@@ -41,7 +41,8 @@ const SKILL_KEYWORD_MAP: Array<{ keywords: RegExp[]; skillId: string; category: 
   { keywords: [/桌面.*自动化|自动.*点击|自动.*操作|maa/i], skillId: 'skill-desktop-automation', category: 'System' },
   { keywords: [/音乐|作曲|写歌|唱歌|旋律|和弦|和声|歌词|乐理|编曲|midi|谱曲|音阶|五声音阶|作词/i], skillId: 'skill-melody', category: 'Creative' },
   { keywords: [/法律|律师|律所|案件|案号|类案|法条|合同.*审|起诉状|答辩状|委托书|庭审|判决|上诉|执行|legal|casework|court|lawsuit|contract.*review/i], skillId: 'skill-legal-casework', category: 'Legal' },
-  { keywords: [/设计|品牌|logo|海报|视觉|UI|UX|设计系统|design|brand|poster|layout|creative brief|视觉方向/i], skillId: 'skill-design-studio-pack', category: 'Design' },
+  // i18n-allow -- task-recognition vocabulary for the spatial/interior skill.
+  { keywords: [/空间规划|室内设计|户型|动线|家具布置|软装|硬装|材质|照明|装修方案|space.planning|interior.design|interior.layout|furniture.plan/i], skillId: 'skill-design-studio-pack', category: 'Interior Design' },
   { keywords: [/CAD|cad|DXF|dxf|图纸|平面图|施工图|草图|户型|装修|空间规划|drawing|drafting|floor plan/i], skillId: 'skill-cad-drafting', category: 'Architecture' },
   { keywords: [/飞书|微信|企业微信|远程访问|远程消息|绑定码|回消息|消息回复|feishu|wechat|wecom|lark/i], skillId: 'skill-messaging-ops', category: 'Messaging' },
   { keywords: [/老师|教师|教培|教学|教案|备课|课堂|作业|批改|评分|试卷|题库|测验|学生画像|家长沟通|lesson|teacher|education|tutor|rubric|quiz|student|parent.message/i], skillId: 'skill-education-teacher', category: 'Education' },

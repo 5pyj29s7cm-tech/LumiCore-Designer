@@ -3,8 +3,9 @@
  * Each template creates a domain-specialist agent with tailored tools and knowledge.
  */
 import { readDB, writeDB } from "../../db_layer";
+import { INTERIOR_PROFESSION_TEMPLATES_CN } from '../regions/packs/cn/interior_profession_templates';
 
-interface AgentTemplate {
+export interface AgentTemplate {
   name: string;
   description: string;
   category: string;
@@ -16,49 +17,7 @@ interface AgentTemplate {
 }
 
 const TEMPLATES: Record<string, AgentTemplate[]> = {
-  designer: [
-    {
-      name: '设计助手',
-      description: 'UI/UX 设计评审、设计系统建议、色彩排版分析',
-      category: 'creative',
-      territory: 'workspace',
-      initialPrompt: `你是一位资深 UI/UX 设计师，精通设计系统、色彩理论、排版和信息架构。
-
-工作方式：
-1. 分析用户上传的设计稿或描述的设计需求
-2. 提供具体的改进建议（对比度、层级、间距、动效）
-3. 引用成熟的设计系统（Material Design, Human Interface Guidelines, Ant Design）
-4. 给出可执行的 CSS/Tailwind 或设计工具操作步骤
-
-核心原则：
-- 建议必须具体，避免"优化一下"这种空泛表述
-- 色彩建议需给出具体色值
-- 响应式设计优先`,
-      knowledgeDomains: ['UI/UX设计', '设计系统', '色彩理论', '排版', '信息架构', '响应式设计'],
-      toolRecommendations: ['generate_image', 'web_search', 'file_read', 'file_write'],
-      modelRecommendation: 'deepseek-v4-pro',
-    },
-    {
-      name: '品牌顾问',
-      description: '品牌策略、视觉识别系统设计、品牌文案撰写',
-      category: 'creative',
-      territory: 'workspace',
-      initialPrompt: `你是一位品牌策略顾问，专注品牌定位、视觉识别(VIS)和品牌叙事。
-
-工作方式：
-1. 理解用户的产品/服务核心价值主张
-2. 提出品牌定位策略（目标人群、差异化、品牌人格）
-3. 设计视觉识别建议（Logo方向、配色方案、字体选择）
-4. 撰写品牌核心文案（Slogan、品牌故事、价值主张）
-
-核心原则：
-- 策略需基于用户产品的实际特征
-- 视觉建议需具体到颜色色值和字体名称`,
-      knowledgeDomains: ['品牌策略', '视觉识别', '文案撰写', '消费者心理学', '市场营销'],
-      toolRecommendations: ['generate_image', 'web_search', 'file_write'],
-      modelRecommendation: 'deepseek-v4-pro',
-    },
-  ],
+  designer: INTERIOR_PROFESSION_TEMPLATES_CN,
   doctor: [
     {
       name: '临床助手',

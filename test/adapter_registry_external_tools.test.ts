@@ -34,6 +34,8 @@ describe('adapter registry external toolbox awareness', () => {
       const nanoBanana = report.adapters.find(adapter => adapter.id === 'ai.nano_banana');
       const externalAi = report.adapters.find(adapter => adapter.id === 'ai.external_agents');
       const drafting = report.adapters.find(adapter => adapter.id === 'cad_bim.drafting');
+      const documentIntelligence = report.adapters.find(adapter => adapter.id === 'cad_bim.document_intelligence');
+      const ifcRevit = report.adapters.find(adapter => adapter.id === 'cad_bim.ifc_revit');
 
       expect(cadToolbox?.status).toBe('available');
       expect(cadToolbox?.diagnostics).toEqual(expect.arrayContaining([
@@ -60,6 +62,14 @@ describe('adapter registry external toolbox awareness', () => {
       expect(externalAi?.requiresConfirmation).toBe(true);
       expect(externalAi?.surfaces).toEqual(expect.arrayContaining(['WorkBuddy', 'Codex desktop', 'ChatGPT', 'Claude', 'local AI runtimes']));
       expect(drafting?.actions).toContain('mcp_cad-drafting_cad_renovation_folder_workflow');
+      expect(documentIntelligence?.actions).toContain('mcp_paddleocr-local_pp_structurev3');
+      expect(documentIntelligence?.safety).toContain('project data root');
+      expect(ifcRevit?.status).not.toBe('planned');
+      expect(ifcRevit?.actions).toEqual(expect.arrayContaining([
+        'mcp_ifc-readonly_ifc_validate',
+        'mcp_revit-readonly_revit_get_current_view_info',
+      ]));
+      expect(ifcRevit?.safety).toContain('arbitrary-code execution');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

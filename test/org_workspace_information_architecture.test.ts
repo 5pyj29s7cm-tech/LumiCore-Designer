@@ -22,15 +22,26 @@ describe('organization workspace information architecture', () => {
     expect(routes).toContain("requireOrgRole('owner', 'admin')");
   });
 
-  it('separates spatial architecture from brand creative work', () => {
+  it('keeps one focused spatial and interior design workspace', () => {
     const orgHub = source('src/components/org/OrgHub.tsx');
     const designHub = source('src/components/org/DesignHub.tsx');
 
     expect(orgHub).toContain("id: 'spatial-design'");
-    expect(orgHub).toContain("id: 'brand-design'");
-    expect(orgHub).toContain('<DesignHub workspace="spatial" />');
-    expect(orgHub).toContain('<DesignHub workspace="brand" />');
-    expect(designHub).toContain("new Set<DesignView>(['space', 'interior', 'architecture'])");
+    expect(orgHub).toContain("case 'spatial-design': return <DesignHub />");
+    expect(orgHub).toContain("onClick={() => openSubView('spatial-design')}");
+    expect(orgHub).not.toContain('orgModulesOpen');
+    expect(orgHub).not.toContain('organization-modules.75dd9b5603');
+    expect(orgHub).not.toContain('t.orgExitWorkSpace');
+    expect(orgHub).not.toContain("id: 'brand-design'");
+    expect(designHub).toContain("| 'space'");
+    expect(designHub).toContain("| 'interior'");
+    expect(designHub).toContain("| 'conditions'");
+    expect(designHub).toContain("| 'materials'");
+    expect(designHub).toContain("| 'visualization'");
+    expect(designHub).toContain("| 'handoff'");
+    expect(designHub).toContain("m('scopeGuard')");
+    expect(designHub).not.toContain("'brand'");
+    expect(designHub).not.toContain("'architecture'");
   });
 
   it('combines template review with the marketplace and hides duplicate dashboard destinations from navigation', () => {
@@ -89,7 +100,7 @@ describe('organization workspace information architecture', () => {
     expect(desktop).toContain('organizationWorkspaceView');
     expect(desktop).toContain('availableOrganizationWorkspaceViews');
     expect(contract).toContain("'spatial-design'");
-    expect(contract).toContain("'brand-design'");
+    expect(contract).not.toContain("'brand-design'");
     expect(navigation).toContain('sessionStorage');
   });
 

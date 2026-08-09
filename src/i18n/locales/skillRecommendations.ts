@@ -27,6 +27,7 @@ export const WORK_RECOMMENDATION_RULES: SkillRecommendationRule[] = [
   { skillIds: ['skill-sales-customer-ops'], zh: '销售/客服', en: 'sales or support work', pattern: /销售|客服|客户|线索|跟进|异议|工单|续费|lead|sales|customer|support|objection/i },
   { skillIds: ['skill-restaurant-store-ops'], zh: '餐饮/门店', en: 'restaurant or store work', pattern: /餐饮|门店|咖啡店|菜单|毛利|报损|排班|点评|促销|restaurant|cafe|store|menu|waste|shift/i },
   { skillIds: ['skill-legal-casework'], zh: '法律/案件', en: 'legal work', pattern: /法律|律师|案件|合同|起诉|答辩|court|legal|lawsuit|contract/i },
-  { skillIds: ['skill-design-studio-pack'], zh: '设计/品牌', en: 'design work', pattern: /设计|品牌|logo|海报|视觉|UI|UX|design|brand|poster/i },
+  { skillIds: ['skill-design-studio-pack'], zh: '空间/室内设计', en: 'space planning or interior design', pattern: /空间规划|室内设计|户型|动线|家具布置|软装|硬装|材质|照明|装修方案|space planning|interior design|interior layout|furniture plan/i },
   { skillIds: ['skill-cad-drafting'], zh: 'CAD/装修图纸', en: 'CAD or drafting work', pattern: /CAD|DXF|图纸|平面图|施工图|装修|floor plan|drafting/i },
+  { skillIds: ['skill-design-studio-pack', 'skill-cad-drafting'], zh: 'BIM/IFC/Revit \u5ba4\u5185\u534f\u8c03', en: 'BIM, IFC, or Revit interior coordination', pattern: /IFC|Revit|BIM|\u626b\u63cf\u56fe\u7eb8|\u6750\u6599\u8868|\u5bb6\u5177\u6e05\u5355|\u73b0\u573a\u8e0f\u52d8|\u6a21\u578b\u5ba1\u67e5|model audit|finish schedule|FF&E|site survey/i },
 ];

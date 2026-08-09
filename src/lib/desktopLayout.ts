@@ -92,7 +92,7 @@ export function getDesktopChromeMetrics(viewport: ViewportSize): DesktopChromeMe
   const density = getDesktopDensity({ width, height });
   const safeInset = density === 'mini' ? 4 : density === 'tight' ? 6 : density === 'compact' ? 10 : 16;
   // These match the responsive top bar and dock dimensions in index.css.
-  const topInset = density === 'mini' ? 34 : density === 'tight' ? 42 : density === 'compact' ? 44 : 48;
+  const topInset = density === 'mini' ? 42 : density === 'tight' ? 42 : density === 'compact' ? 44 : 48;
   const bottomInset = density === 'mini' ? 48 : density === 'tight' ? 58 : density === 'compact' ? 72 : 96;
 
   return {

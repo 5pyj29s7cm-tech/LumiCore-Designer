@@ -34,6 +34,16 @@ describe('desktop display scaling layout', () => {
     expect(bounds.top + bounds.height).toBeLessThanOrEqual(viewport.height - chrome.bottomInset);
   });
 
+  it('keeps an 8px safety gap below the top bar at mini density', () => {
+    const viewport = { width: 520, height: 460 };
+    const chrome = getDesktopChromeMetrics(viewport);
+    const maximized = resolveDesktopWindowBounds(viewport, 900, 700, 'maximized');
+
+    expect(chrome.density).toBe('mini');
+    expect(chrome.topInset).toBe(34 + 8);
+    expect(maximized.top).toBe(chrome.topInset);
+  });
+
   it('keeps maximized and snapped windows inside the same safe work area', () => {
     const viewport = { width: 1024, height: 640 };
     const chrome = getDesktopChromeMetrics(viewport);

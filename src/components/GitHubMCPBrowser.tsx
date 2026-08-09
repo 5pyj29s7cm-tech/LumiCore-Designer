@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { motion } from 'motion/react';
-import { Search, Github, Star, ExternalLink, Download, Loader2, Package, Globe } from 'lucide-react';
+import { Search, Github, Star, ExternalLink, Download, Loader2, Package, Globe, ShieldCheck } from 'lucide-react';
 import { toast } from 'sonner';
+import { uiMessage } from '../i18n/uiMessages';
 
 interface MCPSearchResult {
   id: number | string;
@@ -16,9 +17,22 @@ interface MCPSearchResult {
 
 type SearchSource = 'github' | 'npm';
 
+interface ManagedConnector {
+  name: string;
+  enabled: boolean;
+  connected: boolean;
+  factoryManaged?: boolean;
+  description?: string;
+  setupHint?: string;
+  setupUrl?: string;
+  allowedTools?: string[];
+  blockedTools?: string[];
+}
+
 const LANGUAGES = ['TypeScript', 'Python', 'JavaScript', 'Go', 'Rust', 'Java'];
 
 export function GitHubMCPBrowser({ t, embedded = false }: { t?: any; embedded?: boolean }) {
+  const isZh = t?.langCode !== 'en';
   const [source, setSource] = useState<SearchSource>('github');
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<MCPSearchResult[]>([]);
@@ -27,6 +41,48 @@ export function GitHubMCPBrowser({ t, embedded = false }: { t?: any; embedded?: 
   const [installing, setInstalling] = useState<string | null>(null);
   const [langFilter, setLangFilter] = useState('');
   const [sortBy, setSortBy] = useState<'stars' | 'relevance'>('stars');
+  const [managedConnectors, setManagedConnectors] = useState<ManagedConnector[]>([]);
+  const [connectorBusy, setConnectorBusy] = useState<Set<string>>(new Set());
+
+  const fetchManagedConnectors = async () => {
+    try {
+      const res = await fetch('/api/mcp', { credentials: 'include' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to load managed connectors');
+      setManagedConnectors((data.servers || []).filter((server: ManagedConnector) => server.factoryManaged));
+    } catch {
+      setManagedConnectors([]);
+    }
+  };
+
+  useEffect(() => { void fetchManagedConnectors(); }, []);
+
+  const setManagedConnectorEnabled = async (connector: ManagedConnector) => {
+    const enabled = !connector.enabled;
+    setConnectorBusy(previous => new Set(previous).add(connector.name));
+    try {
+      const res = await fetch(`/api/mcp/${encodeURIComponent(connector.name)}/enabled`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ enabled }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.setupHint || data.error || 'Connector update failed');
+      toast.success(enabled
+        ? uiMessage('mcpsettings.connector-enabled', isZh ? 'zh' : 'en')
+        : uiMessage('mcpsettings.connector-disabled', isZh ? 'zh' : 'en'));
+    } catch (error: any) {
+      toast.error(error?.message || uiMessage('mcpsettings.connector-update-failed', isZh ? 'zh' : 'en'));
+    } finally {
+      await fetchManagedConnectors();
+      setConnectorBusy(previous => {
+        const next = new Set(previous);
+        next.delete(connector.name);
+        return next;
+      });
+    }
+  };
 
   const handleSearch = async () => {
     if (!query.trim()) return;
@@ -119,6 +175,71 @@ export function GitHubMCPBrowser({ t, embedded = false }: { t?: any; embedded?: 
         <div className="rounded-xl border border-amber-400/15 bg-amber-500/10 px-4 py-3 text-xs leading-relaxed text-amber-100/75">
           {t?.mcpInstallNotice || 'Only MCP-compatible packages can be installed. Lumi will clone/install/start the package first; if it cannot run as an MCP server, it will fail with a clear message instead of pretending to be ready.'}
         </div>
+        {managedConnectors.length > 0 && (
+          <section className="space-y-3 rounded-2xl border border-violet-400/15 bg-violet-500/5 p-4">
+            <div>
+              <div className="flex items-center gap-2 text-sm font-bold text-white/85">
+                <ShieldCheck size={16} className="text-violet-300" />
+                {uiMessage('mcpsettings.managed-spatial-connectors', isZh ? 'zh' : 'en')}
+              </div>
+              <p className="mt-1 text-xs leading-relaxed text-white/45">
+                {uiMessage('mcpsettings.managed-spatial-connectors-description', isZh ? 'zh' : 'en')}
+              </p>
+            </div>
+            <div className="grid gap-2 lg:grid-cols-3">
+              {managedConnectors.map(connector => {
+                const busy = connectorBusy.has(connector.name);
+                return (
+                  <div key={connector.name} className="flex flex-col rounded-xl border border-white/10 bg-black/15 p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-bold uppercase tracking-wide text-white/80">{connector.name}</div>
+                        <div className={`mt-1 text-xs font-semibold ${connector.enabled ? 'text-emerald-300' : 'text-white/40'}`}>
+                          {connector.enabled
+                            ? uiMessage('mcpsettings.connector-enabled', isZh ? 'zh' : 'en')
+                            : uiMessage('mcpsettings.connector-disabled', isZh ? 'zh' : 'en')}
+                          {connector.connected ? ' · live' : ''}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void setManagedConnectorEnabled(connector)}
+                        disabled={busy}
+                        className={`rounded-lg border px-2.5 py-1.5 text-xs font-bold transition-colors disabled:opacity-40 ${connector.enabled
+                          ? 'border-red-400/20 bg-red-500/10 text-red-200 hover:bg-red-500/15'
+                          : 'border-violet-400/25 bg-violet-500/15 text-violet-200 hover:bg-violet-500/25'}`}
+                      >
+                        {busy
+                          ? <Loader2 size={13} className="animate-spin" />
+                          : connector.enabled
+                            ? uiMessage('mcpsettings.disable', isZh ? 'zh' : 'en')
+                            : uiMessage('mcpsettings.enable', isZh ? 'zh' : 'en')}
+                      </button>
+                    </div>
+                    <p className="mt-2 flex-1 text-xs leading-relaxed text-white/45">{connector.description}</p>
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-white/40">
+                      {connector.allowedTools?.length ? <span>{connector.allowedTools.length} allowlisted tools</span> : null}
+                      {connector.blockedTools?.length ? <span>{connector.blockedTools.length} blocked tools</span> : null}
+                    </div>
+                    {connector.setupHint && !connector.connected && (
+                      <p className="mt-2 text-xs leading-relaxed text-amber-100/60">{connector.setupHint}</p>
+                    )}
+                    {connector.setupUrl && (
+                      <a
+                        href={connector.setupUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="mt-2 inline-flex items-center gap-1 text-xs text-violet-300 hover:underline"
+                      >
+                        {uiMessage('mcpsettings.setup-instructions', isZh ? 'zh' : 'en')} <ExternalLink size={11} />
+                      </a>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
         {/* Source tabs */}
         <div className="flex gap-1 p-1 rounded-xl bg-white/5 border border-white/5">
           <button

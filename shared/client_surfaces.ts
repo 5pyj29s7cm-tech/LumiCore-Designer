@@ -452,20 +452,11 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
   },
   {
     id: 'org-spatial-design',
-    label: 'Spatial and architecture workspace',
+    label: 'Spatial and interior design workspace',
     target: 'org',
     actions: ['open_organization_spatial_design'],
     organizationView: 'spatial-design',
-    useWhen: 'Open spatial, architecture, CAD, and design-delivery work.',
-    launcherIds: [],
-  },
-  {
-    id: 'org-brand-design',
-    label: 'Brand and creative workspace',
-    target: 'org',
-    actions: ['open_organization_brand_design'],
-    organizationView: 'brand-design',
-    useWhen: 'Open organization brand, campaign, visual, and creative-delivery work.',
+    useWhen: 'Open space planning, interior design, building-condition coordination, visualization, and interior-delivery work.',
     launcherIds: [],
   },
   {

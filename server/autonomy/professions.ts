@@ -11,13 +11,11 @@ export interface ProfessionProfile {
 
 const PROFESSION_SIGNATURES: Record<string, { apps: string[]; domains: string[]; persona: string[] }> = {
   designer: {
-    apps: ['Photoshop', 'Illustrator', 'Figma', 'Sketch', 'Adobe XD', 'Adobe', 'Canva', 'CorelDRAW', 'InDesign',
-      'After Effects', 'Premiere Pro', 'Blender', 'Cinema 4D', 'Maya', 'ZBrush', 'Procreate', 'Affinity',
-      'SketchUp', 'AutoCAD', 'Revit', 'Rhino', '3ds Max', 'DaVinci Resolve', 'Final Cut', 'Lightroom',
-      'Affinity Designer', 'Affinity Photo', 'Affinity Publisher', 'GIMP', 'Inkscape', 'Krita',
-      'Capture One', 'Pixelmator', 'Zeplin', 'InVision', 'Framer', 'Principle', 'ProtoPie',
-      'Axure', 'Balsamiq', 'Marvel', 'Abstract', 'Notion', 'Miro', 'Dribbble'],
-    domains: ['UI/UX设计', '平面设计', '品牌设计', '工业设计', '3D建模', '视频剪辑', '设计系统', '色彩理论', '排版', '用户体验'],
+    apps: ['AutoCAD', 'Revit', 'SketchUp', 'Rhino', '3ds Max', 'Blender', 'Cinema 4D', 'V-Ray',
+      'Enscape', 'Lumion', 'D5 Render', 'Twinmotion', 'Chief Architect', 'Vectorworks', 'ArchiCAD',
+      'Photoshop', 'Illustrator', 'InDesign', 'Affinity Photo', 'Procreate', 'Morpholio Trace'],
+    // i18n-allow -- profession detection metadata for this spatial/interior variant.
+    domains: ['空间规划', '室内设计', '住宅设计', '商业空间设计', '人体工学', '材料设计', '照明设计', '软装设计', '室内可视化', '施工图深化'],
     persona: ['视觉思维', '注重细节', '审美敏锐', '创造性解决问题'],
   },
   doctor: {

@@ -16,6 +16,8 @@ import * as Templates from './templates';
 import * as Audit from './audit';
 import * as WorkRouting from './work_routing';
 import * as ResourceACL from './resource_acl';
+import * as InteriorProjects from '../design/projects';
+import * as InteriorProjectAssets from '../design/project_assets';
 import { Server as SocketIOServer } from 'socket.io';
 import { getJwtSecret } from '../config/local_identity';
 
@@ -43,6 +45,17 @@ function canReadOrganizationResource(input: {
   }).allowed;
 }
 
+function respondInteriorProjectError(res: Response, error: unknown): boolean {
+  if (
+    error instanceof InteriorProjects.InteriorProjectValidationError
+    || error instanceof InteriorProjectAssets.InteriorProjectAssetValidationError
+  ) {
+    res.status(error.statusCode).json({ error: error.message });
+    return true;
+  }
+  return false;
+}
+
 export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
   // ── Health / status ──────────────────────────────────────────────────
 
@@ -54,6 +67,130 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
       orgId: _req.user?.orgId || null,
       orgRole: _req.user?.orgRole || null,
     });
+  });
+
+  // ── Spatial and interior projects ───────────────────────────────────
+
+  router.get('/org/interior/projects', requireAuth, requireOrgMember, (req: Request, res: Response) => {
+    const projects = InteriorProjects.listInteriorProjects(req.user!.orgId!, {
+      includeArchived: req.query.includeArchived === 'true',
+    });
+    res.json({ projects });
+  });
+
+  router.get('/org/interior/projects/:projectId', requireAuth, requireOrgMember, (req: Request, res: Response) => {
+    const project = InteriorProjects.getInteriorProject(req.user!.orgId!, req.params.projectId);
+    if (!project) {
+      res.status(404).json({ error: 'Interior project not found' });
+      return;
+    }
+    res.json(project);
+  });
+
+  router.post('/org/interior/projects', requireAuth, requireOrgRole('owner', 'admin', 'member'), (req: Request, res: Response) => {
+    try {
+      const project = InteriorProjects.createInteriorProject(req.user!.orgId!, req.user!.uid, req.body || {});
+      EDB.logAudit({
+        orgId: req.user!.orgId!,
+        userId: req.user!.uid,
+        action: 'interior_project.created',
+        resourceType: 'interior_project',
+        resourceId: project.id,
+        details: { name: project.name, projectType: project.projectType },
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+      res.status(201).json(project);
+    } catch (error) {
+      if (!respondInteriorProjectError(res, error)) throw error;
+    }
+  });
+
+  router.put('/org/interior/projects/:projectId', requireAuth, requireOrgRole('owner', 'admin', 'member'), (req: Request, res: Response) => {
+    try {
+      const project = InteriorProjects.updateInteriorProject(
+        req.user!.orgId!,
+        req.params.projectId,
+        req.body || {},
+      );
+      if (!project) {
+        res.status(404).json({ error: 'Interior project not found' });
+        return;
+      }
+      EDB.logAudit({
+        orgId: req.user!.orgId!,
+        userId: req.user!.uid,
+        action: project.status === 'archived' ? 'interior_project.archived' : 'interior_project.updated',
+        resourceType: 'interior_project',
+        resourceId: project.id,
+        details: { name: project.name, projectType: project.projectType, status: project.status },
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+      res.json(project);
+    } catch (error) {
+      if (!respondInteriorProjectError(res, error)) throw error;
+    }
+  });
+
+  router.get('/org/interior/projects/:projectId/assets', requireAuth, requireOrgMember, (req: Request, res: Response) => {
+    const project = InteriorProjects.getInteriorProject(req.user!.orgId!, req.params.projectId);
+    if (!project) {
+      res.status(404).json({ error: 'Interior project not found' });
+      return;
+    }
+    res.json({ assets: InteriorProjectAssets.listInteriorProjectAssets(req.user!.orgId!, project.id) });
+  });
+
+  router.put('/org/interior/projects/:projectId/assets/:assetId', requireAuth, requireOrgRole('owner', 'admin', 'member'), (req: Request, res: Response) => {
+    try {
+      const asset = InteriorProjectAssets.updateInteriorProjectAsset(
+        req.user!.orgId!,
+        req.params.projectId,
+        req.params.assetId,
+        req.body || {},
+      );
+      if (!asset) {
+        res.status(404).json({ error: 'Interior project asset not found' });
+        return;
+      }
+      EDB.logAudit({
+        orgId: req.user!.orgId!,
+        userId: req.user!.uid,
+        action: 'interior_project.asset_updated',
+        resourceType: 'interior_project_asset',
+        resourceId: asset.id,
+        details: { projectId: asset.projectId, fileId: asset.fileId, category: asset.category },
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+      res.json(asset);
+    } catch (error) {
+      if (!respondInteriorProjectError(res, error)) throw error;
+    }
+  });
+
+  router.delete('/org/interior/projects/:projectId/assets/:assetId', requireAuth, requireOrgRole('owner', 'admin', 'member'), (req: Request, res: Response) => {
+    const asset = InteriorProjectAssets.removeInteriorProjectAsset(
+      req.user!.orgId!,
+      req.params.projectId,
+      req.params.assetId,
+    );
+    if (!asset) {
+      res.status(404).json({ error: 'Interior project asset not found' });
+      return;
+    }
+    EDB.logAudit({
+      orgId: req.user!.orgId!,
+      userId: req.user!.uid,
+      action: 'interior_project.asset_removed',
+      resourceType: 'interior_project_asset',
+      resourceId: asset.id,
+      details: { projectId: asset.projectId, fileId: asset.fileId, fileRetained: true },
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent'),
+    });
+    res.json({ success: true, asset, fileRetained: true });
   });
 
   // ── Organization CRUD ────────────────────────────────────────────────

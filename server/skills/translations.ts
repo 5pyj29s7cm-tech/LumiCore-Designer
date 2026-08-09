@@ -26,8 +26,8 @@ const BUILTIN_ZH_TRANSLATIONS: Record<string, TranslationEntry> = {
     description: '支持认证场景、站内深度抓取和结构化内容提取的网页采集工具。',
   },
   'skill-design-studio-pack': {
-    displayName: '设计工作室包',
-    description: '面向品牌、UI、空间与视觉生产的设计工作流，支持创意简报、方向整理、审查清单和交付计划。',
+    displayName: '空间与室内设计包', // i18n-allow -- built-in zh locale resource.
+    description: '面向空间规划和室内设计的专用工作流，支持图纸质检、布局审查、现场踏勘、FF&E、IFC 与 Revit 只读协调。', // i18n-allow -- built-in zh locale resource.
   },
   'skill-desktop-automation': {
     displayName: '桌面指挥官',

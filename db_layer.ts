@@ -108,6 +108,8 @@ const PERFORMANCE_INDEX_SQL = [
   `CREATE INDEX IF NOT EXISTS idx_org_credential_references_org_status ON org_credential_references(orgId, status)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_org_devices_branch ON org_devices(branchId)`,
   `CREATE INDEX IF NOT EXISTS idx_org_devices_org_status ON org_devices(orgId, status, updatedAt)`,
+  `CREATE INDEX IF NOT EXISTS idx_interior_projects_org_status ON interior_projects(orgId, status, updatedAt)`,
+  `CREATE INDEX IF NOT EXISTS idx_interior_project_assets_project ON interior_project_assets(orgId, projectId, status, updatedAt)`,
   `CREATE INDEX IF NOT EXISTS idx_org_kb_articles_org_category ON org_kb_articles(orgId, category, status)`,
   `CREATE INDEX IF NOT EXISTS idx_org_kb_embeddings_article ON org_kb_embeddings(articleId)`,
   `CREATE INDEX IF NOT EXISTS idx_notifications_user_ts ON notifications(userId, timestamp)`,
@@ -1037,6 +1039,26 @@ function createTables(): Promise<void> {
         updatedAt TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS interior_projects (
+        id TEXT PRIMARY KEY,
+        orgId TEXT NOT NULL,
+        ownerUserId TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'brief',
+        payload TEXT NOT NULL DEFAULT '{}',
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS interior_project_assets (
+        id TEXT PRIMARY KEY,
+        orgId TEXT NOT NULL,
+        projectId TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        payload TEXT NOT NULL DEFAULT '{}',
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS org_invitations (
         id TEXT PRIMARY KEY,
         orgId TEXT NOT NULL,
@@ -1243,6 +1265,8 @@ async function loadMemoryDB(): Promise<void> {
   const orgResourceGrantsRaw = await query<any>('SELECT * FROM org_resource_grants');
   const orgCredentialReferencesRaw = await query<any>('SELECT * FROM org_credential_references');
   const orgDevicesRaw = await query<any>('SELECT * FROM org_devices');
+  const interiorProjectsRaw = await query<any>('SELECT * FROM interior_projects');
+  const interiorProjectAssetsRaw = await query<any>('SELECT * FROM interior_project_assets');
   const orgInvitations = await query<any>('SELECT * FROM org_invitations');
   const orgKbArticles = await query<any>('SELECT * FROM org_kb_articles');
   const orgKbEmbeddings = await query<any>('SELECT * FROM org_kb_embeddings');
@@ -1492,6 +1516,8 @@ async function loadMemoryDB(): Promise<void> {
     orgResourceGrants: parsePayloadRows(orgResourceGrantsRaw),
     orgCredentialReferences: parsePayloadRows(orgCredentialReferencesRaw),
     orgDevices: parsePayloadRows(orgDevicesRaw),
+    interiorProjects: parsePayloadRows(interiorProjectsRaw),
+    interiorProjectAssets: parsePayloadRows(interiorProjectAssetsRaw),
     orgInvitations: orgInvitations || [],
     orgKbArticles: orgKbArticles || [],
     orgKbEmbeddings: orgKbEmbeddings || [],
@@ -2144,6 +2170,18 @@ async function persistMemoryDB(): Promise<void> {
       createSQL: `CREATE TABLE _temp_org_devices (id TEXT PRIMARY KEY, orgId TEXT NOT NULL, branchId TEXT NOT NULL UNIQUE, userId TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', payload TEXT NOT NULL DEFAULT '{}', createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL)`,
       insertSQL: `INSERT INTO _temp_org_devices (id, orgId, branchId, userId, status, payload, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       rows: () => (memoryDB.orgDevices || []).map((item: any) => [item.id, item.orgId, item.branchId, item.userId, item.status || 'active', JSON.stringify(item), item.createdAt, item.updatedAt]),
+    },
+    {
+      name: 'interior_projects',
+      createSQL: `CREATE TABLE _temp_interior_projects (id TEXT PRIMARY KEY, orgId TEXT NOT NULL, ownerUserId TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'brief', payload TEXT NOT NULL DEFAULT '{}', createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL)`,
+      insertSQL: `INSERT INTO _temp_interior_projects (id, orgId, ownerUserId, status, payload, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      rows: () => (memoryDB.interiorProjects || []).map((item: any) => [item.id, item.orgId, item.ownerUserId, item.status || 'brief', JSON.stringify(item), item.createdAt, item.updatedAt]),
+    },
+    {
+      name: 'interior_project_assets',
+      createSQL: `CREATE TABLE _temp_interior_project_assets (id TEXT PRIMARY KEY, orgId TEXT NOT NULL, projectId TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', payload TEXT NOT NULL DEFAULT '{}', createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL)`,
+      insertSQL: `INSERT INTO _temp_interior_project_assets (id, orgId, projectId, status, payload, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      rows: () => (memoryDB.interiorProjectAssets || []).map((item: any) => [item.id, item.orgId, item.projectId, item.status || 'active', JSON.stringify(item), item.createdAt, item.updatedAt]),
     },
     {
       name: 'org_invitations',

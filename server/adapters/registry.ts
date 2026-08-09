@@ -119,6 +119,55 @@ const CATEGORY_ORDER: AdapterCategory[] = [
   'system',
 ];
 
+function managedMCPAdapterState(name: string): {
+  status: AdapterStatus;
+  diagnostics: string[];
+  setup: string[];
+} {
+  try {
+    const config = mcpManager.getConfig()[name];
+    const health = mcpManager.getServerHealth()[name];
+    if (!config) {
+      return {
+        status: 'requires_setup',
+        diagnostics: [`${name}=not-configured`],
+        setup: [`Add the ${name} managed connector template.`],
+      };
+    }
+    if (!config.enabled) {
+      return {
+        status: 'requires_setup',
+        diagnostics: [`${name}=disabled`],
+        setup: [config.setupHint || `Enable ${name} in MCP settings.`],
+      };
+    }
+    const healthStatus = String(health?.status || 'available');
+    const status: AdapterStatus = healthStatus === 'connected' || healthStatus === 'idle'
+      ? 'ready'
+      : ['crashed', 'failed', 'restarting'].includes(healthStatus)
+        ? 'attention'
+        : 'available';
+    return {
+      status,
+      diagnostics: [`${name}=enabled`, `${name}.health=${healthStatus}`],
+      setup: status === 'attention' ? [config.setupHint || `Check the ${name} local bridge.`] : [],
+    };
+  } catch (error: any) {
+    return {
+      status: 'attention',
+      diagnostics: [`${name}.error=${String(error?.message || error)}`],
+      setup: [`Review the ${name} connector configuration.`],
+    };
+  }
+}
+
+function combineManagedMCPStatus(states: Array<{ status: AdapterStatus }>): AdapterStatus {
+  if (states.some(state => state.status === 'ready')) return 'ready';
+  if (states.some(state => state.status === 'attention')) return 'attention';
+  if (states.some(state => state.status === 'available')) return 'available';
+  return 'requires_setup';
+}
+
 export function getAdapterRegistry(options: AdapterRegistryOptions = {}): AdapterRegistryReport {
   const userId = options.userId || 'anonymous';
   const state = sanitizeDiagnosticValue(options.clientState || null);
@@ -126,6 +175,9 @@ export function getAdapterRegistry(options: AdapterRegistryOptions = {}): Adapte
   const skillStats = getSkillStats();
   const externalToolbox = getExternalToolboxStatus();
   const extensionProviders = listRegisteredProviders(userId);
+  const paddleOcrConnector = managedMCPAdapterState('paddleocr-local');
+  const ifcConnector = managedMCPAdapterState('ifc-readonly');
+  const revitConnector = managedMCPAdapterState('revit-readonly');
   const stateAgeSeconds = getStateAgeSeconds(state);
   const hasState = Boolean(state);
   const staleState = stateAgeSeconds != null && stateAgeSeconds > 120;
@@ -331,7 +383,7 @@ export function getAdapterRegistry(options: AdapterRegistryOptions = {}): Adapte
       category: 'organization',
       status: state?.org?.connected ? 'ready' : 'available',
       actions: [
-        'open_organization_workspace(section=dashboard|kb|chat|messaging|templates|review|members|audit|settings|branch|legal|spatial-design|brand-design)',
+        'open_organization_workspace(section=dashboard|kb|chat|messaging|templates|review|members|audit|settings|branch|legal|spatial-design)',
       ],
       surfaces: [
         'organization dashboard',
@@ -343,8 +395,7 @@ export function getAdapterRegistry(options: AdapterRegistryOptions = {}): Adapte
         'audit',
         'organization settings and branch connection',
         'law firm workspace',
-        'spatial and architecture workspace',
-        'brand and creative workspace',
+        'spatial and interior design workspace',
       ],
       diagnostics: state?.org?.connected
         ? [
@@ -592,6 +643,20 @@ export function getAdapterRegistry(options: AdapterRegistryOptions = {}): Adapte
       notes: 'Use native desktop WeChat duty mode for persistent unread detection, deduplication, conservative risk classification, and confirmation-queued drafts. Treat detection, reading, drafting, and sending as separate actions with separate evidence; an unread badge is not message-content evidence, and a prepared draft is not a send. Personal WeChat may enter an organization only through the bound member identity: uniquely matched court notices can be archived directly, ambiguous cases ask once, and cross-workspace file sends are target-bound and audit-logged. Feishu and WeCom group members are routed independently by member, chat, and thread.',
     },
     {
+      id: 'cad_bim.document_intelligence',
+      label: 'Interior Drawing OCR and Document Intelligence',
+      category: 'cad_bim',
+      status: paddleOcrConnector.status,
+      actions: ['read_pdf', 'ocr_image_file', 'mcp_paddleocr-local_pp_structurev3', 'floorplan_extract_geometry'],
+      surfaces: ['scanned plans', 'PDF drawings', 'site-survey documents', 'finish schedules', 'Lumi project assets'],
+      requiresSetup: paddleOcrConnector.status === 'requires_setup',
+      requiresConfirmation: false,
+      setup: paddleOcrConnector.setup,
+      diagnostics: paddleOcrConnector.diagnostics,
+      safety: 'Local OCR is restricted to the Lumi project data root and cannot fetch network URLs. OCR output remains unverified evidence until dimensions and drawing geometry are checked against measured sources.',
+      notes: 'Use built-in PDF/image readers first, then PP-StructureV3 for complex tables or drawing layouts. Never infer missing dimensions from OCR confidence alone.',
+    },
+    {
       id: 'cad_bim.drafting',
       label: 'CAD Drafting and Floorplan Handoff',
       category: 'cad_bim',
@@ -619,14 +684,35 @@ export function getAdapterRegistry(options: AdapterRegistryOptions = {}): Adapte
     },
     {
       id: 'cad_bim.ifc_revit',
-      label: 'IFC and Revit Integration',
+      label: 'IFC and Revit Read-only Review',
       category: 'cad_bim',
-      status: 'planned',
-      actions: ['capability_research', 'open_skills'],
-      surfaces: ['Revit import', 'IFC handoff', 'Dynamo script handoff'],
-      requiresConfirmation: true,
-      setup: ['Add a safe IFC generator or Dynamo/Revit adapter before claiming native RVT production output.'],
-      notes: 'Current workflow can generate Dynamo scripts and room schedules for reviewed Revit/BIM modeling and can open the handoff files or a detected Dynamo/Revit entry point. Native RVT production output still needs a confirmed adapter or Revit automation environment.',
+      status: combineManagedMCPStatus([ifcConnector, revitConnector]),
+      actions: [
+        'mcp_ifc-readonly_ifc_load',
+        'mcp_ifc-readonly_ifc_summary',
+        'mcp_ifc-readonly_ifc_tree',
+        'mcp_ifc-readonly_ifc_info',
+        'mcp_ifc-readonly_ifc_select',
+        'mcp_ifc-readonly_ifc_relations',
+        'mcp_ifc-readonly_ifc_clash',
+        'mcp_ifc-readonly_ifc_validate',
+        'mcp_ifc-readonly_ifc_materials',
+        'mcp_ifc-readonly_ifc_plot',
+        'mcp_ifc-readonly_ifc_render',
+        'mcp_revit-readonly_revit_get_current_view_info',
+        'mcp_revit-readonly_revit_get_selected_elements',
+        'mcp_revit-readonly_revit_ai_element_filter',
+        'mcp_revit-readonly_revit_get_element_details',
+        'mcp_revit-readonly_revit_capture_view_image',
+        'open_skills',
+      ],
+      surfaces: ['IFC model review', 'Revit active model', 'room and element queries', 'clash and validation reports'],
+      requiresSetup: ifcConnector.status === 'requires_setup' && revitConnector.status === 'requires_setup',
+      requiresConfirmation: false,
+      setup: Array.from(new Set([...ifcConnector.setup, ...revitConnector.setup])),
+      diagnostics: [...ifcConnector.diagnostics, ...revitConnector.diagnostics],
+      safety: 'Both connectors are local and read-only. IFC create/save/edit/quantify tools are denied. Revit arbitrary-code execution, ToolBaker, adaptive bake, and model mutation are disabled and denied again at call time.',
+      notes: 'This adapter supports evidence-backed model inspection for interior design and building-condition coordination. It does not claim native RVT production, authoring, structural design, or construction-document approval.',
     },
     {
       id: 'ai.extension_registry',

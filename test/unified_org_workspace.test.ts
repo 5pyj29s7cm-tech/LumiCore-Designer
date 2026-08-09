@@ -31,6 +31,7 @@ describe('unified organization workspace boundary', () => {
     const web = read('src/entries/web.tsx');
     const portal = read('src/components/OrgPortal.tsx');
     const hub = read('src/components/org/OrgHub.tsx');
+    const workModeSwitch = read('src/components/org/WorkModeSwitch.tsx');
 
     expect(desktop).toContain("case 'org'");
     expect(desktop).toContain('<OrgPortal />');
@@ -38,7 +39,9 @@ describe('unified organization workspace boundary', () => {
     expect(web).toContain('<OrgPortal />');
     expect(portal).toContain("await switchDomain('work')");
     expect(portal).toContain('<OrgHub />');
-    expect(hub).toContain("switchDomain('personal')");
+    expect(hub).not.toContain("switchDomain('personal')");
+    expect(hub).toContain("openSubView('spatial-design')");
+    expect(workModeSwitch).toContain("onSelectDomain('personal')");
   });
 
   it('keeps native desktop window controls visible above the organization workbench', () => {

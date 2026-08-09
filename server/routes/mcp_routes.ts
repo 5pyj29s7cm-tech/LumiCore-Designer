@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAuth } from "../middleware/auth";
+import { requireAuth, requireLocalRequest } from "../middleware/auth";
 import { mcpManager, getMCPConfig, updateMCPConfig, recoverServerTools } from "../mcp";
 
 export function mountMcpRoutes(router: Router) {
@@ -24,6 +24,41 @@ export function mountMcpRoutes(router: Router) {
       res.json({ registered, count: registered.length });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.put("/mcp/:name/enabled", requireAuth, requireLocalRequest, async (req, res) => {
+    const name = String(req.params.name || '').trim();
+    const enabled = req.body?.enabled;
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled must be a boolean' });
+    }
+
+    const servers = getMCPConfig();
+    const current = servers[name];
+    if (!current) return res.status(404).json({ error: `Unknown MCP server: ${name}` });
+
+    servers[name] = { ...current, enabled };
+    mcpManager.saveConfig(servers);
+
+    if (!enabled) {
+      await mcpManager.disconnectServer(name);
+      await recoverServerTools(name, []);
+      return res.json({ success: true, name, enabled, tools: [] });
+    }
+
+    try {
+      const tools = await mcpManager.restartServer(name);
+      const registered = await recoverServerTools(name, tools);
+      return res.json({ success: true, name, enabled, tools, registered });
+    } catch (err: any) {
+      return res.status(503).json({
+        error: err?.message || `Failed to start MCP server: ${name}`,
+        name,
+        enabled,
+        setupHint: current.setupHint,
+        setupUrl: current.setupUrl,
+      });
     }
   });
 

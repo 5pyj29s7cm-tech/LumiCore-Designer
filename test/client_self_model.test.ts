@@ -189,8 +189,8 @@ describe('Lumi client self model', () => {
       'org-messaging',
       'org-legal',
       'org-spatial-design',
-      'org-brand-design',
     ]));
+    expect(ids).not.toContain('org-brand-design');
     expect(ids).not.toContain('subscription');
   });
 

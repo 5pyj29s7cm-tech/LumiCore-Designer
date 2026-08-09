@@ -10,7 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { exec, execFile } from 'child_process';
-import { getDataPath } from '../config/data_path';
+import { getDataPath, getDataRoot } from '../config/data_path';
 import { loadKeys } from '../config/keys';
 import { runRuntimeCapabilityCleanup } from './runtime_cleanup';
 import type {
@@ -58,6 +58,13 @@ export interface MCPServerConfig {
   cachedTools?: MCPToolDef[];            // persisted declarations for on-demand process startup
   capabilityDefault?: MCPToolCapabilityDeclaration;
   toolCapabilities?: Record<string, MCPToolCapabilityDeclaration>;
+  factoryManaged?: boolean;              // built-in connector template; user controls enablement
+  setupUrl?: string;                     // upstream setup or installation reference
+  setupHint?: string;                    // concise setup guidance for the runtime UI
+  allowedTools?: string[];               // exact MCP wire names exposed by this connector
+  blockedTools?: string[];               // defense-in-depth denylist, checked again at call time
+  allowedPathRoots?: string[];           // local file arguments must remain below these roots
+  allowNetworkUrls?: boolean;            // false blocks http/file/data URLs in tool arguments
 }
 
 export interface MCPToolDef {
@@ -149,6 +156,79 @@ const DEFAULT_CONFIG_FILE: MCPConfigFile = {
       transport: 'stdio',
       description: 'Playwright MCP structured browser automation for real websites and authenticated browser tasks.',
     },
+    'paddleocr-local': {
+      command: 'uvx',
+      args: ['--from', 'paddleocr-mcp[local-cpu]', 'paddleocr_mcp'],
+      env: {
+        PADDLEOCR_MCP_MODEL: 'PP-StructureV3',
+        PADDLEOCR_MCP_PPOCR_SOURCE: 'local',
+      },
+      enabled: false,
+      source: 'external',
+      transport: 'stdio',
+      factoryManaged: true,
+      allowedTools: ['pp_structurev3'],
+      allowedPathRoots: ['${LUMI_DATA_ROOT}'],
+      allowNetworkUrls: false,
+      description: 'Local document-layout and drawing OCR for interior project files.',
+    },
+    'ifc-readonly': {
+      command: 'uvx',
+      args: ['--from', 'ifcmcp[mcp]', 'ifcmcp'],
+      enabled: false,
+      source: 'external',
+      transport: 'stdio',
+      factoryManaged: true,
+      allowedTools: [
+        'ifc_load',
+        'ifc_reset',
+        'ifc_summary',
+        'ifc_tree',
+        'ifc_info',
+        'ifc_select',
+        'ifc_relations',
+        'ifc_clash',
+        'ifc_validate',
+        'ifc_schema',
+        'ifc_contexts',
+        'ifc_materials',
+        'ifc_plot',
+        'ifc_render',
+      ],
+      blockedTools: ['ifc_new', 'ifc_save', 'ifc_shape', 'ifc_edit', 'ifc_quantify'],
+      allowedPathRoots: ['${LUMI_DATA_ROOT}'],
+      allowNetworkUrls: false,
+      description: 'Read-only IFC inspection, validation, clash review, and preview rendering.',
+    },
+    'revit-readonly': {
+      command: 'rvt-mcp',
+      args: ['--read-only', '--disable-toolbaker'],
+      env: {
+        BIMWRIGHT_READ_ONLY: '1',
+        BIMWRIGHT_ENABLE_TOOLBAKER: '0',
+        BIMWRIGHT_ENABLE_ADAPTIVE_BAKE: '0',
+      },
+      enabled: false,
+      source: 'external',
+      transport: 'stdio',
+      factoryManaged: true,
+      allowedTools: [
+        'revit_get_current_view_info',
+        'revit_get_selected_elements',
+        'revit_ai_element_filter',
+        'revit_get_element_details',
+        'revit_capture_view_image',
+      ],
+      blockedTools: [
+        'revit_send_code_to_revit',
+        'revit_list_baked_tools',
+        'revit_run_baked_tool',
+        'revit_list_bake_suggestions',
+      ],
+      allowedPathRoots: ['${LUMI_DATA_ROOT}'],
+      allowNetworkUrls: false,
+      description: 'Local Revit room, view, material, geometry, parameter, and model-audit queries in read-only mode.',
+    },
   },
   remoteDevices: {},
 };
@@ -172,6 +252,96 @@ function expandPortablePath(value: string): string {
     return path.join(os.homedir(), value.slice(2));
   }
   return value.replace(/\$\{LUMI_SKILLS_DIR\}/g, SKILLS_DIR);
+}
+
+function expandPolicyPath(value: string): string {
+  return expandPortablePath(String(value || ''))
+    .replace(/\$\{LUMI_DATA_ROOT\}/g, getDataRoot())
+    .replace(/\$\{LUMI_DATA_DIR\}/g, path.join(getDataRoot(), 'data'));
+}
+
+function shortConfiguredToolName(serverName: string, toolName: string): string {
+  const prefix = `mcp_${serverName}_`;
+  return toolName.startsWith(prefix) ? toolName.slice(prefix.length) : toolName;
+}
+
+export function isMCPToolAllowed(
+  serverName: string,
+  config: MCPServerConfig,
+  toolName: string,
+): boolean {
+  const shortName = shortConfiguredToolName(serverName, toolName);
+  const blocked = new Set((config.blockedTools || []).map(item => String(item).trim()).filter(Boolean));
+  if (blocked.has(shortName)) return false;
+  const allowed = (config.allowedTools || []).map(item => String(item).trim()).filter(Boolean);
+  return allowed.length === 0 || allowed.includes(shortName);
+}
+
+function isWithinRoot(target: string, root: string): boolean {
+  const relative = path.relative(root, target);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function canonicalPolicyPath(value: string): string {
+  const resolved = path.resolve(value);
+  let existing = resolved;
+  const missingSegments: string[] = [];
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) return resolved;
+    missingSegments.unshift(path.basename(existing));
+    existing = parent;
+  }
+  try {
+    return path.resolve(fs.realpathSync.native(existing), ...missingSegments);
+  } catch {
+    return resolved;
+  }
+}
+
+function isPathArgumentKey(key: string): boolean {
+  const normalized = key.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
+  return /(^|_)(path|paths|file|files|filepath|filename|directory|directories|folder|folders|root|roots)($|_)/i.test(normalized);
+}
+
+export function assertMCPToolArgumentsAllowed(
+  serverName: string,
+  config: MCPServerConfig,
+  args: Record<string, any>,
+): void {
+  const roots = (config.allowedPathRoots || [])
+    .map(expandPolicyPath)
+    .filter(Boolean)
+    .map(canonicalPolicyPath);
+
+  const inspect = (value: unknown, key: string): void => {
+    if (Array.isArray(value)) {
+      value.forEach(item => inspect(item, key));
+      return;
+    }
+    if (value && typeof value === 'object') {
+      for (const [nestedKey, nestedValue] of Object.entries(value as Record<string, unknown>)) {
+        inspect(nestedValue, nestedKey);
+      }
+      return;
+    }
+    if (typeof value !== 'string' || !value.trim()) return;
+    const text = value.trim();
+    const isWindowsPath = /^[a-z]:[\\/]/i.test(text);
+    if (!isWindowsPath && /^[a-z][a-z0-9+.-]*:/i.test(text)) {
+      if (config.allowNetworkUrls === false) {
+        throw new Error(`MCP server "${serverName}" blocks URL arguments for this managed connector`);
+      }
+      return;
+    }
+    if (!isPathArgumentKey(key) || roots.length === 0) return;
+    const target = canonicalPolicyPath(expandPolicyPath(text));
+    if (!roots.some(root => isWithinRoot(target, root))) {
+      throw new Error(`MCP server "${serverName}" blocks paths outside its approved project roots`);
+    }
+  };
+
+  for (const [key, value] of Object.entries(args || {})) inspect(value, key);
 }
 
 function toPortableSkillPath(filePath: string): string {
@@ -320,27 +490,59 @@ export class MCPClientManager {
       return [];
     }
     const runtime = this.readConfigFile();
+    if (!runtime.mcpServers) runtime.mcpServers = {};
     const updated: string[] = [];
     for (const [name, factoryServer] of Object.entries(factory.mcpServers || {})) {
-      const runtimeServer = runtime.mcpServers?.[name];
+      let runtimeServer = runtime.mcpServers[name];
+      if (!runtimeServer && factoryServer.factoryManaged) {
+        runtimeServer = JSON.parse(JSON.stringify(factoryServer));
+        runtimeServer.enabled = false;
+        runtime.mcpServers[name] = runtimeServer;
+        updated.push(name);
+      }
       if (!runtimeServer) continue;
       const nextDefault = factoryServer.capabilityDefault;
       const nextTools = factoryServer.toolCapabilities;
+      const managedSafetyFields: Array<keyof MCPServerConfig> = [
+        'factoryManaged',
+        'setupUrl',
+        'setupHint',
+        'allowedTools',
+        'blockedTools',
+        'allowedPathRoots',
+        'allowNetworkUrls',
+        ...(factoryServer.factoryManaged
+          ? ['command', 'args', 'env', 'source', 'transport'] as Array<keyof MCPServerConfig>
+          : []),
+      ];
+      const safetyMatches = managedSafetyFields.every(field => (
+        JSON.stringify(runtimeServer?.[field] ?? null) === JSON.stringify(factoryServer[field] ?? null)
+      ));
       if (
         JSON.stringify(runtimeServer.capabilityDefault || null) === JSON.stringify(nextDefault || null)
         && JSON.stringify(runtimeServer.toolCapabilities || null) === JSON.stringify(nextTools || null)
+        && safetyMatches
       ) continue;
       if (nextDefault) runtimeServer.capabilityDefault = JSON.parse(JSON.stringify(nextDefault));
       else delete runtimeServer.capabilityDefault;
       if (nextTools) runtimeServer.toolCapabilities = JSON.parse(JSON.stringify(nextTools));
       else delete runtimeServer.toolCapabilities;
+      for (const field of managedSafetyFields) {
+        const value = factoryServer[field];
+        if (value === undefined) delete runtimeServer[field];
+        else (runtimeServer as any)[field] = JSON.parse(JSON.stringify(value));
+      }
       updated.push(name);
     }
     const migrations = runtime.migrations || {};
-    const markerChanged = Number(migrations.mcpCapabilityDeclarationsV1 || 0) < 1;
-    if (markerChanged) runtime.migrations = { ...migrations, mcpCapabilityDeclarationsV1: 1 };
+    const markerChanged = Number(migrations.mcpConnectorTemplatesV1 || 0) < 1;
+    if (markerChanged) runtime.migrations = {
+      ...migrations,
+      mcpCapabilityDeclarationsV1: 1,
+      mcpConnectorTemplatesV1: 1,
+    };
     if (updated.length > 0 || markerChanged) this.saveConfigFile(runtime);
-    return updated.sort((left, right) => left.localeCompare(right));
+    return Array.from(new Set(updated)).sort((left, right) => left.localeCompare(right));
   }
 
   private readConfigFile(): MCPConfigFile {
@@ -1304,8 +1506,11 @@ main().catch((err) => { console.error('[npm-skill] Fatal:', err); process.exit(1
       }
 
       if (this.isProcessBacked(serverConfig) && serverConfig.cachedTools?.length) {
-        allTools.push(...serverConfig.cachedTools);
-        console.log(`[MCP] ${serverName}: ${serverConfig.cachedTools.length} cached tools ready on demand`);
+        const cachedTools = serverConfig.cachedTools.filter(tool => (
+          isMCPToolAllowed(serverName, serverConfig, tool.name)
+        ));
+        allTools.push(...cachedTools);
+        console.log(`[MCP] ${serverName}: ${cachedTools.length} cached tools ready on demand`);
         continue;
       }
 
@@ -1345,7 +1550,7 @@ main().catch((err) => { console.error('[npm-skill] Fatal:', err); process.exit(1
           description: tool.description || `${tool.name} (from MCP server: ${name})`,
           inputSchema: tool.inputSchema || { type: 'object', properties: {} },
           annotations: tool.annotations,
-        }));
+        })).filter(tool => isMCPToolAllowed(name, config, tool.name));
       } catch {
         // Stale connection — clean up and reconnect below
         this.servers.delete(name);
@@ -1452,7 +1657,7 @@ main().catch((err) => { console.error('[npm-skill] Fatal:', err); process.exit(1
       description: tool.description || `${tool.name} (from MCP server: ${name})`,
       inputSchema: tool.inputSchema || { type: 'object', properties: {} },
       annotations: tool.annotations,
-    }));
+    })).filter(tool => isMCPToolAllowed(name, config, tool.name));
   }
 
   async callTool(fullName: string, args: Record<string, any>, options: MCPCallOptions = {}): Promise<string> {
@@ -1468,6 +1673,10 @@ main().catch((err) => { console.error('[npm-skill] Fatal:', err); process.exit(1
     const serverConfig = config[serverName] || existingServer?.config;
     if (!serverConfig) throw new Error(`MCP server "${serverName}" is not configured`);
     if (serverConfig.enabled === false) throw new Error(`MCP server "${serverName}" is disabled`);
+    if (!isMCPToolAllowed(serverName, serverConfig, toolName)) {
+      throw new Error(`MCP tool "${toolName}" is blocked by connector policy`);
+    }
+    assertMCPToolArgumentsAllowed(serverName, serverConfig, args);
     if (this.isMissingRequiredApiKey(serverConfig)) {
       throw new Error(`MCP server "${serverName}" requires ${serverConfig.apiKeyEnv}`);
     }

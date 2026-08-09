@@ -9131,6 +9131,54 @@
     "en": "The current task could not be cancelled.",
     "zh": "\u65e0\u6cd5\u53d6\u6d88\u5f53\u524d\u4efb\u52a1\u3002"
   },
+  "mcpsettings.connector-enabled": {
+    "en": "Connector enabled",
+    "zh": "\u8fde\u63a5\u5df2\u542f\u7528"
+  },
+  "mcpsettings.connector-disabled": {
+    "en": "Connector disabled",
+    "zh": "\u8fde\u63a5\u5df2\u505c\u7528"
+  },
+  "mcpsettings.connector-update-failed": {
+    "en": "Connector update failed",
+    "zh": "\u8fde\u63a5\u5668\u66f4\u65b0\u5931\u8d25"
+  },
+  "mcpsettings.managed": {
+    "en": "Managed",
+    "zh": "\u53d7\u63a7\u8fde\u63a5"
+  },
+  "mcpsettings.read-only": {
+    "en": "Read-only",
+    "zh": "\u53ea\u8bfb"
+  },
+  "mcpsettings.setup-instructions": {
+    "en": "Setup instructions",
+    "zh": "\u5b89\u88c5\u4e0e\u8fde\u63a5\u8bf4\u660e"
+  },
+  "mcpsettings.enable": {
+    "en": "Enable",
+    "zh": "\u542f\u7528"
+  },
+  "mcpsettings.disable": {
+    "en": "Disable",
+    "zh": "\u505c\u7528"
+  },
+  "mcpsettings.ready-on-demand": {
+    "en": "Ready on demand",
+    "zh": "\u5c31\u7eea\uff0c\u6309\u9700\u542f\u52a8"
+  },
+  "mcpsettings.disabled": {
+    "en": "Disabled",
+    "zh": "\u5df2\u505c\u7528"
+  },
+  "mcpsettings.managed-spatial-connectors": {
+    "en": "Managed spatial-design connectors",
+    "zh": "\u53d7\u63a7\u7a7a\u95f4\u8bbe\u8ba1\u8fde\u63a5"
+  },
+  "mcpsettings.managed-spatial-connectors-description": {
+    "en": "Optional local connectors for drawing OCR and read-only IFC/Revit review. They are disabled until you explicitly enable them.",
+    "zh": "\u7528\u4e8e\u56fe\u7eb8 OCR \u548c IFC/Revit \u53ea\u8bfb\u5ba1\u67e5\u7684\u53ef\u9009\u672c\u5730\u8fde\u63a5\uff0c\u9700\u8981\u4f60\u624b\u52a8\u542f\u7528\u3002"
+  },
   "agent-chat-page.cancelling.7163e20e93": {
     "en": "Cancelling",
     "zh": "\u6b63\u5728\u53d6\u6d88"

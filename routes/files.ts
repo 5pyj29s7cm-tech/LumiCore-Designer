@@ -22,7 +22,12 @@ import { buildKnowledgeIngestionManifest, evaluateKnowledgeManifest, hashKnowled
 import { getDataPath, getDataRoot } from '../server/config/data_path';
 import { getJwtSecret } from '../server/config/local_identity';
 import * as OrgKB from '../server/org/kb';
-import { getMember } from '../server/org/db';
+import { getMember, logAudit } from '../server/org/db';
+import { getInteriorProject } from '../server/design/projects';
+import {
+  createInteriorProjectAsset,
+  normalizeInteriorAssetCategory,
+} from '../server/design/project_assets';
 import { analyzeScreen } from '../server/llm/adapter';
 import { getUserPreferredVision, type VisionProvider } from '../server/llm/vision_preferences';
 import { AUDIO_FILE_EXTS, isAudioTranscriptionUnavailable, transcribeAudioFile } from '../server/stt/file_transcription';
@@ -1983,22 +1988,73 @@ router.post('/files/upload', requireAuth, upload.array('files', MAX_UPLOAD_FILES
     const userId = getUserId(req);
     const scope = getFileScope(req);
     assertKnowledgeWriteAccess(scope);
+    const interiorProjectId = String(req.body?.interiorProjectId || '').trim();
+    const interiorAssetCategory = interiorProjectId
+      ? normalizeInteriorAssetCategory(req.body?.interiorAssetCategory)
+      : undefined;
+    if (interiorProjectId) {
+      if (scope.domain !== 'work' || !scope.orgId) {
+        const error: any = new Error('Interior project files require an organization workspace');
+        error.status = 400;
+        throw error;
+      }
+      if (!getInteriorProject(scope.orgId, interiorProjectId)) {
+        const error: any = new Error('Interior project not found');
+        error.status = 404;
+        throw error;
+      }
+    }
     const db = readDB();
     if (!db.knowledgeFiles) db.knowledgeFiles = [];
 
     const saved: any[] = [];
     for (const file of uploadedFiles) {
-      saved.push(await saveKnowledgeFile({
+      const entry = await saveKnowledgeFile({
         sourcePath: file.path,
         originalName: file.originalname,
         size: file.size,
         mimeType: file.mimetype || '',
         move: true,
-      }, userId, scope, db));
+      }, userId, scope, db);
+      if (interiorProjectId && scope.orgId) {
+        const projectAsset = createInteriorProjectAsset({
+          orgId: scope.orgId,
+          projectId: interiorProjectId,
+          fileId: entry.id,
+          displayName: entry.displayName || entry.name || entry.id,
+          mimeType: entry.mimeType || file.mimetype || '',
+          rawSize: entry.rawSize || file.size,
+          category: interiorAssetCategory,
+          uploadedBy: userId,
+          extractionStatus: entry.extractionStatus,
+          orgArticleId: entry.orgArticleId,
+        });
+        entry.interiorProjectAsset = projectAsset;
+      }
+      saved.push(entry);
     }
     writeDB(db);
+    if (interiorProjectId && scope.orgId) {
+      logAudit({
+        orgId: scope.orgId,
+        userId,
+        action: 'interior_project.assets_uploaded',
+        resourceType: 'interior_project',
+        resourceId: interiorProjectId,
+        details: {
+          category: interiorAssetCategory,
+          fileCount: saved.length,
+          fileIds: saved.map(file => file.id),
+        },
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      });
+    }
     res.json({ success: true, files: saved });
   } catch (err: any) {
+    for (const file of (req.files as Express.Multer.File[] | undefined) || []) {
+      try { if (fs.existsSync(file.path)) fs.unlinkSync(file.path); } catch {}
+    }
     sendRouteError(res, err);
   }
 });

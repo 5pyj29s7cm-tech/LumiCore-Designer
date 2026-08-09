@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spatial & Interior Studio"
+  short_description: "Interior planning, drawing QA, and BIM review"
+  default_prompt: "Use $design-studio-pack to review this interior project and produce evidence-backed next steps."

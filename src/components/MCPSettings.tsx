@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Cpu, RefreshCw, CheckCircle, XCircle, Wrench, Sparkles, Download, Plus, AlertTriangle, XOctagon } from 'lucide-react';
+import { Cpu, RefreshCw, CheckCircle, XCircle, Wrench, Sparkles, Download, Plus, AlertTriangle, XOctagon, ExternalLink, ShieldCheck } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { toast } from 'sonner';
@@ -24,10 +24,15 @@ interface MCPServer {
   requiresApiKey?: boolean;
   apiKeyEnv?: string;
   apiKeyUrl?: string;
+  factoryManaged?: boolean;
+  setupUrl?: string;
+  setupHint?: string;
+  allowedTools?: string[];
+  blockedTools?: string[];
 }
 
 interface ServerHealth {
-  status: 'connected' | 'restarting' | 'crashed' | 'failed' | 'disconnected';
+  status: 'connected' | 'idle' | 'restarting' | 'crashed' | 'failed' | 'disconnected';
   consecutiveCrashes: number;
   lastCrashTime?: string;
   lastSuccessfulConnect?: string;
@@ -130,6 +135,7 @@ export function MCPSettings({ t }: { t?: any }) {
     try {
       const res = await fetch(`/api/mcp/restart/${name}`, { method: 'POST' });
       const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Restart failed');
       toast.success(`${data.tools?.length || 0} ${t?.mcpToolsReconnected || 'tools reconnected'}`);
       fetchServers();
     } catch (err: any) {
@@ -186,13 +192,13 @@ export function MCPSettings({ t }: { t?: any }) {
                 <div className="flex items-center gap-4">
                   {(() => {
                     const h = healthMap[server.name];
-                    const status = h?.status || (server.connected ? 'connected' : 'disconnected');
-                    const icon = status === 'connected' ? <CheckCircle size={20} />
+                    const status = !server.enabled ? 'disabled' : h?.status || (server.connected ? 'connected' : 'disconnected');
+                    const icon = status === 'connected' || status === 'idle' ? <CheckCircle size={20} />
                       : status === 'restarting' ? <RefreshCw size={20} className="animate-spin" />
                       : status === 'crashed' ? <AlertTriangle size={20} />
                       : status === 'failed' ? <XOctagon size={20} />
                       : <XCircle size={20} />;
-                    const bg = status === 'connected' ? 'bg-green-500/10 text-green-500'
+                    const bg = status === 'connected' || status === 'idle' ? 'bg-green-500/10 text-green-500'
                       : status === 'restarting' ? 'bg-amber-500/10 text-amber-400'
                       : status === 'crashed' ? 'bg-red-500/10 text-red-400'
                       : status === 'failed' ? 'bg-red-500/10 text-red-400'
@@ -215,10 +221,33 @@ export function MCPSettings({ t }: { t?: any }) {
                       {server.toolCount != null && (
                         <span className="text-[12px] text-white/45">{server.toolCount} tools</span>
                       )}
+                      {server.factoryManaged && (
+                        <span className="text-xs px-1.5 py-0.5 bg-violet-500/15 text-violet-300 border border-violet-500/25 rounded-full font-bold uppercase flex items-center gap-1">
+                          <ShieldCheck size={9} /> {uiMessage('mcpsettings.managed', isZh ? 'zh' : 'en')}
+                        </span>
+                      )}
+                      {server.name.endsWith('-readonly') && (
+                        <span className="text-xs px-1.5 py-0.5 bg-sky-500/15 text-sky-300 border border-sky-500/25 rounded-full font-bold uppercase">
+                          {uiMessage('mcpsettings.read-only', isZh ? 'zh' : 'en')}
+                        </span>
+                      )}
                     </div>
                     <p className="text-xs text-white/55 font-mono">{server.command} {server.args.join(' ')}</p>
                     {server.description && (
                       <p className="text-xs text-white/55 mt-1">{server.description}</p>
+                    )}
+                    {server.setupHint && !server.connected && (
+                      <p className="text-xs text-amber-200/70 mt-2 max-w-3xl">{server.setupHint}</p>
+                    )}
+                    {server.setupUrl && (
+                      <a
+                        href={server.setupUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 mt-2 text-xs text-celestial-saturn hover:underline"
+                      >
+                        {uiMessage('mcpsettings.setup-instructions', isZh ? 'zh' : 'en')} <ExternalLink size={11} />
+                      </a>
                     )}
                   </div>
                 </div>
@@ -238,23 +267,25 @@ export function MCPSettings({ t }: { t?: any }) {
 
               {(() => {
                 const h = healthMap[server.name];
-                const status = h?.status || (server.connected ? 'connected' : 'disconnected');
+                const status = !server.enabled ? 'disabled' : h?.status || (server.connected ? 'connected' : 'disconnected');
                 const crashes = h?.consecutiveCrashes || 0;
                 const statusLabel =
                   status === 'connected' ? (t?.mcpConnected || (uiMessage('mcpsettings.connected.77956f6a16', (isZh) ? 'zh' : 'en')))
+                  : status === 'idle' ? uiMessage('mcpsettings.ready-on-demand', isZh ? 'zh' : 'en')
                   : status === 'restarting' ? (t?.mcpRestarting || (formatUiMessage('mcpsettings.restarting-value0.9df23d736e', { value0: { en: crashes > 0 ? ` (${crashes})` : '', zh: crashes > 0 ? ` (第${crashes}次)` : '' } }, (isZh) ? 'zh' : 'en')))
                   : status === 'crashed' ? (t?.mcpCrashed || (formatUiMessage('mcpsettings.crashed-value0.9f395a7f76', { value0: crashes }, (isZh) ? 'zh' : 'en')))
                   : status === 'failed' ? (t?.mcpFailed || (formatUiMessage('mcpsettings.failed-value0-attempts.1ed6701254', { value0: crashes }, (isZh) ? 'zh' : 'en')))
+                  : status === 'disabled' ? uiMessage('mcpsettings.disabled', isZh ? 'zh' : 'en')
                   : t?.mcpDisconnected || (uiMessage('mcpsettings.disconnected.0065488a05', (isZh) ? 'zh' : 'en'));
                 const dotColor =
-                  status === 'connected' ? 'bg-green-500'
+                  status === 'connected' || status === 'idle' ? 'bg-green-500'
                   : status === 'restarting' ? 'bg-amber-400'
                   : status === 'crashed' ? 'bg-red-500'
                   : status === 'failed' ? 'bg-red-600'
                   : 'bg-white/20';
                 const dotAnim = status === 'connected' || status === 'restarting' ? 'animate-pulse' : '';
                 const textColor =
-                  status === 'connected' ? 'text-green-500'
+                  status === 'connected' || status === 'idle' ? 'text-green-500'
                   : status === 'restarting' ? 'text-amber-400'
                   : status === 'crashed' || status === 'failed' ? 'text-red-400'
                   : 'text-white/45';
