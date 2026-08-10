@@ -1149,6 +1149,12 @@ function collectAutocadDrawOperations(args: Record<string, any>): AutocadDrawOpe
     const leafX = maybeNumber(door?.leafX) ?? hingeX + Math.cos(angle * Math.PI / 180) * doorWidth;
     const leafY = maybeNumber(door?.leafY) ?? hingeY + Math.sin(angle * Math.PI / 180) * doorWidth;
     const openAngle = Math.max(20, Math.min(135, asFiniteNumber(door?.openAngle, 90)));
+    const arcStart = sign >= 0
+      ? normalizeDegrees(angle)
+      : normalizeDegrees(angle - openAngle);
+    const arcEnd = sign >= 0
+      ? normalizeDegrees(angle + openAngle)
+      : normalizeDegrees(angle);
     pushLineOp(ops, safeLayer(door?.layer, 'DOOR'), hingeX, hingeY, leafX, leafY, door?.label || 'door leaf');
     ops.push({
       kind: 'arc',
@@ -1156,8 +1162,8 @@ function collectAutocadDrawOperations(args: Record<string, any>): AutocadDrawOpe
       cx: hingeX,
       cy: hingeY,
       r: doorWidth,
-      start: normalizeDegrees(angle),
-      end: normalizeDegrees(angle + sign * openAngle),
+      start: arcStart,
+      end: arcEnd,
       label: door?.label || 'door swing',
     });
     pushTextOp(ops, hingeX + 80, hingeY + 80, door?.label || door?.name, door?.textHeight || 180, 'TEXT', 'door label');
@@ -2259,7 +2265,7 @@ export function registerExternalAppTools(registry: ToolRegistry): void {
       const geometryVerificationRequired = isImageCadSource(draftArgs.sourcePath);
 
       fs.writeFileSync(paths.operationsPath, JSON.stringify({
-        version: 2,
+        version: 3,
         generatedAt: new Date().toISOString(),
         title,
         unit: draftArgs.unit || 'unit',
@@ -2274,7 +2280,7 @@ export function registerExternalAppTools(registry: ToolRegistry): void {
         operations,
       }, null, 2), 'utf-8');
       const manifest = {
-        version: 2,
+        version: 3,
         generatedAt: new Date().toISOString(),
         title,
         sourcePath: draftArgs.sourcePath || '',

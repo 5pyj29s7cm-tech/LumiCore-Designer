@@ -18,12 +18,13 @@ describe('AutoCAD MCP control', () => {
       const markerPath = path.join(dir, 'plan_completed.txt');
       const operations = [
         { kind: 'line', layer: 'WALL', x1: 0, y1: 0, x2: 4000, y2: 0 },
+        { kind: 'arc', layer: 'DOOR_SWING', cx: 1000, cy: 1000, r: 900, start: 270, end: 0 },
         { kind: 'text', layer: 'TEXT', x: 200, y: 200, text: 'Room', height: 180 },
       ];
       const geometryHash = crypto.createHash('sha256').update('verified manual geometry').digest('hex');
       const operationSetId = crypto.createHash('sha256').update(JSON.stringify({ geometryHash, operations })).digest('hex');
       fs.writeFileSync(operationsPath, JSON.stringify({
-        version: 2,
+        version: 3,
         title: 'Visible MCP plan',
         geometryHash,
         geometryVerified: true,
@@ -40,7 +41,7 @@ describe('AutoCAD MCP control', () => {
         strokeDelayMs: 450,
       });
 
-      expect(payload.operations).toHaveLength(2);
+      expect(payload.operations).toHaveLength(3);
       expect(payload.operationSetId).toBe(operationSetId);
       expect(script).toContain("GetActiveObject('AutoCAD.Application')");
       expect(script).toContain("$ProgressPreference = 'SilentlyContinue'");
@@ -56,6 +57,10 @@ describe('AutoCAD MCP control', () => {
       expect(script).toContain('$model.AddLine');
       expect(script).toContain('return ,([double[]]@($x, $y, 0.0))');
       expect(script).toContain('$model.AddText');
+      expect(script).toContain('$model.AddArc');
+      expect(script).toContain('$validatedOperationsBase64');
+      expect(script).not.toContain('$payload = Get-Content');
+      expect(script).not.toContain('$swap = $start');
       expect(script).toContain('$doc.Regen(1)');
       expect(script).toContain('$startingEntityCount = if ($resumeCompleted -gt 0)');
       expect(script).toContain('function WaitForEntityCount');
@@ -115,7 +120,7 @@ describe('AutoCAD MCP control', () => {
       const geometryHash = crypto.createHash('sha256').update('verified manual geometry').digest('hex');
       const operationSetId = crypto.createHash('sha256').update(JSON.stringify({ geometryHash, operations })).digest('hex');
       fs.writeFileSync(operationsPath, JSON.stringify({
-        version: 2,
+        version: 3,
         title: 'Cached plan',
         geometryHash,
         geometryVerified: true,

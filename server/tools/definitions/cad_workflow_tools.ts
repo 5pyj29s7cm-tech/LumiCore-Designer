@@ -329,15 +329,16 @@ export function registerCadWorkflowTools(registry: ToolRegistry): void {
       }
     },
     permission: 'user',
-    securityLevel: 'safe',
+    securityLevel: 'confirm',
     capability: {
       id: 'cad.floorplan.autocad.visible_draw',
       family: 'cad_drafting',
       lane: 'cad',
       operation: 'create',
-      risk: 'medium',
+      risk: 'high',
       sideEffects: [
-        { type: 'desktop_control', scope: 'active AutoCAD drawing', reversible: true },
+        { type: 'desktop_control', scope: 'visible AutoCAD document and entities', reversible: false },
+        { type: 'process_execution', scope: 'audited PowerShell AutoCAD COM bridge', reversible: false },
         { type: 'local_write', scope: 'audited CAD operation and completion receipts', reversible: true },
       ],
       verification: {

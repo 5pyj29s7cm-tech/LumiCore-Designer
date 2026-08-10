@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 import { ToolRegistry } from '../server/tools/registry';
 import { registerExternalAppTools } from '../server/tools/definitions/external_app_tools';
+import { registerCadWorkflowTools } from '../server/tools/definitions/cad_workflow_tools';
 import { validateCadGeometry, writeCadGeometryReceipt } from '../server/cad/geometry_verification';
 
 const VERIFIED_VISUAL = {
@@ -149,6 +150,68 @@ describe('AutoCAD MCP operation preparation', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('preserves 90-degree door swings across the 0-degree boundary', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi_autocad_door_arcs_'));
+    try {
+      const registry = new ToolRegistry();
+      registerExternalAppTools(registry);
+      const result = JSON.parse(await registry.execute('cad_prepare_autocad_operations', {
+        title: 'door-arc-quadrants',
+        width: 5000,
+        height: 4000,
+        outputDirectory: dir,
+        doors: [
+          { hingeX: 500, hingeY: 500, width: 900, angle: 270, swing: 'left', label: 'cross-left' },
+          { hingeX: 1500, hingeY: 500, width: 900, angle: 0, swing: 'right', label: 'cross-right' },
+          { hingeX: 2500, hingeY: 500, width: 900, angle: 0, swing: 'left', label: 'plain-left' },
+          { hingeX: 3500, hingeY: 500, width: 900, angle: 270, swing: 'right', label: 'plain-right' },
+        ],
+      }, { allowLocalFileWrites: true }));
+      const payload = JSON.parse(fs.readFileSync(result.operationsPath, 'utf-8'));
+      type ArcOperation = { label: string; start: number; end: number };
+      const arcOperations = payload.operations
+        .filter((operation: any) => operation.kind === 'arc') as ArcOperation[];
+      const arcs = new Map<string, ArcOperation>(arcOperations
+        .map(operation => [operation.label, operation]));
+
+      expect(payload.version).toBe(3);
+      expect(arcs.get('cross-left')).toMatchObject({ start: 270, end: 0 });
+      expect(arcs.get('cross-right')).toMatchObject({ start: 270, end: 0 });
+      expect(arcs.get('plain-left')).toMatchObject({ start: 0, end: 90 });
+      expect(arcs.get('plain-right')).toMatchObject({ start: 180, end: 270 });
+      for (const arc of arcs.values()) {
+        const sweep = ((arc.end - arc.start) % 360 + 360) % 360;
+        expect(sweep).toBe(90);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('classifies visible AutoCAD drawing as high-risk irreversible control', () => {
+    const registry = new ToolRegistry();
+    registerCadWorkflowTools(registry);
+    const tool = registry.get('cad_draw_floorplan_in_autocad');
+
+    expect(tool?.securityLevel).toBe('confirm');
+    expect(tool?.capability?.risk).toBe('high');
+    expect(tool?.capability?.sideEffects).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'desktop_control', reversible: false }),
+      expect.objectContaining({ type: 'process_execution', reversible: false }),
+    ]));
+  });
+
+  it('keeps the bundled skill version and advertised tool count aligned', () => {
+    const skillRoot = path.resolve('server/skills/bundled/cad-drafting');
+    const manifest = JSON.parse(fs.readFileSync(path.join(skillRoot, 'package.json'), 'utf-8'));
+    const serverSource = fs.readFileSync(path.join(skillRoot, 'index.ts'), 'utf-8');
+    const registeredTools = Array.from(serverSource.matchAll(/server\.registerTool\(/g));
+
+    expect(serverSource).toContain(`version: '${manifest.version}'`);
+    expect(manifest.lumi.toolCount).toBe(registeredTools.length);
+    expect(manifest.lumi.toolCount).toBe(5);
   });
 
   it('refuses to invent fallback dimensions when geometry is incomplete', async () => {
