@@ -66,7 +66,7 @@ type ChatExecutionSnapshot = {
 
 type PersistedChatExecution = {
   requestId: string;
-  source: 'chat';
+  source: string;
   domain: 'personal' | 'work';
   orgId?: string;
   startedAt: string;
@@ -366,6 +366,9 @@ function extractGeneratedFiles(text: string): GeneratedFileLink[] {
 
 export function AgentChatPage({ t, user, agent, isOpen, onClose, prefillMessage, prefillSource = 'proactive', onPrefillConsumed, attachmentRequest, onAttachmentRequestConsumed }: { t: any; user: any; agent?: any; isOpen: boolean; onClose: () => void; prefillMessage?: string; prefillSource?: string; onPrefillConsumed?: () => void; attachmentRequest?: ChatAttachmentRequest; onAttachmentRequestConsumed?: (requestId: string) => void }) {
   const [messages, setMessages] = useState<any[]>([]);
+  // Variants keep their specialized workbench layout, while retaining the
+  // source-bound execution resume/abort safeguards from the shared chat core.
+  const chatExecutionSource = 'chat';
   const isZh = t?.langCode !== 'en';
   const ui = (zh: string, en: string) => isZh ? zh : en;
   const { platform, isElectron } = usePlatform();
@@ -1203,14 +1206,14 @@ export function AgentChatPage({ t, user, agent, isOpen, onClose, prefillMessage,
     try {
       const execution: PersistedChatExecution = {
         requestId,
-        source: 'chat',
+        source: chatExecutionSource,
         domain: activeDomain,
         orgId: activeOrgId || undefined,
         startedAt: new Date().toISOString(),
       };
       localStorage.setItem(activeExecutionStorageKey, JSON.stringify(execution));
     } catch {}
-  }, [activeDomain, activeExecutionStorageKey, activeOrgId]);
+  }, [activeDomain, activeExecutionStorageKey, activeOrgId, chatExecutionSource]);
   const clearPersistedExecution = useCallback((requestId?: string) => {
     try {
       if (requestId) {
@@ -1228,7 +1231,7 @@ export function AgentChatPage({ t, user, agent, isOpen, onClose, prefillMessage,
       const activeRequestId = activeChatRequestIdRef.current;
       if (activeRequestId) return data?.requestId === activeRequestId;
       if (data?.requestId) return false;
-      if (data?.source && data.source !== 'chat') return false;
+      if (data?.source && data.source !== chatExecutionSource) return false;
       return textChatActiveRef.current;
     };
 
@@ -1655,6 +1658,7 @@ export function AgentChatPage({ t, user, agent, isOpen, onClose, prefillMessage,
     agentId,
     agentName,
     bindAttachmentContextToConversation,
+    chatExecutionSource,
     clearChatProgress,
     clearPersistedExecution,
     finishChatProgress,
@@ -1703,7 +1707,7 @@ export function AgentChatPage({ t, user, agent, isOpen, onClose, prefillMessage,
 
       socket.emit('agent:execution_resume', {
         requestId: persisted.requestId,
-        source: 'chat',
+        source: persisted.source || chatExecutionSource,
         domain: persisted.domain,
         orgId: persisted.orgId || null,
       }, (result?: { ok?: boolean; snapshot?: ChatExecutionSnapshot; error?: string }) => {
@@ -1733,7 +1737,7 @@ export function AgentChatPage({ t, user, agent, isOpen, onClose, prefillMessage,
     socket.on('connect', resumeActiveExecution);
     if (socket.connected) resumeActiveExecution();
     return () => { socket.off('connect', resumeActiveExecution); };
-  }, [activeExecutionStorageKey, clearPersistedExecution, isFounder, isZh, pushChatProgress, socket]);
+  }, [activeExecutionStorageKey, chatExecutionSource, clearPersistedExecution, isFounder, isZh, pushChatProgress, socket]);
 
   useEffect(() => {
     // Scroll to bottom when messages change (new messages, initial load)
@@ -1868,7 +1872,7 @@ export function AgentChatPage({ t, user, agent, isOpen, onClose, prefillMessage,
     const isCurrentResponse = (data?: { requestId?: string; source?: string }) => {
       if (data?.requestId) return data.requestId === requestId;
       if (activeChatRequestIdRef.current) return false;
-      if (data?.source && data.source !== 'chat') return false;
+      if (data?.source && data.source !== chatExecutionSource) return false;
       return textChatActiveRef.current;
     };
     const cleanupSocketWaiters = () => {
@@ -1919,7 +1923,7 @@ export function AgentChatPage({ t, user, agent, isOpen, onClose, prefillMessage,
 
         socket.emit('agent:execution_resume', {
           requestId,
-          source: 'chat',
+          source: chatExecutionSource,
           domain: activeDomain,
           orgId: activeOrgId || null,
         }, (result?: { ok?: boolean; snapshot?: ChatExecutionSnapshot; error?: string }) => {
@@ -1966,7 +1970,7 @@ export function AgentChatPage({ t, user, agent, isOpen, onClose, prefillMessage,
       agentId,
       domain: activeDomain,
       orgId: activeOrgId || null,
-      source: 'chat',
+      source: chatExecutionSource,
       operationMode,
       requestId,
     };
@@ -2030,7 +2034,7 @@ export function AgentChatPage({ t, user, agent, isOpen, onClose, prefillMessage,
     }, 8000);
     socket.emit('agent:abort_chat', {
       requestId,
-      source: 'chat',
+      source: chatExecutionSource,
       domain: activeDomain,
       orgId: activeOrgId || null,
     }, (result?: { ok?: boolean; error?: string }) => {
