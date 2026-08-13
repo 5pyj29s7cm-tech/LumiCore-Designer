@@ -20,6 +20,7 @@ import {
 } from "../cognition/response_delivery";
 import type { LumiTurnFlow } from "../cognition/turn_flow";
 import type { ToolExecutionRecord } from "../tools/types";
+import { getIndustryWorkflowTask, recordIndustryWorkflowExecution } from "../industry/workflow_service";
 
 const REST_CHAT_BASE_SYSTEM_INSTRUCTION =
   'You are Lumi, the local core intelligence. Be professional, thoughtful, forward-looking, concise, and useful. Follow the user-facing response-language instruction while keeping internal protocols, tool names, state fields, and execution policy in canonical English.';
@@ -98,6 +99,19 @@ function finalizeRestChatResponse(input: {
     source: input.source,
     flow: input.flow,
   });
+}
+
+function bindIndustryToolRecords(records: ToolExecutionRecord[], input: {
+  workTakeoverTaskId: string;
+  conversationTaskId: string;
+  requestId: string;
+}): ToolExecutionRecord[] {
+  return records.map(record => ({
+    ...record,
+    taskId: record.taskId || input.conversationTaskId,
+    requestId: record.requestId || input.requestId,
+    idempotencyKey: record.idempotencyKey || `industry:${input.workTakeoverTaskId}:${record.id || record.name}`,
+  }));
 }
 
 function dateLikeToIso(value: unknown, fallback = Date.now()): string {
@@ -220,6 +234,14 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
     const requestScope = req.user ? resolveDomain(req.user) : { domain: 'personal' as const, orgId: '' };
     const domain = requestScope.domain;
     const orgId = requestScope.orgId;
+    const industryWorkflowTaskId = String(req.body?.industryWorkflowTaskId || '').trim();
+    const industryWorkflowTask = industryWorkflowTaskId
+      ? getIndustryWorkflowTask({ userId, domain, orgId }, industryWorkflowTaskId)
+      : null;
+    if (industryWorkflowTaskId && !industryWorkflowTask) {
+      return res.status(404).json({ error: 'Industry workflow task not found in the current user scope.' });
+    }
+    const industryWorkflow = industryWorkflowTask?.metadata?.industryWorkflow || {};
     const routeText = buildRestChatRouteText(messages, prompt);
     const restTurnDispatch = buildLumiTurnDispatch({
       userId,
@@ -253,6 +275,13 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
       actionIntent: routeText,
       routedTaskText: restTurnDispatch.flow.routeText,
       toolPolicy: restExecutionDecision.toolPolicy,
+      ...(industryWorkflowTask
+        ? {
+            taskId: String(industryWorkflow.conversationTaskId || ''),
+            conversationId: String(industryWorkflow.conversationId || ''),
+            requestId: String(industryWorkflow.requestId || ''),
+          }
+        : {}),
     };
     const systemInstruction = buildRestChatSystemInstruction({
       routeText,
@@ -351,10 +380,17 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
           restTextGate.finish();
 
           responseText = result.text || '';
+          const boundRecords = industryWorkflowTask
+            ? bindIndustryToolRecords(result.toolCalls, {
+                workTakeoverTaskId: industryWorkflowTask.id,
+                conversationTaskId: String(industryWorkflow.conversationTaskId || ''),
+                requestId: String(industryWorkflow.requestId || ''),
+              })
+            : result.toolCalls;
           const finalized = finalizeRestChatResponse({
             taskText: routeText,
             responseText,
-            toolRecords: result.toolCalls,
+            toolRecords: boundRecords,
             source: 'rest_chat_stream',
             flow: restTurnDispatch.flow,
           });
@@ -366,6 +402,12 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
               totalTokens: u.totalTokens,
             }, `rest_chat_${Date.now()}`, 'chat');
           }
+          const workflowRecord = industryWorkflowTask
+            ? recordIndustryWorkflowExecution({
+                userId, domain, orgId, taskId: industryWorkflowTask.id,
+                resultText: responseText, toolRecords: boundRecords, source: 'rest_chat_stream',
+              })
+            : null;
           res.write(`data: ${JSON.stringify({
             done: true,
             text: responseText,
@@ -374,6 +416,11 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
             blocked: finalized.blocked,
             reason: finalized.reason,
             notification: finalized.notification,
+            ...(workflowRecord ? { industryWorkflow: {
+              taskId: workflowRecord.task.id,
+              status: workflowRecord.task.status,
+              verification: workflowRecord.verification,
+            } } : {}),
           })}\n\n`);
           return res.end();
         }
@@ -389,10 +436,17 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
         );
 
         responseText = result.text || '';
+        const boundRecords = industryWorkflowTask
+          ? bindIndustryToolRecords(result.toolCalls, {
+              workTakeoverTaskId: industryWorkflowTask.id,
+              conversationTaskId: String(industryWorkflow.conversationTaskId || ''),
+              requestId: String(industryWorkflow.requestId || ''),
+            })
+          : result.toolCalls;
         const finalized = finalizeRestChatResponse({
           taskText: routeText,
           responseText,
-          toolRecords: result.toolCalls,
+          toolRecords: boundRecords,
           source: 'rest_chat',
           flow: restTurnDispatch.flow,
         });
@@ -408,6 +462,12 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
           totalTokens: result.usageRecords.reduce((sum, item) => sum + item.totalTokens, 0),
           records: result.usageRecords.length,
         };
+        const workflowRecord = industryWorkflowTask
+          ? recordIndustryWorkflowExecution({
+              userId, domain, orgId, taskId: industryWorkflowTask.id,
+              resultText: responseText, toolRecords: boundRecords, source: 'rest_chat',
+            })
+          : null;
         return res.json({
           text: responseText,
           usage,
@@ -416,6 +476,11 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
           blocked: finalized.blocked,
           reason: finalized.reason,
           notification: finalized.notification,
+          ...(workflowRecord ? { industryWorkflow: {
+            taskId: workflowRecord.task.id,
+            status: workflowRecord.task.status,
+            verification: workflowRecord.verification,
+          } } : {}),
         });
       }
 

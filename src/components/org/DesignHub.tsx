@@ -25,6 +25,7 @@ import {
 } from '../../i18n/locales/interiorDesign';
 import { InteriorProjectPanel } from './InteriorProjectPanel';
 import { InteriorProjectAssets } from './InteriorProjectAssets';
+import { startIndustryWorkflow } from '../../lib/industryWorkflowClient';
 
 type DesignView =
   | 'project'
@@ -184,6 +185,7 @@ export function DesignHub() {
             <DesignToolView
               key={`${activeProject.id}:${activeProject.updatedAt}:${view}`}
               config={tools[view]}
+              entryId={view}
               locale={locale}
               project={activeProject}
               assets={projectAssets}
@@ -208,25 +210,44 @@ function useDesignChat(locale: InteriorDesignLocale) {
   const [input, setInput] = useState('');
   const [result, setResult] = useState('');
   const [loading, setLoading] = useState(false);
+  const [workflowTaskId, setWorkflowTaskId] = useState('');
+  const [workflowStatus, setWorkflowStatus] = useState('');
   const abortRef = useRef<AbortController | null>(null);
 
   React.useEffect(() => () => abortRef.current?.abort(), []);
 
   const stop = () => abortRef.current?.abort();
 
-  const send = async (prompt: string) => {
+  const send = async (prompt: string, workflow: {
+    entryId: DesignView;
+    sourceInput: string;
+    projectId: string;
+    projectName: string;
+  }) => {
     if (!prompt.trim() || loading) return;
     const controller = new AbortController();
     abortRef.current = controller;
     setLoading(true);
     setResult('');
+    setWorkflowStatus('creating');
     try {
+      const started = await startIndustryWorkflow({
+        entryId: workflow.entryId,
+        sourceInput: workflow.sourceInput,
+        source: 'designer_project_workspace',
+        context: { projectId: workflow.projectId, projectName: workflow.projectName },
+      });
+      setWorkflowTaskId(started.task.id);
+      setWorkflowStatus('in_progress');
       const res = await fetch('/api/chat?stream=true', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
         signal: controller.signal,
-        body: JSON.stringify({ messages: [{ role: 'user', content: prompt }] }),
+        body: JSON.stringify({
+          industryWorkflowTaskId: started.task.id,
+          messages: [{ role: 'user', content: `${started.handoffPrompt}\n\n${prompt}` }],
+        }),
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -254,6 +275,8 @@ function useDesignChat(locale: InteriorDesignLocale) {
           if (event.done === true && typeof event.text === 'string') {
             assembled = event.text;
             setResult(assembled);
+            const workflowResult = event.industryWorkflow as Record<string, unknown> | undefined;
+            if (typeof workflowResult?.status === 'string') setWorkflowStatus(workflowResult.status);
           }
         }
         if (done) break;
@@ -262,16 +285,21 @@ function useDesignChat(locale: InteriorDesignLocale) {
       const trailing = parseSseEvent(buffer);
       if (trailing?.done === true && typeof trailing.text === 'string') {
         setResult(trailing.text);
+        const workflowResult = trailing.industryWorkflow as Record<string, unknown> | undefined;
+        if (typeof workflowResult?.status === 'string') setWorkflowStatus(workflowResult.status);
       }
     } catch (err: any) {
-      if (err?.name !== 'AbortError') setResult(`${m('errorPrefix')}${err?.message || err}`);
+      if (err?.name !== 'AbortError') {
+        setResult(`${m('errorPrefix')}${err?.message || err}`);
+        setWorkflowStatus('blocked');
+      }
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
       setLoading(false);
     }
   };
 
-  return { input, setInput, result, loading, send, stop };
+  return { input, setInput, result, loading, workflowTaskId, workflowStatus, send, stop };
 }
 
 function formatProjectContext(project: InteriorProject, locale: InteriorDesignLocale): string {
@@ -321,24 +349,29 @@ function formatProjectAssets(assets: InteriorProjectAsset[], locale: InteriorDes
 
 function DesignToolView({
   config,
+  entryId,
   locale,
   project,
   assets,
 }: {
   config: ToolConfig;
+  entryId: DesignView;
   locale: InteriorDesignLocale;
   project: InteriorProject;
   assets: InteriorProjectAsset[];
 }) {
   const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
-  const { input, setInput, result, loading, send, stop } = useDesignChat(locale);
+  const { input, setInput, result, loading, workflowTaskId, workflowStatus, send, stop } = useDesignChat(locale);
 
   const run = () => {
     const outputGuide = config.output.map(item => `- ${item}`).join('\n');
     const projectContext = formatProjectContext(project, locale);
     const assetContext = formatProjectAssets(assets, locale);
     const assetSection = assetContext ? `\n\n${m('projectSources')}\n${assetContext}` : '';
-    send(`${config.role}\n\n${m('scopeGuard')}\n\n${m('projectContext')}\n${projectContext}${assetSection}\n\n${m('outputInstruction')}\n${outputGuide}\n\n${m('userRequirement')}\n${input}`);
+    void send(
+      `${config.role}\n\n${m('scopeGuard')}\n\n${m('projectContext')}\n${projectContext}${assetSection}\n\n${m('outputInstruction')}\n${outputGuide}\n\n${m('userRequirement')}\n${input}`,
+      { entryId, sourceInput: input, projectId: project.id, projectName: project.name },
+    );
   };
 
   return (
@@ -364,6 +397,12 @@ function DesignToolView({
           </div>
         </div>
       </section>
+
+      {workflowTaskId && (
+        <div className="rounded-xl border border-emerald-300/12 bg-emerald-400/[0.05] px-3 py-2 text-[11px] font-mono text-emerald-100/55">
+          task {workflowTaskId} · {workflowStatus || 'in_progress'}
+        </div>
+      )}
 
       <section className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_260px]">
         <div className="space-y-4">
