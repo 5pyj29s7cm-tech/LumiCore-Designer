@@ -3,6 +3,16 @@
   "variantId": "designer-client",
   "displayName": "Lumi 设计师定制版",
   "productLine": "design",
+  "runtime": {
+    "productName": "Lumi Designer",
+    "desktopTitle": "Lumi Designer",
+    "appIdentifier": "com.lumiai.designer",
+    "mobileAppIdentifier": "com.lumiai.designer",
+    "dataDirectoryName": "LumiOS-Designer",
+    "updaterChannel": "lumi-designer",
+    "defaultSkills": ["design-studio-pack", "cad-drafting"],
+    "modules": ["spatial-design", "interior-design", "cad-workflows"]
+  },
   "upstream": {
     "repository": "https://github.com/5pyj29s7cm-tech/lumi-CEO.git",
     "branch": "main",
