@@ -66,6 +66,8 @@ import {
   trackTopic,
   getTopicContext,
   getActiveConversation,
+  getConversationForScope,
+  getOrCreateActiveConversation,
   getConversationActionStatus,
   prepareConversationActionExecution,
   persistConversationExecutionPlan,
@@ -801,7 +803,7 @@ export function registerChatHandler(
   io: Server,
 ) {
   socket.on("agent:execution_resume", (
-    data: { requestId?: string; source?: string; domain?: string; orgId?: string | null } = {},
+    data: { requestId?: string; source?: string; domain?: string; orgId?: string | null; conversationId?: string } = {},
     ack?: (payload: { ok: boolean; snapshot?: ReturnType<typeof getChatExecution>; error?: string }) => void,
   ) => {
     const uid = userIdFn(socket);
@@ -814,6 +816,7 @@ export function registerChatHandler(
       domain: requestScope.domain,
       orgId: requestScope.orgId,
       source: data.source || 'chat',
+      conversationId: data.conversationId,
     };
     const snapshot = getChatExecution(scope, data.requestId);
     try {
@@ -832,7 +835,7 @@ export function registerChatHandler(
   // Abort is request-scoped and acknowledged. The UI stays in "cancelling"
   // until this handler confirms that the server owns and cancelled the task.
   socket.on("agent:abort_chat", (
-    data: { requestId?: string; source?: string; domain?: string; orgId?: string | null } = {},
+    data: { requestId?: string; source?: string; domain?: string; orgId?: string | null; conversationId?: string } = {},
     ack?: (payload: { ok: boolean; requestId?: string; status?: string; error?: string }) => void,
   ) => {
     const uid = userIdFn(socket);
@@ -845,6 +848,7 @@ export function registerChatHandler(
       domain: requestScope.domain,
       orgId: requestScope.orgId,
       source: data.source || 'chat',
+      conversationId: data.conversationId,
     };
     const snapshot = getChatExecution(scope, data.requestId);
     if (!snapshot || snapshot.terminal) {
@@ -859,7 +863,7 @@ export function registerChatHandler(
       return;
     }
 
-    const sessionKey = `${uid}:${scope.domain}:${scope.orgId || ''}:${scope.source}`;
+    const sessionKey = `${uid}:${scope.domain}:${scope.orgId || ''}:${scope.source}:${scope.conversationId || ''}`;
     const session = chatExecutionQueue.getByRequestId(sessionKey, snapshot.requestId);
     if (!session || session.requestId !== snapshot.requestId) {
       try { ack?.({ ok: false, requestId: snapshot.requestId, error: 'Execution controller is unavailable' }); } catch {}
@@ -871,6 +875,7 @@ export function registerChatHandler(
       status: 'cancelling',
       source: scope.source,
       requestId: snapshot.requestId,
+      conversationId: scope.conversationId,
     };
     io.to(room).emit('agent:status', cancellingPayload);
     session.cancel();
@@ -880,6 +885,7 @@ export function registerChatHandler(
       agentName: 'Lumi',
       source: scope.source,
       requestId: snapshot.requestId,
+      conversationId: scope.conversationId,
       finalized: true,
       blocked: true,
       reason: 'cancelled',
@@ -938,7 +944,7 @@ export function registerChatHandler(
   socket.on("agent:background_resume", (data: { taskId?: string }) => updateBackgroundTaskState(data, 'resume'));
 
   socket.on("agent:chat", async (
-    data: { text?: string; history?: any[]; attachments?: any[]; personalityId?: string; category?: string; agentId?: string; domain?: string; orgId?: string | null; mode?: string; operationMode?: string; source?: string; requestId?: string },
+    data: { text?: string; history?: any[]; attachments?: any[]; personalityId?: string; category?: string; agentId?: string; domain?: string; orgId?: string | null; mode?: string; operationMode?: string; source?: string; requestId?: string; conversationId?: string },
     ack?: (payload: { ok: boolean; requestId?: string; receivedAt?: string; error?: string }) => void,
   ) => {
     console.log('[ChatHandler] agent:chat RECEIVED:', JSON.stringify(data).slice(0, 300));
@@ -977,11 +983,20 @@ export function registerChatHandler(
     });
     const resolvedDomain = requestScope.domain;
     const resolvedOrgId = requestScope.orgId;
+    const requestedConversationId = String(data.conversationId || '').trim();
+    const selectedConversation = requestedConversationId
+      ? getConversationForScope(requestedConversationId, uid, resolvedDomain, resolvedOrgId)
+      : getOrCreateActiveConversation(uid, conversationAgentId, resolvedDomain, resolvedOrgId);
+    if (!selectedConversation || selectedConversation.agentId !== conversationAgentId || selectedConversation.status !== 'active') {
+      try { ack?.({ ok: false, requestId, error: 'Conversation is unavailable for this user, agent, or workspace' }); } catch {}
+      return;
+    }
+    const selectedConversationId = selectedConversation.id;
     const confirmationScope = {
       source: eventSource,
       domain: resolvedDomain,
       orgId: resolvedOrgId,
-      channelId: socket.id,
+      channelId: `${socket.id}:${selectedConversationId}`,
     };
     if (isConfirmationCancellation(visibleUserText)) {
       clearPendingConfirmation(uid, confirmationScope);
@@ -997,14 +1012,16 @@ export function registerChatHandler(
       domain: resolvedDomain,
       orgId: resolvedOrgId,
       source: eventSource,
+      conversationId: selectedConversationId,
     };
     const executionRoom = chatExecutionRoom(executionScope);
-    const sessionKey = `${uid}:${resolvedDomain}:${resolvedOrgId || ''}:${eventSource}`;
+    const sessionKey = `${uid}:${resolvedDomain}:${resolvedOrgId || ''}:${eventSource}:${selectedConversationId}`;
     const emitAgent = (event: string, payload: Record<string, any> = {}) => {
       const normalizedPayload = {
         ...payload,
         source: payload.source || eventSource,
         requestId,
+        conversationId: selectedConversationId,
       };
       if (!recordChatExecutionEvent(executionScope, requestId, event, normalizedPayload)) return;
       io.to(executionRoom).emit(event, normalizedPayload);
@@ -1247,7 +1264,7 @@ export function registerChatHandler(
         conversationAgentId,
         resolvedDomain,
         resolvedOrgId,
-        { userText: visibleUserText },
+        { userText: visibleUserText, conversationId: selectedConversationId },
       );
       const conversation = conversationTurn.conversation;
       const conversationId = conversation?.id;

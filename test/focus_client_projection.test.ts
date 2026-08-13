@@ -16,17 +16,16 @@ describe('focus thread client projection', () => {
     expect(hook).not.toContain('userId:');
   });
 
-  it('shows the same evidence-backed focus in desktop and chat surfaces', () => {
-    const desktop = source('src/components/DesktopUI.tsx');
+  it('projects active durable focus into the transient task widget instead of the chat stream', () => {
     const chat = source('src/components/AgentChatPage.tsx');
-    const panel = source('src/components/FocusThreadPanel.tsx');
-    expect(desktop).toContain('useFocusThreads({');
-    expect(desktop).toContain('focusThreads={focusThreads}');
-    expect(chat).toContain('<FocusThreadPanel');
-    expect(chat).toContain('variant="strip"');
-    expect(panel).toContain('thread.evidenceTaskId');
-    expect(panel).toContain('thread.waitingFor');
-    expect(panel).toContain('thread.resumePoint');
+    const widget = source('src/components/ActiveTaskWidget.tsx');
+    expect(chat).toContain('useFocusThreads({');
+    expect(chat).toContain('<ActiveTaskWidget');
+    expect(chat).toContain('focusThreads={focusThreads}');
+    expect(chat).not.toContain('<FocusThreadPanel');
+    expect(widget).toContain('primaryThread?.goal');
+    expect(widget).toContain('primaryThread?.waitingFor');
+    expect(widget).toContain('primaryThread?.nextAction');
   });
 
   it('binds chat, task, and voice work to the durable commitment record', () => {

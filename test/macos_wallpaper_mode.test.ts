@@ -13,7 +13,7 @@ describe('macOS wallpaper mode recovery', () => {
 
   it('keeps native recovery paths available while the main window is click-through', () => {
     const rust = source('src-tauri/src/lib.rs');
-    expect(rust).toContain('#[cfg(target_os = "macos")]\n        let _ = window.set_skip_taskbar(false);');
+    expect(rust).toMatch(/#\[cfg\(target_os = "macos"\)\]\r?\n\s*let _ = window\.set_skip_taskbar\(false\);/);
     expect(rust).toContain('"Exit Wallpaper Mode"');
     expect(rust).toContain('tauri::RunEvent::Reopen { .. }');
     expect(rust).toContain('let _ = show_main_window_impl(app);');
