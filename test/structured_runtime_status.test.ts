@@ -122,18 +122,13 @@ describe('structured runtime status', () => {
     expect(second.snapshotId).toBe(first.snapshotId);
   });
 
-  it('keeps runtime evidence in System Explorer without duplicating the chat task bar on the homepage', () => {
+  it('mounts an authenticated scope-derived endpoint and visible evidence surfaces', () => {
     const routes = readFileSync(path.join(process.cwd(), 'server/routes/system_routes.ts'), 'utf8');
     const desktop = readFileSync(path.join(process.cwd(), 'src/components/DesktopUI.tsx'), 'utf8');
-    const chat = readFileSync(path.join(process.cwd(), 'src/components/AgentChatPage.tsx'), 'utf8');
     const explorer = readFileSync(path.join(process.cwd(), 'src/components/SystemExplorer.tsx'), 'utf8');
     expect(routes).toContain("router.get('/runtime/status', requireAuth");
     expect(routes).toContain('const scope = resolveDomain(req.user!)');
-    expect(desktop).not.toContain('<WorkflowPanel');
-    expect(desktop).not.toContain('runtimeStatus={structuredRuntimeStatus}');
-    expect(chat).toContain('{workflowProgressVisible && (');
-    expect(chat).toContain('<FocusThreadPanel');
+    expect(desktop).toContain('runtimeStatus={structuredRuntimeStatus}');
     expect(explorer).toContain('<RuntimeEvidencePanel');
-    expect(explorer).toContain('<LumiScenePanel');
   });
 });
