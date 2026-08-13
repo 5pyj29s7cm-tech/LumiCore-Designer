@@ -3,11 +3,8 @@ import {
   Building2,
   CheckCircle,
   FileText,
-  Home,
   Layout,
   Loader2,
-  Map,
-  Palette,
   Ruler,
   Send,
   Sparkles,
@@ -30,11 +27,10 @@ import { InteriorProjectPanel } from './InteriorProjectPanel';
 import { InteriorProjectAssets } from './InteriorProjectAssets';
 
 type DesignView =
-  | 'space'
-  | 'interior'
-  | 'conditions'
-  | 'materials'
+  | 'project'
+  | 'cad'
   | 'visualization'
+  | 'presentation'
   | 'handoff';
 
 interface NavItem {
@@ -70,7 +66,7 @@ function parseSseEvent(block: string): Record<string, unknown> | null {
 }
 
 export function DesignHub() {
-  const [view, setView] = useState<DesignView>('space');
+  const [view, setView] = useState<DesignView>('project');
   const [activeProject, setActiveProject] = useState<InteriorProject | null>(null);
   const [projectAssets, setProjectAssets] = useState<InteriorProjectAsset[]>([]);
   const t = useT();
@@ -78,45 +74,25 @@ export function DesignHub() {
   const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
 
   const tools = useMemo<Record<DesignView, ToolConfig>>(() => ({
-    space: {
-      title: m('spaceTitle'),
-      desc: m('spaceDescription'),
-      placeholder: m('spacePlaceholder'),
-      button: m('spaceButton'),
-      role: m('spaceRole'),
-      output: [m('zoning'), m('circulation'), m('areaSchedule'), m('planningRisks')],
+    project: {
+      title: m('designProjectTitle'),
+      desc: m('designProjectDescription'),
+      placeholder: m('designProjectPlaceholder'),
+      button: m('designProjectButton'),
+      role: m('designProjectRole'),
+      output: [m('concept'), m('layout'), m('planningRisks'), m('implementation')],
       chips: [m('office'), m('residence'), m('retail'), m('hospitality')],
-      icon: <Map size={18} />,
+      icon: <Layout size={18} />,
     },
-    interior: {
-      title: m('interiorTitle'),
-      desc: m('interiorDescription'),
-      placeholder: m('interiorPlaceholder'),
-      button: m('interiorButton'),
-      role: m('interiorRole'),
-      output: [m('concept'), m('layout'), m('storage'), m('implementation')],
-      chips: [m('modern'), m('natural'), m('softNeutral'), m('commercial')],
-      icon: <Home size={18} />,
-    },
-    conditions: {
-      title: m('conditionsTitle'),
-      desc: m('conditionsDescription'),
-      placeholder: m('conditionsPlaceholder'),
-      button: m('conditionsButton'),
-      role: m('conditionsRole'),
-      output: [m('fixedConditions'), m('changeableConditions'), m('coordinationRisks'), m('verificationList')],
-      chips: [m('loadBearing'), m('doorsWindows'), m('mep'), m('fireAccess')],
-      icon: <Building2 size={18} />,
-    },
-    materials: {
-      title: m('materialsTitle'),
-      desc: m('materialsDescription'),
-      placeholder: m('materialsPlaceholder'),
-      button: m('materialsButton'),
-      role: m('materialsRole'),
-      output: [m('palette'), m('lightingLayers'), m('specifications'), m('maintenanceRisks')],
-      chips: [m('flooring'), m('wallCeiling'), m('taskLighting'), m('sustainable')],
-      icon: <Palette size={18} />,
+    cad: {
+      title: m('cadPlanTitle'),
+      desc: m('cadPlanDescription'),
+      placeholder: m('cadPlanPlaceholder'),
+      button: m('cadPlanButton'),
+      role: m('cadPlanRole'),
+      output: [m('fixedConditions'), m('zoning'), m('keyDimensions'), m('verificationList')],
+      chips: [m('floorPlan'), m('loadBearing'), m('doorsWindows'), m('mep')],
+      icon: <Ruler size={18} />,
     },
     visualization: {
       title: m('visualizationTitle'),
@@ -127,6 +103,16 @@ export function DesignHub() {
       output: [m('cameraComposition'), m('renderLighting'), m('renderMaterials'), m('generationPrompt')],
       chips: [m('livingRoom'), m('bedroom'), m('restaurant'), m('showroom')],
       icon: <Sparkles size={18} />,
+    },
+    presentation: {
+      title: m('proposalPptTitle'),
+      desc: m('proposalPptDescription'),
+      placeholder: m('proposalPptPlaceholder'),
+      button: m('proposalPptButton'),
+      role: m('proposalPptRole'),
+      output: [m('proposalStructure'), m('slideStoryline'), m('visualAssetChecklist'), m('verifiedPresentationFile')],
+      chips: [m('concept'), m('layout'), m('palette'), m('implementation')],
+      icon: <FileText size={18} />,
     },
     handoff: {
       title: m('handoffTitle'),

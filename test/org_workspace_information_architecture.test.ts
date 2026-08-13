@@ -25,6 +25,7 @@ describe('organization workspace information architecture', () => {
   it('keeps one focused spatial and interior design workspace', () => {
     const orgHub = source('src/components/org/OrgHub.tsx');
     const designHub = source('src/components/org/DesignHub.tsx');
+    const designCopy = source('src/i18n/locales/interiorDesign.ts');
 
     expect(orgHub).toContain("id: 'spatial-design'");
     expect(orgHub).toContain("case 'spatial-design': return <DesignHub />");
@@ -33,13 +34,16 @@ describe('organization workspace information architecture', () => {
     expect(orgHub).not.toContain('organization-modules.75dd9b5603');
     expect(orgHub).not.toContain('t.orgExitWorkSpace');
     expect(orgHub).not.toContain("id: 'brand-design'");
-    expect(designHub).toContain("| 'space'");
-    expect(designHub).toContain("| 'interior'");
-    expect(designHub).toContain("| 'conditions'");
-    expect(designHub).toContain("| 'materials'");
+    expect(designHub).toContain("| 'project'");
+    expect(designHub).toContain("| 'cad'");
     expect(designHub).toContain("| 'visualization'");
+    expect(designHub).toContain("| 'presentation'");
     expect(designHub).toContain("| 'handoff'");
     expect(designHub).toContain("m('scopeGuard')");
+    for (const label of ['设计项目', 'CAD 方案', '效果图', '提案 PPT', '交付中心']) {
+      expect(designCopy).toContain(label);
+    }
+    expect(designCopy).toContain('验证文件可打开后才能报告完成');
     expect(designHub).not.toContain("'brand'");
     expect(designHub).not.toContain("'architecture'");
   });

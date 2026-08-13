@@ -86,6 +86,28 @@ const messages = {
   sourceStored: { zh: '已归档', en: 'Filed' },
   projectSources: { zh: '当前项目资料（需要时从组织知识库检索）：', en: 'Current project files (retrieve from organization knowledge when needed):' },
 
+  designProjectTitle: { zh: '设计项目', en: 'Design Project' },
+  designProjectDescription: { zh: '围绕同一项目 Brief 和资料管理范围、阶段、设计决策、风险与下一步。', en: 'Manage scope, stage, design decisions, risks, and next actions from one project brief and evidence set.' },
+  designProjectPlaceholder: { zh: '输入本次要梳理的项目目标、阶段、使用需求、预算、限制和待决策事项……', en: 'Enter the project goal, stage, user needs, budget, constraints, and decisions to resolve…' },
+  designProjectButton: { zh: '生成项目行动方案', en: 'Build Project Action Plan' },
+  designProjectRole: { zh: '你是设计项目负责人。只使用当前项目 Brief 与已归档资料，梳理范围、设计方向、风险、缺失信息和下一步；不把推测写成已确认事实。', en: 'You are the design project lead. Use only the active brief and filed evidence to organize scope, direction, risk, missing facts, and next actions. Never present inference as confirmed fact.' },
+
+  cadPlanTitle: { zh: 'CAD 方案', en: 'CAD Scheme' },
+  cadPlanDescription: { zh: '从原始 CAD/PDF、测量与固定条件形成可核验的平面方案、关键尺寸和复核清单。', en: 'Turn base CAD/PDF files, surveys, and fixed conditions into a reviewable plan, key dimensions, and verification list.' },
+  cadPlanPlaceholder: { zh: '说明需要处理的图纸、功能布局、已知尺寸、不可改条件、输出格式和待解决冲突……', en: 'Describe the drawings, required layout, known dimensions, fixed conditions, output format, and conflicts to resolve…' },
+  cadPlanButton: { zh: '生成 CAD 方案', en: 'Generate CAD Scheme' },
+  cadPlanRole: { zh: '你是室内 CAD 方案与深化协调设计师。优先读取当前项目已归档的 CAD/PDF 和测量资料；未验证的尺寸、结构、消防与机电条件必须标为待复核。需要生成或修改文件时调用可用 CAD 工具，并以几何或文件回执作为完成依据。', en: 'You are an interior CAD scheme and detailing coordinator. Prefer filed CAD/PDF and survey evidence. Mark unverified dimensions, structure, fire, and MEP conditions for review. When a file is requested, use available CAD tools and rely on geometry or file receipts for completion.' },
+
+  proposalPptTitle: { zh: '提案 PPT', en: 'Proposal PPT' },
+  proposalPptDescription: { zh: '把已确认的设计内容整理成适合客户汇报的叙事、页面结构与可打开演示文件。', en: 'Turn approved design content into a client-ready story, slide structure, and openable presentation file.' },
+  proposalPptPlaceholder: { zh: '输入汇报对象、会议目标、页数、视觉风格、必须呈现的方案和已有成果文件……', en: 'Enter the audience, meeting goal, slide count, visual style, required scheme content, and available deliverables…' },
+  proposalPptButton: { zh: '生成提案 PPT', en: 'Generate Proposal PPT' },
+  proposalPptRole: { zh: '你是设计提案与客户汇报负责人。只引用当前项目已确认的方案和成果；先形成叙事与页面结构。用户要求文件时必须调用可用演示文稿工具生成真实 PPTX，并验证文件可打开后才能报告完成。', en: 'You lead design proposals and client presentations. Use only approved project decisions and deliverables, starting with the story and slide structure. When a file is requested, use the presentation tool to create a real PPTX and verify that it opens before reporting completion.' },
+  proposalStructure: { zh: '提案结构', en: 'Proposal structure' },
+  slideStoryline: { zh: '页面叙事', en: 'Slide storyline' },
+  visualAssetChecklist: { zh: '视觉素材清单', en: 'Visual asset checklist' },
+  verifiedPresentationFile: { zh: '已验证演示文件', en: 'Verified presentation file' },
+
   spaceTitle: { zh: '空间规划', en: 'Space Planning' },
   spaceDescription: { zh: '梳理功能分区、面积配比、动线、邻接关系与空间效率。', en: 'Plan zoning, area allocation, circulation, adjacency, and spatial efficiency.' },
   spacePlaceholder: { zh: '输入项目类型、面积、使用人数、房间需求、优先级与现有问题……', en: 'Enter project type, area, occupants, room needs, priorities, and current problems…' },
@@ -156,7 +178,7 @@ const messages = {
   restaurant: { zh: '餐饮空间', en: 'Restaurant' },
   showroom: { zh: '展厅', en: 'Showroom' },
 
-  handoffTitle: { zh: '深化与交付', en: 'Detailing & Handoff' },
+  handoffTitle: { zh: '交付中心', en: 'Delivery Center' },
   handoffDescription: { zh: '把方案整理为图纸目录、关键尺寸、材料表、专业协调和验收清单。', en: 'Turn the scheme into a drawing list, key dimensions, material schedule, consultant coordination, and QA checklist.' },
   handoffPlaceholder: { zh: '输入项目阶段、已确认方案、需要交付的图纸、材料表和专业接口……', en: 'Enter project phase, approved scheme, required drawings, schedules, and consultant interfaces…' },
   handoffButton: { zh: '生成交付计划', en: 'Generate handoff plan' },
