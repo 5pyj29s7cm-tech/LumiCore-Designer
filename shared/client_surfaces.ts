@@ -7,6 +7,8 @@ export interface PersonalClientSurfaceDefinition {
   closeAfterUse?: boolean;
   settingsSection?: string;
   launcherIds?: readonly string[];
+  /** Spoken or typed names that must resolve to this native client surface. */
+  navigationAliases?: readonly string[];
   organizationView?: string;
   organizationViewByAction?: Readonly<Record<string, string>>;
   commandCenterViewByAction?: Readonly<Record<string, 'office' | 'team' | 'core'>>;
@@ -287,6 +289,7 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     actions: ['open_design_project'],
     useWhen: 'Open the real design-project workspace for briefs, scope, project evidence, and decisions.',
     launcherIds: ['design-project'],
+    navigationAliases: ['设计项目', '项目工作台'],
   },
   {
     id: 'design-cad',
@@ -295,6 +298,7 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     actions: ['open_design_cad'],
     useWhen: 'Open the CAD scheme workspace for geometry, constraints, dimensions, and drawing verification.',
     launcherIds: ['design-cad'],
+    navigationAliases: ['CAD 方案', 'CAD方案', 'CAD 工作区', 'CAD工作区'],
   },
   {
     id: 'design-visualization',
@@ -303,6 +307,7 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     actions: ['open_design_visualization'],
     useWhen: 'Open the visualization workspace for composition, lighting, materials, and image-generation evidence.',
     launcherIds: ['design-visualization'],
+    navigationAliases: ['效果图', '效果图工作区', '可视化工作区'],
   },
   {
     id: 'design-presentation',
@@ -311,6 +316,7 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     actions: ['open_design_presentation'],
     useWhen: 'Open the proposal presentation workspace for narrative, slides, assets, and verified PPT delivery.',
     launcherIds: ['design-presentation'],
+    navigationAliases: ['提案 PPT', '提案PPT', '提案演示', '设计提案'],
   },
   {
     id: 'design-handoff',
@@ -319,6 +325,7 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     actions: ['open_design_handoff'],
     useWhen: 'Open the design handoff workspace for drawing lists, coordination, QA, and deliverable verification.',
     launcherIds: ['design-handoff'],
+    navigationAliases: ['交付中心', '设计交付', '交付工作区'],
   },
   {
     id: 'personalization',

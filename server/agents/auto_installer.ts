@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { mcpManager } from '../mcp';
 import { getMarketplaceSkills, recordInstall, type MarketplaceAgentScope } from '../marketplace/registry';
 import { createAgentForSkill } from './skill_agent';
+import { PRODUCT_VARIANT } from '../../shared/product_variant';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -124,6 +125,7 @@ export async function autoInstallForTask(
     if (!matched) continue;
 
     const dirName = entry.skillId.replace('skill-', '');
+    if (!PRODUCT_VARIANT.runtime.defaultSkills.includes(dirName)) continue;
     const bundledPath = path.join(BUNDLED_DIR, dirName);
     if (!fs.existsSync(bundledPath)) continue;
 
