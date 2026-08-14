@@ -65,6 +65,17 @@ export class InteriorProjectValidationError extends Error {
   }
 }
 
+/**
+ * Interior projects predate the unified personal/work domain model and persist
+ * their scope in the `orgId` column. Keep that schema backwards compatible
+ * while assigning every personal user a collision-free private scope.
+ */
+export function personalInteriorProjectScope(userId: string): string {
+  const normalized = String(userId || '').trim();
+  if (!normalized) throw new InteriorProjectValidationError('userId is required');
+  return `personal:${normalized}`;
+}
+
 const EMPTY_BRIEF: InteriorProjectBrief = {
   location: '',
   area: '',

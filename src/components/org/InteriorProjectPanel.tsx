@@ -5,6 +5,7 @@ import {
   listInteriorProjects,
   updateInteriorProject,
   type InteriorProject,
+  type InteriorProjectDomain,
   type InteriorProjectDraft,
   type InteriorProjectStatus,
   type InteriorProjectType,
@@ -44,11 +45,12 @@ function draftFromProject(project: InteriorProject): InteriorProjectDraft {
 }
 
 interface InteriorProjectPanelProps {
+  domain: InteriorProjectDomain;
   locale: InteriorDesignLocale;
   onProjectChange: (project: InteriorProject | null) => void;
 }
 
-export function InteriorProjectPanel({ locale, onProjectChange }: InteriorProjectPanelProps) {
+export function InteriorProjectPanel({ domain, locale, onProjectChange }: InteriorProjectPanelProps) {
   const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
   const [projects, setProjects] = useState<InteriorProject[]>([]);
   const [selectedId, setSelectedId] = useState('');
@@ -65,13 +67,13 @@ export function InteriorProjectPanel({ locale, onProjectChange }: InteriorProjec
 
   useEffect(() => {
     let cancelled = false;
-    listInteriorProjects()
+    listInteriorProjects(domain)
       .then(items => {
         if (cancelled) return;
         setProjects(items);
         let storedId = '';
-        try { storedId = sessionStorage.getItem(SELECTED_PROJECT_KEY) || ''; } catch {}
-        const selected = items.find(project => project.id === storedId) || items[0] || null;
+        try { storedId = sessionStorage.getItem(`${SELECTED_PROJECT_KEY}.${domain}`) || ''; } catch {}
+        const selected = items.find(project => project.id === storedId) || null;
         setSelectedId(selected?.id || '');
         onProjectChange(selected);
       })
@@ -84,7 +86,7 @@ export function InteriorProjectPanel({ locale, onProjectChange }: InteriorProjec
     return () => { cancelled = true; };
   // The initial project load is scoped to the mounted workspace and locale.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [locale]);
+  }, [domain, locale]);
 
   const chooseProject = (projectId: string) => {
     const project = projects.find(item => item.id === projectId) || null;
@@ -92,8 +94,8 @@ export function InteriorProjectPanel({ locale, onProjectChange }: InteriorProjec
     setEditor(null);
     setError('');
     try {
-      if (project) sessionStorage.setItem(SELECTED_PROJECT_KEY, project.id);
-      else sessionStorage.removeItem(SELECTED_PROJECT_KEY);
+      if (project) sessionStorage.setItem(`${SELECTED_PROJECT_KEY}.${domain}`, project.id);
+      else sessionStorage.removeItem(`${SELECTED_PROJECT_KEY}.${domain}`);
     } catch {}
     onProjectChange(project);
   };
@@ -122,14 +124,14 @@ export function InteriorProjectPanel({ locale, onProjectChange }: InteriorProjec
     setError('');
     try {
       const project = editor === 'edit' && selectedProject
-        ? await updateInteriorProject(selectedProject.id, draft)
-        : await createInteriorProject(draft);
+        ? await updateInteriorProject(domain, selectedProject.id, draft)
+        : await createInteriorProject(domain, draft);
       const nextProjects = [project, ...projects.filter(item => item.id !== project.id)]
         .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
       setProjects(nextProjects);
       setSelectedId(project.id);
       setEditor(null);
-      try { sessionStorage.setItem(SELECTED_PROJECT_KEY, project.id); } catch {}
+      try { sessionStorage.setItem(`${SELECTED_PROJECT_KEY}.${domain}`, project.id); } catch {}
       onProjectChange(project);
     } catch (reason: any) {
       setError(`${m('projectSaveFailed')}：${reason?.message || reason}`);
@@ -164,11 +166,11 @@ export function InteriorProjectPanel({ locale, onProjectChange }: InteriorProjec
           <select
             value={selectedId}
             onChange={event => chooseProject(event.target.value)}
-            disabled={loading || projects.length === 0}
+            disabled={loading}
             aria-label={m('selectProject')}
             className="lumi-field min-w-52 flex-1 py-2 text-sm disabled:opacity-50"
           >
-            {projects.length === 0 && <option value="">{loading ? m('loadingProjects') : m('selectProject')}</option>}
+            <option value="">{loading ? m('loadingProjects') : m('standaloneTask')}</option>
             {projects.map(project => (
               <option key={project.id} value={project.id}>{project.name}</option>
             ))}
@@ -194,6 +196,9 @@ export function InteriorProjectPanel({ locale, onProjectChange }: InteriorProjec
         </div>
 
         {error && <p className="mt-3 text-xs text-rose-300/90">{error}</p>}
+        {!loading && !selectedProject && !error && (
+          <p className="mt-3 text-xs leading-relaxed text-cyan-100/45">{m('projectRequiredDescription')}</p>
+        )}
 
         {editor && (
           <form onSubmit={save} className="mt-4 rounded-2xl border border-cyan-300/10 bg-cyan-950/10 p-4">

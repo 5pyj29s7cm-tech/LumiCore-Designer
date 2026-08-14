@@ -118,6 +118,7 @@ import {
 import { queueOrganizationWorkspaceRoute } from '../lib/orgWorkspaceNavigation';
 import { formatUiMessage, uiMessage } from '../i18n/uiMessages';
 import { desktopWorkflowCopy } from '../i18n/locales/desktopWorkflows';
+import { interiorDesignMessage } from '../i18n/locales/interiorDesign';
 import { chatAttachmentRequestMatchesScope, type ChatAttachmentRequest } from '@/lib/chatAttachmentReferences';
 import {
   getDesktopDockPositionClassName,
@@ -147,13 +148,14 @@ const OrgPortal = lazy(() => import('./OrgPortal').then(m => ({ default: m.OrgPo
 const PersonalityEditor = lazy(() => import('./PersonalityEditor').then(m => ({ default: m.PersonalityEditor })));
 const ReminderPanel = lazy(() => import('./ReminderPanel').then(m => ({ default: m.ReminderPanel })));
 const Sanctuary = lazy(() => import('./Sanctuary').then(m => ({ default: m.Sanctuary })));
-const Settings = lazy(() => import('./Settings').then(m => ({ default: m.Settings })));
+const IndustrySettings = lazy(() => import('./IndustrySettings').then(m => ({ default: m.IndustrySettings })));
 const SkillCenter = lazy(() => import('./SkillCenter').then(m => ({ default: m.SkillCenter })));
 const SystemExplorer = lazy(() => import('./SystemExplorer').then(m => ({ default: m.SystemExplorer })));
 const TerminalWindow = lazy(() => import('./Terminal').then(m => ({ default: m.TerminalWindow })));
 const TokenDashboard = lazy(() => import('./TokenDashboard').then(m => ({ default: m.TokenDashboard })));
 const ToolPanel = lazy(() => import('./ToolPanel').then(m => ({ default: m.ToolPanel })));
 const VoiceTrainingDialog = lazy(() => import('./VoiceTrainingDialog').then(m => ({ default: m.VoiceTrainingDialog })));
+const DesignHub = lazy(() => import('./org/DesignHub').then(m => ({ default: m.DesignHub })));
 
 type ProactiveChatDetail = {
   type?: string;
@@ -1763,11 +1765,16 @@ export function DesktopUI({
     y: desktopIconLayout.startY + Math.floor(index / desktopIconColumns) * desktopIconLayout.cellHeight,
   }), [desktopIconColumns, desktopIconLayout]);
 
-  // Desktop icon layout: absolute positioning with viewport-aware columns.
+  // The designer variant exposes outcome workspaces on the primary desktop.
+  // Each icon opens the existing DesignHub at the matching real workflow.
+  const designLocale = lang === 'en' ? 'en' : 'zh';
+  const designLabel = (key: Parameters<typeof interiorDesignMessage>[0]) => interiorDesignMessage(key, designLocale);
   const desktopIcons = [
-    { id: 'tools', labelKey: 'tools', icon: <Wrench size={24} />, colorClass: 'from-amber-500 to-orange-600', windowId: 'tools' },
-    { id: 'skills', labelKey: 'skills', icon: <Sparkles size={24} />, colorClass: 'from-emerald-500 to-teal-600', windowId: 'skills' },
-    { id: 'memory-avatar', labelKey: 'memoryAvatars', icon: <Castle size={24} />, colorClass: 'from-fuchsia-500 to-purple-600', windowId: 'memory-avatar' },
+    { id: 'design-project', label: designLabel('designProjectTitle'), icon: <Box size={24} />, colorClass: 'from-cyan-500 to-blue-600', windowId: 'design-project' },
+    { id: 'design-cad', label: designLabel('cadPlanTitle'), icon: <Wrench size={24} />, colorClass: 'from-amber-500 to-orange-600', windowId: 'design-cad' },
+    { id: 'design-visualization', label: designLabel('visualizationTitle'), icon: <Sparkles size={24} />, colorClass: 'from-violet-500 to-fuchsia-600', windowId: 'design-visualization' },
+    { id: 'design-presentation', label: designLabel('proposalPptTitle'), icon: <FileText size={24} />, colorClass: 'from-rose-500 to-orange-500', windowId: 'design-presentation' },
+    { id: 'design-handoff', label: designLabel('handoffTitle'), icon: <Shield size={24} />, colorClass: 'from-emerald-500 to-teal-600', windowId: 'design-handoff' },
   ];
   const desktopIconAreaHeight = Math.max(
     desktopIconLayout.compact ? 300 : 400,
@@ -4369,20 +4376,20 @@ export function DesktopUI({
   ]);
 
   const appIcons = [
-    { id: 'personality', label: t.personality || 'Personality Lab', icon: <UserIcon size={24} />, color: 'from-violet-500 to-fuchsia-600' },
-    { id: 'kernel', label: t.kernelMonitor || 'Kernel Monitor', icon: <Activity size={24} />, color: 'from-orange-500 to-red-600' },
     { id: 'devices', label: t.devices || 'Devices', icon: <Cpu size={24} />, color: 'from-blue-600 to-cyan-400' },
-    { id: 'settings', label: t.settings || 'OS Integrity', icon: <SettingsIcon size={24} />, color: 'from-gray-400 to-slate-600' },
+    { id: 'settings', label: t.settings || 'Settings', icon: <SettingsIcon size={24} />, color: 'from-gray-400 to-slate-600' },
   ];
 
   const desktopAppEntries = desktopIcons.map(def => ({
     id: def.windowId,
-    label: 'label' in def ? def.label : (t as any)[def.labelKey] || def.labelKey,
+    label: def.label,
     icon: def.icon,
     color: def.colorClass,
   }));
   const utilityAppEntries = [
     { id: 'knowledge', label: t.knowledgeBase || 'Knowledge Base', icon: <BrainCircuit size={24} />, color: 'from-cyan-400 to-blue-600' },
+    { id: 'personality', label: t.personality || 'Personality Lab', icon: <UserIcon size={24} />, color: 'from-violet-500 to-fuchsia-600' },
+    { id: 'kernel', label: t.kernelMonitor || 'Kernel Monitor', icon: <Activity size={24} />, color: 'from-orange-500 to-red-600' },
     { id: 'personalization', label: t.personalization || 'Personalization', icon: <Brush size={24} />, color: 'from-cyan-400 to-indigo-600' },
     { id: 'notifications', label: t.notificationsLabel || 'Notifications', icon: <Bell size={24} />, color: 'from-amber-500 to-orange-600' },
     { id: 'terminal', label: t.terminal || 'Terminal', icon: <TerminalIcon size={24} />, color: 'from-green-500 to-emerald-600' },
@@ -4409,6 +4416,7 @@ export function DesktopUI({
     chatOpen ? 'focused' : 'default';
 
   const getWindowSize = (windowId: string) => {
+    if (windowId.startsWith('design-')) return { w: '1180px', h: '760px' };
     if (windowId === 'settings') return { w: '1050px', h: '720px' };
     if (windowId === 'knowledge') return { w: '1100px', h: '750px' };
     if (windowId === 'kernel') return { w: '1050px', h: '720px' };
@@ -5201,7 +5209,7 @@ export function DesktopUI({
             <div className="lumi-desktop-icon-canvas relative flex-1 w-full" style={{ margin: 0, padding: 0, minHeight: desktopIconAreaHeight }}>
               {desktopIcons.map((def, i) => {
                 const { x, y } = getDefaultDesktopIconPosition(i);
-                const label = 'label' in def ? def.label : (t as any)[def.labelKey] || def.labelKey;
+                const label = def.label;
                 const isIconOpen = openWindows.includes(def.windowId) || (def.windowId === 'command-center' && chatOpen);
                 const isIconFocused = focusedWindow === def.windowId || (def.windowId === 'command-center' && chatOpen);
                 const handleClick = () => {
@@ -5633,10 +5641,18 @@ export function DesktopUI({
               >
                 <div className="os-window-body custom-scrollbar">
                   <Suspense fallback={<LazyPanelFallback label={t.loading || 'Loading'} />}>
-                  {windowId === 'kernel' ? (
+                  {windowId.startsWith('design-') ? (
+                    <DesignHub initialView={
+                      windowId === 'design-cad' ? 'cad'
+                        : windowId === 'design-visualization' ? 'visualization'
+                          : windowId === 'design-presentation' ? 'presentation'
+                            : windowId === 'design-handoff' ? 'handoff'
+                              : 'project'
+                    } />
+                  ) : windowId === 'kernel' ? (
                     <KernelMonitorApp t={t} />
                   ) : windowId === 'settings' ? (
-                    <Settings t={t} lang={lang} setLang={setLang} activeSection={settingsSection} onSectionChange={setSettingsSection} />
+                    <IndustrySettings t={t} lang={lang} setLang={setLang} activeSection={settingsSection} onSectionChange={setSettingsSection} />
                   ) : windowId === 'personality' ? (
                     <PersonalityEditor t={t} />
                   ) : windowId === 'tools' ? (

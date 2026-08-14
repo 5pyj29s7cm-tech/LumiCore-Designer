@@ -23,7 +23,7 @@ import { getDataPath, getDataRoot } from '../server/config/data_path';
 import { getJwtSecret } from '../server/config/local_identity';
 import * as OrgKB from '../server/org/kb';
 import { getMember, logAudit } from '../server/org/db';
-import { getInteriorProject } from '../server/design/projects';
+import { getInteriorProject, personalInteriorProjectScope } from '../server/design/projects';
 import {
   createInteriorProjectAsset,
   normalizeInteriorAssetCategory,
@@ -1992,13 +1992,11 @@ router.post('/files/upload', requireAuth, upload.array('files', MAX_UPLOAD_FILES
     const interiorAssetCategory = interiorProjectId
       ? normalizeInteriorAssetCategory(req.body?.interiorAssetCategory)
       : undefined;
+    const interiorProjectScopeId = scope.domain === 'work'
+      ? String(scope.orgId || '')
+      : personalInteriorProjectScope(userId);
     if (interiorProjectId) {
-      if (scope.domain !== 'work' || !scope.orgId) {
-        const error: any = new Error('Interior project files require an organization workspace');
-        error.status = 400;
-        throw error;
-      }
-      if (!getInteriorProject(scope.orgId, interiorProjectId)) {
+      if (!interiorProjectScopeId || !getInteriorProject(interiorProjectScopeId, interiorProjectId)) {
         const error: any = new Error('Interior project not found');
         error.status = 404;
         throw error;
@@ -2016,9 +2014,9 @@ router.post('/files/upload', requireAuth, upload.array('files', MAX_UPLOAD_FILES
         mimeType: file.mimetype || '',
         move: true,
       }, userId, scope, db);
-      if (interiorProjectId && scope.orgId) {
+      if (interiorProjectId) {
         const projectAsset = createInteriorProjectAsset({
-          orgId: scope.orgId,
+          orgId: interiorProjectScopeId,
           projectId: interiorProjectId,
           fileId: entry.id,
           displayName: entry.displayName || entry.name || entry.id,
@@ -2034,7 +2032,7 @@ router.post('/files/upload', requireAuth, upload.array('files', MAX_UPLOAD_FILES
       saved.push(entry);
     }
     writeDB(db);
-    if (interiorProjectId && scope.orgId) {
+    if (interiorProjectId && scope.domain === 'work' && scope.orgId) {
       logAudit({
         orgId: scope.orgId,
         userId,

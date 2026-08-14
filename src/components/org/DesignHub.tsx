@@ -1,6 +1,5 @@
 import React, { useMemo, useRef, useState } from 'react';
 import {
-  Building2,
   CheckCircle,
   FileText,
   Layout,
@@ -18,16 +17,19 @@ import type {
   InteriorProjectStatus,
   InteriorProjectType,
 } from '../../lib/interiorProjects';
+import { listInteriorProjectAssets } from '../../lib/interiorProjects';
 import {
   interiorDesignMessage,
   type InteriorDesignLocale,
   type InteriorDesignMessageKey,
 } from '../../i18n/locales/interiorDesign';
+import { designerWorkspaceText } from '../../i18n/locales/designerWorkspaces';
 import { InteriorProjectPanel } from './InteriorProjectPanel';
 import { InteriorProjectAssets } from './InteriorProjectAssets';
 import { startIndustryWorkflow } from '../../lib/industryWorkflowClient';
+import { useApp } from '../../contexts/AppContext';
 
-type DesignView =
+export type DesignView =
   | 'project'
   | 'cad'
   | 'visualization'
@@ -66,13 +68,34 @@ function parseSseEvent(block: string): Record<string, unknown> | null {
   }
 }
 
-export function DesignHub() {
-  const [view, setView] = useState<DesignView>('project');
+export function DesignHub({ initialView = 'project' }: { initialView?: DesignView } = {}) {
+  const [view, setView] = useState<DesignView>(initialView);
   const [activeProject, setActiveProject] = useState<InteriorProject | null>(null);
   const [projectAssets, setProjectAssets] = useState<InteriorProjectAsset[]>([]);
   const t = useT();
+  const { workDomain } = useApp();
   const locale: InteriorDesignLocale = t.langCode === 'en' ? 'en' : 'zh';
   const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
+
+  React.useEffect(() => {
+    setView(initialView);
+  }, [initialView]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    if (!activeProject) {
+      setProjectAssets([]);
+      return () => { cancelled = true; };
+    }
+    listInteriorProjectAssets(workDomain, activeProject.id)
+      .then(items => {
+        if (!cancelled) setProjectAssets(items);
+      })
+      .catch(() => {
+        if (!cancelled) setProjectAssets([]);
+      });
+    return () => { cancelled = true; };
+  }, [activeProject, workDomain]);
 
   const tools = useMemo<Record<DesignView, ToolConfig>>(() => ({
     project: {
@@ -173,33 +196,24 @@ export function DesignHub() {
       </aside>
       <main className="custom-scrollbar min-w-0 flex-1 overflow-y-auto bg-black/10">
         <InteriorProjectPanel
+          domain={workDomain}
           locale={locale}
           onProjectChange={project => {
             setActiveProject(project);
             setProjectAssets([]);
           }}
         />
-        {activeProject ? (
-          <>
-            <InteriorProjectAssets key={activeProject.id} project={activeProject} locale={locale} onAssetsChange={setProjectAssets} />
-            <DesignToolView
-              key={`${activeProject.id}:${activeProject.updatedAt}:${view}`}
-              config={tools[view]}
-              entryId={view}
-              locale={locale}
-              project={activeProject}
-              assets={projectAssets}
-            />
-          </>
-        ) : (
-          <div className="mx-auto flex max-w-5xl items-center justify-center px-6 py-20">
-            <div className="max-w-lg rounded-2xl border border-dashed border-cyan-300/15 bg-cyan-500/[0.04] p-8 text-center">
-              <Building2 size={28} className="mx-auto text-cyan-300/60" />
-              <h2 className="mt-4 text-lg font-black text-white/85">{m('projectRequiredTitle')}</h2>
-              <p className="mt-2 text-sm leading-relaxed text-white/45">{m('projectRequiredDescription')}</p>
-            </div>
-          </div>
+        {activeProject && view === 'project' && (
+          <InteriorProjectAssets key={`${workDomain}:${activeProject.id}`} domain={workDomain} project={activeProject} locale={locale} onAssetsChange={setProjectAssets} />
         )}
+        <DesignToolView
+          key={`${activeProject?.id || 'standalone'}:${activeProject?.updatedAt || ''}:${view}`}
+          config={tools[view]}
+          entryId={view}
+          locale={locale}
+          project={activeProject}
+          assets={activeProject ? projectAssets : []}
+        />
       </main>
     </div>
   );
@@ -221,8 +235,8 @@ function useDesignChat(locale: InteriorDesignLocale) {
   const send = async (prompt: string, workflow: {
     entryId: DesignView;
     sourceInput: string;
-    projectId: string;
-    projectName: string;
+    projectId?: string;
+    projectName?: string;
   }) => {
     if (!prompt.trim() || loading) return;
     const controller = new AbortController();
@@ -234,8 +248,10 @@ function useDesignChat(locale: InteriorDesignLocale) {
       const started = await startIndustryWorkflow({
         entryId: workflow.entryId,
         sourceInput: workflow.sourceInput,
-        source: 'designer_project_workspace',
-        context: { projectId: workflow.projectId, projectName: workflow.projectName },
+        source: workflow.projectId ? 'designer_project_workspace' : 'designer_standalone_workspace',
+        context: workflow.projectId
+          ? { projectId: workflow.projectId, projectName: workflow.projectName }
+          : { mode: 'standalone' },
       });
       setWorkflowTaskId(started.task.id);
       setWorkflowStatus('in_progress');
@@ -347,30 +363,44 @@ function formatProjectAssets(assets: InteriorProjectAsset[], locale: InteriorDes
   return assets.map(asset => `- ${categoryLabels[asset.category]}: ${asset.displayName}`).join('\n');
 }
 
-function DesignToolView({
+interface DesignToolViewProps {
+  config: ToolConfig;
+  entryId: DesignView;
+  locale: InteriorDesignLocale;
+  project: InteriorProject | null;
+  assets: InteriorProjectAsset[];
+}
+
+function DesignToolView(props: DesignToolViewProps) {
+  if (props.entryId === 'project') return <ProjectWorkspace {...props} />;
+  if (props.entryId === 'cad') return <CadWorkspace {...props} />;
+  if (props.entryId === 'visualization') return <VisualizationWorkspace {...props} />;
+  if (props.entryId === 'presentation') return <PresentationWorkspace {...props} />;
+  return <HandoffWorkspace {...props} />;
+}
+
+function GenericDesignToolView({
   config,
   entryId,
   locale,
   project,
   assets,
-}: {
-  config: ToolConfig;
-  entryId: DesignView;
-  locale: InteriorDesignLocale;
-  project: InteriorProject;
-  assets: InteriorProjectAsset[];
-}) {
+}: DesignToolViewProps) {
   const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
   const { input, setInput, result, loading, workflowTaskId, workflowStatus, send, stop } = useDesignChat(locale);
 
   const run = () => {
     const outputGuide = config.output.map(item => `- ${item}`).join('\n');
-    const projectContext = formatProjectContext(project, locale);
-    const assetContext = formatProjectAssets(assets, locale);
+    const projectContext = project ? formatProjectContext(project, locale) : m('standaloneContext');
+    const assetContext = project ? formatProjectAssets(assets, locale) : '';
     const assetSection = assetContext ? `\n\n${m('projectSources')}\n${assetContext}` : '';
     void send(
       `${config.role}\n\n${m('scopeGuard')}\n\n${m('projectContext')}\n${projectContext}${assetSection}\n\n${m('outputInstruction')}\n${outputGuide}\n\n${m('userRequirement')}\n${input}`,
-      { entryId, sourceInput: input, projectId: project.id, projectName: project.name },
+      {
+        entryId,
+        sourceInput: input,
+        ...(project ? { projectId: project.id, projectName: project.name } : {}),
+      },
     );
   };
 
@@ -388,6 +418,9 @@ function DesignToolView({
             <p className="max-w-2xl text-sm leading-relaxed text-white/55">{config.desc}</p>
           </div>
           <div className="hidden shrink-0 gap-2 lg:flex">
+            <span className="max-w-48 truncate rounded-full border border-cyan-300/10 bg-cyan-400/[0.06] px-3 py-1 text-[12px] font-bold text-cyan-100/55">
+              {project?.name || m('standaloneTask')}
+            </span>
             <span className="rounded-full border border-white/[0.08] bg-white/[0.04] px-3 py-1 text-[12px] font-bold uppercase tracking-[0.12em] text-white/45">
               {m('schemeBadge')}
             </span>
@@ -464,6 +497,210 @@ function DesignToolView({
           {result}
         </section>
       )}
+    </div>
+  );
+}
+
+function ProjectWorkspace(props: DesignToolViewProps) {
+  const { locale, project, assets } = props;
+  const stageLabels: Record<InteriorProjectStatus, string> = {
+    brief: designerWorkspaceText(locale, "Brief"),
+    planning: designerWorkspaceText(locale, "Planning"),
+    design: designerWorkspaceText(locale, "Design"),
+    visualization: designerWorkspaceText(locale, "Visualization"),
+    handoff: designerWorkspaceText(locale, "Handoff"),
+    archived: designerWorkspaceText(locale, "Archived"),
+  };
+  return (
+    <div>
+      <section className="mx-auto grid max-w-5xl gap-3 px-6 pt-6 sm:grid-cols-3">
+        <article className="rounded-2xl border border-cyan-300/12 bg-cyan-400/[0.05] p-4">
+          <p className="text-[10px] font-black uppercase tracking-[0.16em] text-cyan-100/45">{designerWorkspaceText(locale, "Project cockpit")}</p>
+          <p className="mt-2 text-lg font-black text-cyan-50">{project ? stageLabels[project.status] : designerWorkspaceText(locale, "Standalone")}</p>
+        </article>
+        <article className="rounded-2xl border border-white/[0.08] bg-white/[0.035] p-4">
+          <p className="text-[10px] font-black uppercase tracking-[0.16em] text-white/35">{designerWorkspaceText(locale, "Project evidence")}</p>
+          <p className="mt-2 text-lg font-black text-white/80">{assets.length} {designerWorkspaceText(locale, "files")}</p>
+        </article>
+        <article className="rounded-2xl border border-white/[0.08] bg-white/[0.035] p-4">
+          <p className="text-[10px] font-black uppercase tracking-[0.16em] text-white/35">{designerWorkspaceText(locale, "Continuity")}</p>
+          <p className="mt-2 truncate text-lg font-black text-white/80">{project?.name || designerWorkspaceText(locale, "No project bound")}</p>
+        </article>
+      </section>
+      <GenericDesignToolView {...props} />
+    </div>
+  );
+}
+
+function useStageWorkflow(props: DesignToolViewProps) {
+  const { config, entryId, locale, project, assets } = props;
+  const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
+  const chat = useDesignChat(locale);
+  const run = (details: string) => {
+    const projectContext = project ? formatProjectContext(project, locale) : m('standaloneContext');
+    const assetContext = project ? formatProjectAssets(assets, locale) : '';
+    const outputGuide = config.output.map(item => `- ${item}`).join('\n');
+    void chat.send(
+      `${config.role}\n\n${m('scopeGuard')}\n\n${m('projectContext')}\n${projectContext}${assetContext ? `\n\n${m('projectSources')}\n${assetContext}` : ''}\n\n${m('outputInstruction')}\n${outputGuide}\n\n${m('userRequirement')}\n${details}`,
+      {
+        entryId,
+        sourceInput: details,
+        ...(project ? { projectId: project.id, projectName: project.name } : {}),
+      },
+    );
+  };
+  return { chat, run };
+}
+
+function StageHeader({ config, project, eyebrow, accent }: {
+  config: ToolConfig;
+  project: InteriorProject | null;
+  eyebrow: string;
+  accent: string;
+}) {
+  return (
+    <header className="flex flex-wrap items-start justify-between gap-4 border-b border-white/[0.08] pb-5">
+      <div className="min-w-0">
+        <div className={`mb-2 flex items-center gap-3 ${accent}`}>
+          <span className="flex h-10 w-10 items-center justify-center rounded-2xl border border-current/20 bg-current/10">{config.icon}</span>
+          <div>
+            <p className="text-[10px] font-black uppercase tracking-[0.18em] opacity-55">{eyebrow}</p>
+            <h2 className="text-xl font-black tracking-tight text-white">{config.title}</h2>
+          </div>
+        </div>
+        <p className="max-w-3xl text-sm leading-relaxed text-white/50">{config.desc}</p>
+      </div>
+      <span className="max-w-64 truncate rounded-full border border-white/[0.08] bg-white/[0.04] px-3 py-1.5 text-xs font-bold text-white/55">{project?.name || 'Standalone'}</span>
+    </header>
+  );
+}
+
+function StageRunBar({ chat, button, disabled, onRun, className, locale }: {
+  chat: ReturnType<typeof useDesignChat>;
+  button: string;
+  disabled: boolean;
+  onRun: () => void;
+  className: string;
+  locale: InteriorDesignLocale;
+}) {
+  return (
+    <>
+      <div className="flex flex-wrap items-center gap-3 border-t border-white/[0.08] pt-4">
+        <button type="button" onClick={onRun} disabled={chat.loading || disabled} className={`lumi-button-primary px-6 py-3 disabled:cursor-not-allowed disabled:opacity-40 ${className}`}>
+          {chat.loading ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
+          {chat.loading ? designerWorkspaceText(locale, 'Lumi is working') : button}
+        </button>
+        {chat.loading && <button type="button" onClick={chat.stop} className="lumi-button px-4 py-3 text-white/65"><Square size={14} />{designerWorkspaceText(locale, 'Stop')}</button>}
+        {chat.workflowTaskId && <span className="rounded-full border border-emerald-300/12 bg-emerald-400/[0.05] px-3 py-1.5 text-[11px] font-mono text-emerald-100/60">{chat.workflowStatus || 'in_progress'} · {chat.workflowTaskId.slice(0, 12)}</span>}
+      </div>
+      {chat.result && <section className="lumi-panel custom-scrollbar max-h-[560px] overflow-y-auto whitespace-pre-wrap p-5 text-sm leading-relaxed text-white/80">{chat.result}</section>}
+    </>
+  );
+}
+
+function CadWorkspace(props: DesignToolViewProps) {
+  const { config, locale, project, assets } = props;
+  const { chat, run } = useStageWorkflow(props);
+  const [drawingType, setDrawingType] = useState(designerWorkspaceText(locale, "Floor plan"));
+  const [output, setOutput] = useState('');
+  const [dimensions, setDimensions] = useState('');
+  const [constraints, setConstraints] = useState('');
+  const sources = assets.filter(asset => asset.category === 'cad' || asset.category === 'floor-plan' || /\.(dwg|dxf|ifc|rvt|pdf)$/i.test(asset.displayName));
+  const checks = [designerWorkspaceText(locale, "Grid, structure, and fixed conditions"), designerWorkspaceText(locale, "Key dimensions and closure"), designerWorkspaceText(locale, "Fire, MEP, and opening conflicts"), designerWorkspaceText(locale, "Openable file and geometry receipt")];
+  return (
+    <div className="mx-auto flex max-w-6xl flex-col gap-5 p-6">
+      <StageHeader config={config} project={project} eyebrow={designerWorkspaceText(locale, "Drawing desk")} accent="text-amber-200" />
+      <section className="grid gap-5 xl:grid-cols-[280px_minmax(0,1fr)_280px]">
+        <aside className="rounded-2xl border border-amber-300/12 bg-amber-400/[0.045] p-4">
+          <h3 className="flex items-center gap-2 text-xs font-black uppercase tracking-[0.14em] text-amber-100/60"><FileText size={14} />{designerWorkspaceText(locale, "Drawing sources")}</h3>
+          <div className="mt-3 space-y-2">{sources.length ? sources.slice(0, 8).map(asset => <div key={asset.id} className="rounded-xl border border-white/[0.07] bg-black/20 px-3 py-2.5"><p className="truncate text-sm font-bold text-white/70">{asset.displayName}</p><p className="mt-1 text-[10px] uppercase tracking-[0.12em] text-amber-100/35">{asset.category}</p></div>) : <p className="rounded-xl border border-dashed border-amber-300/15 px-3 py-5 text-center text-xs leading-relaxed text-amber-100/40">{designerWorkspaceText(locale, "No CAD, PDF, or base plan is bound. Describe a standalone task first.")}</p>}</div>
+        </aside>
+        <div className="rounded-2xl border border-white/[0.08] bg-black/20 p-5">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Drawing type")}</span><select value={drawingType} onChange={event => setDrawingType(event.target.value)} className="lumi-field mt-2 w-full py-2.5 text-sm"><option>{designerWorkspaceText(locale, "Floor plan")}</option><option>{designerWorkspaceText(locale, "Reflected ceiling")}</option><option>{designerWorkspaceText(locale, "Elevation")}</option><option>{designerWorkspaceText(locale, "Detail")}</option></select></label>
+            <label className="text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Output requirement")}</span><input value={output} onChange={event => setOutput(event.target.value)} placeholder={designerWorkspaceText(locale, "e.g. DWG + dimension checklist")} className="lumi-field mt-2 w-full py-2.5 text-sm" /></label>
+          </div>
+          <label className="mt-4 block text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Known dimensions and survey basis")}</span><textarea value={dimensions} onChange={event => setDimensions(event.target.value)} rows={5} placeholder={designerWorkspaceText(locale, "Enter verified grids, spans, heights, openings, and service points")} className="lumi-field mt-2 w-full resize-y" /></label>
+          <label className="mt-4 block text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Fixed conditions and conflicts")}</span><textarea value={constraints} onChange={event => setConstraints(event.target.value)} rows={5} placeholder={config.placeholder} className="lumi-field mt-2 w-full resize-y" /></label>
+        </div>
+        <aside className="rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4"><h3 className="text-xs font-black uppercase tracking-[0.14em] text-white/45">{designerWorkspaceText(locale, "Pre-drawing checks")}</h3><div className="mt-3 space-y-2">{checks.map((check, index) => <div key={check} className="flex gap-3 rounded-xl border border-white/[0.06] px-3 py-3 text-sm text-white/60"><span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-amber-300/20 text-[10px] font-black text-amber-200">{index + 1}</span><span>{check}</span></div>)}</div></aside>
+      </section>
+      <StageRunBar locale={locale} chat={chat} button={config.button} disabled={!output.trim() && !dimensions.trim() && !constraints.trim()} onRun={() => run(`${designerWorkspaceText(locale, "Drawing type")}: ${drawingType}\n${designerWorkspaceText(locale, "Output")}: ${output}\n${designerWorkspaceText(locale, "Dimensions")}: ${dimensions}\n${designerWorkspaceText(locale, "Fixed conditions and conflicts")}: ${constraints}`)} className="border-amber-400/25 bg-amber-500/15 text-amber-100 hover:bg-amber-500/25" />
+    </div>
+  );
+}
+
+function VisualizationWorkspace(props: DesignToolViewProps) {
+  const { config, locale, project, assets } = props;
+  const { chat, run } = useStageWorkflow(props);
+  const [space, setSpace] = useState('');
+  const [style, setStyle] = useState('');
+  const [lighting, setLighting] = useState('');
+  const [materials, setMaterials] = useState('');
+  const [brief, setBrief] = useState('');
+  const views = [designerWorkspaceText(locale, "Hero view"), designerWorkspaceText(locale, "Spatial relation"), designerWorkspaceText(locale, "Material detail"), designerWorkspaceText(locale, "Lighting mood")];
+  const references = assets.filter(asset => asset.mimeType.startsWith('image/') || ['site-photo', 'material', 'reference'].includes(asset.category)).length;
+  return (
+    <div className="mx-auto flex max-w-6xl flex-col gap-5 p-6">
+      <StageHeader config={config} project={project} eyebrow={designerWorkspaceText(locale, "Visualization studio")} accent="text-fuchsia-200" />
+      <section className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
+        <div className="space-y-4"><div className="grid gap-3 sm:grid-cols-2">
+          <label className="rounded-2xl border border-fuchsia-300/10 bg-fuchsia-400/[0.04] p-4 text-xs font-bold text-fuchsia-100/55"><span>{designerWorkspaceText(locale, "Space and camera")}</span><input value={space} onChange={event => setSpace(event.target.value)} placeholder={designerWorkspaceText(locale, "Hero view, entrance reverse view")} className="lumi-field mt-2 w-full py-2.5 text-sm" /></label>
+          <label className="rounded-2xl border border-fuchsia-300/10 bg-fuchsia-400/[0.04] p-4 text-xs font-bold text-fuchsia-100/55"><span>{designerWorkspaceText(locale, "Style direction")}</span><input value={style} onChange={event => setStyle(event.target.value)} placeholder={designerWorkspaceText(locale, "Natural modern, restrained sci-fi")} className="lumi-field mt-2 w-full py-2.5 text-sm" /></label>
+          <label className="rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4 text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Lighting and time")}</span><input value={lighting} onChange={event => setLighting(event.target.value)} placeholder={designerWorkspaceText(locale, "Afternoon daylight, warm evening light")} className="lumi-field mt-2 w-full py-2.5 text-sm" /></label>
+          <label className="rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4 text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Key materials")}</span><input value={materials} onChange={event => setMaterials(event.target.value)} placeholder={designerWorkspaceText(locale, "Wood veneer, microcement, metal")} className="lumi-field mt-2 w-full py-2.5 text-sm" /></label>
+        </div><textarea value={brief} onChange={event => setBrief(event.target.value)} rows={6} placeholder={config.placeholder} className="lumi-field w-full resize-y" /></div>
+        <aside className="overflow-hidden rounded-2xl border border-fuchsia-300/12 bg-gradient-to-br from-fuchsia-950/25 to-violet-950/20 p-4"><div className="flex items-center justify-between"><h3 className="text-xs font-black uppercase tracking-[0.14em] text-fuchsia-100/55">{designerWorkspaceText(locale, "Shot board")}</h3><span className="text-[11px] text-white/30">{references} refs</span></div><div className="mt-4 grid grid-cols-2 gap-3">{views.map((label, index) => <div key={label} className="flex aspect-[4/3] flex-col justify-between rounded-2xl border border-white/[0.08] bg-black/25 p-3"><span className="text-[10px] font-black uppercase tracking-[0.14em] text-fuchsia-100/35">VIEW {String(index + 1).padStart(2, '0')}</span><Sparkles size={20} className="self-center text-fuchsia-200/25" /><span className="text-xs font-bold text-white/55">{label}</span></div>)}</div></aside>
+      </section>
+      <StageRunBar locale={locale} chat={chat} button={config.button} disabled={!space.trim() && !style.trim() && !brief.trim()} onRun={() => run(`${designerWorkspaceText(locale, "Space and camera")}: ${space}\n${designerWorkspaceText(locale, "Style")}: ${style}\n${designerWorkspaceText(locale, "Lighting")}: ${lighting}\n${designerWorkspaceText(locale, "Materials")}: ${materials}\n${designerWorkspaceText(locale, "Additional brief")}: ${brief}`)} className="border-fuchsia-400/25 bg-fuchsia-500/15 text-fuchsia-100 hover:bg-fuchsia-500/25" />
+    </div>
+  );
+}
+
+function PresentationWorkspace(props: DesignToolViewProps) {
+  const { config, locale, project } = props;
+  const { chat, run } = useStageWorkflow(props);
+  const [audience, setAudience] = useState('');
+  const [goal, setGoal] = useState('');
+  const [slideCount, setSlideCount] = useState('12');
+  const [style, setStyle] = useState('');
+  const [required, setRequired] = useState('');
+  const slides = [designerWorkspaceText(locale, "Cover and positioning"), designerWorkspaceText(locale, "Brief and insight"), designerWorkspaceText(locale, "Concept and strategy"), designerWorkspaceText(locale, "Spatial scheme"), designerWorkspaceText(locale, "Visuals and materials"), designerWorkspaceText(locale, "Budget, schedule, next step")];
+  return (
+    <div className="mx-auto flex max-w-6xl flex-col gap-5 p-6">
+      <StageHeader config={config} project={project} eyebrow={designerWorkspaceText(locale, "Proposal builder")} accent="text-blue-200" />
+      <section className="grid gap-5 lg:grid-cols-[340px_minmax(0,1fr)]">
+        <aside className="rounded-2xl border border-blue-300/12 bg-blue-400/[0.04] p-4"><div className="flex items-center justify-between"><h3 className="text-xs font-black uppercase tracking-[0.14em] text-blue-100/55">{designerWorkspaceText(locale, "Suggested storyline")}</h3><span className="rounded-full bg-blue-400/10 px-2 py-1 text-[10px] font-bold text-blue-100/45">{slideCount || '—'} PAGES</span></div><div className="mt-4 space-y-2">{slides.map((slide, index) => <div key={slide} className="flex items-center gap-3 rounded-xl border border-white/[0.07] bg-black/15 px-3 py-3"><span className="text-[11px] font-black text-blue-200/45">{String(index + 1).padStart(2, '0')}</span><span className="text-sm font-bold text-white/65">{slide}</span></div>)}</div></aside>
+        <div className="rounded-2xl border border-white/[0.08] bg-black/20 p-5"><div className="grid gap-3 sm:grid-cols-2">
+          <label className="text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Audience")}</span><input value={audience} onChange={event => setAudience(event.target.value)} placeholder={designerWorkspaceText(locale, "Client, management, review panel")} className="lumi-field mt-2 w-full py-2.5 text-sm" /></label>
+          <label className="text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Slide count")}</span><input type="number" min="4" max="80" value={slideCount} onChange={event => setSlideCount(event.target.value)} className="lumi-field mt-2 w-full py-2.5 text-sm" /></label>
+          <label className="text-xs font-bold text-white/45 sm:col-span-2"><span>{designerWorkspaceText(locale, "Meeting goal")}</span><input value={goal} onChange={event => setGoal(event.target.value)} placeholder={designerWorkspaceText(locale, "What decision should this proposal enable?")} className="lumi-field mt-2 w-full py-2.5 text-sm" /></label>
+          <label className="text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Visual style")}</span><textarea value={style} onChange={event => setStyle(event.target.value)} rows={5} placeholder={designerWorkspaceText(locale, "Layout, color, and brand constraints")} className="lumi-field mt-2 w-full resize-y" /></label>
+          <label className="text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Required content")}</span><textarea value={required} onChange={event => setRequired(event.target.value)} rows={5} placeholder={config.placeholder} className="lumi-field mt-2 w-full resize-y" /></label>
+        </div></div>
+      </section>
+      <StageRunBar locale={locale} chat={chat} button={config.button} disabled={!audience.trim() && !goal.trim() && !required.trim()} onRun={() => run(`${designerWorkspaceText(locale, "Audience")}: ${audience}\n${designerWorkspaceText(locale, "Meeting goal")}: ${goal}\n${designerWorkspaceText(locale, "Slide count")}: ${slideCount}\n${designerWorkspaceText(locale, "Visual style")}: ${style}\n${designerWorkspaceText(locale, "Required content")}: ${required}`)} className="border-blue-400/25 bg-blue-500/15 text-blue-100 hover:bg-blue-500/25" />
+    </div>
+  );
+}
+
+function HandoffWorkspace(props: DesignToolViewProps) {
+  const { config, locale, project, assets } = props;
+  const { chat, run } = useStageWorkflow(props);
+  const checklist = [designerWorkspaceText(locale, "Drawing register and revisions"), designerWorkspaceText(locale, "Key dimensions and schedules"), designerWorkspaceText(locale, "Consultant coordination and conflicts"), designerWorkspaceText(locale, "Openable files and naming"), designerWorkspaceText(locale, "Client approvals and open items")];
+  const [checked, setChecked] = useState<string[]>([]);
+  const [recipient, setRecipient] = useState('');
+  const [version, setVersion] = useState('V1.0');
+  const [notes, setNotes] = useState('');
+  const toggle = (item: string) => setChecked(current => current.includes(item) ? current.filter(value => value !== item) : [...current, item]);
+  return (
+    <div className="mx-auto flex max-w-6xl flex-col gap-5 p-6">
+      <StageHeader config={config} project={project} eyebrow={designerWorkspaceText(locale, "Handoff control")} accent="text-emerald-200" />
+      <section className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_340px]">
+        <div className="rounded-2xl border border-emerald-300/12 bg-emerald-400/[0.035] p-5"><div className="flex flex-wrap items-center justify-between gap-3"><h3 className="text-xs font-black uppercase tracking-[0.14em] text-emerald-100/55">{designerWorkspaceText(locale, "Delivery checklist")}</h3><span className="text-xs font-bold text-emerald-100/45">{checked.length}/{checklist.length} {designerWorkspaceText(locale, "verified")}</span></div><div className="mt-4 space-y-2">{checklist.map(item => <label key={item} className={`flex cursor-pointer items-center gap-3 rounded-xl border px-3 py-3 transition-colors ${checked.includes(item) ? 'border-emerald-300/25 bg-emerald-400/10 text-emerald-50' : 'border-white/[0.07] bg-black/15 text-white/55'}`}><input type="checkbox" checked={checked.includes(item)} onChange={() => toggle(item)} className="h-4 w-4 accent-emerald-400" /><span className="text-sm font-bold">{item}</span></label>)}</div></div>
+        <aside className="rounded-2xl border border-white/[0.08] bg-black/20 p-5"><label className="block text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Recipient")}</span><input value={recipient} onChange={event => setRecipient(event.target.value)} placeholder={designerWorkspaceText(locale, "Client, contractor, supplier")} className="lumi-field mt-2 w-full py-2.5 text-sm" /></label><label className="mt-4 block text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Delivery version")}</span><input value={version} onChange={event => setVersion(event.target.value)} className="lumi-field mt-2 w-full py-2.5 text-sm" /></label><label className="mt-4 block text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Open items and verification focus")}</span><textarea value={notes} onChange={event => setNotes(event.target.value)} rows={7} placeholder={config.placeholder} className="lumi-field mt-2 w-full resize-y" /></label><div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-3 text-xs leading-relaxed text-white/40">{assets.length} {designerWorkspaceText(locale, "project files are available as evidence. Completion requires verified file receipts.")}</div></aside>
+      </section>
+      <StageRunBar locale={locale} chat={chat} button={config.button} disabled={!recipient.trim() && !notes.trim() && checked.length === 0} onRun={() => run(`${designerWorkspaceText(locale, "Recipient")}: ${recipient}\n${designerWorkspaceText(locale, "Version")}: ${version}\n${designerWorkspaceText(locale, "Manually checked")}: ${checked.join('、')}\n${designerWorkspaceText(locale, "Open items")}: ${notes}`)} className="border-emerald-400/25 bg-emerald-500/15 text-emerald-100 hover:bg-emerald-500/25" />
     </div>
   );
 }

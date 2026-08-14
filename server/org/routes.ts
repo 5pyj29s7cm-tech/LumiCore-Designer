@@ -56,6 +56,18 @@ function respondInteriorProjectError(res: Response, error: unknown): boolean {
   return false;
 }
 
+function requirePersonalInteriorContext(req: Request, res: Response): string | null {
+  if (!req.user) {
+    res.status(401).json({ error: 'Authentication required' });
+    return null;
+  }
+  if (req.user.orgId) {
+    res.status(409).json({ error: 'Personal design projects require the personal Lumi workspace.' });
+    return null;
+  }
+  return InteriorProjects.personalInteriorProjectScope(req.user.uid);
+}
+
 export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
   // ── Health / status ──────────────────────────────────────────────────
 
@@ -70,6 +82,99 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
   });
 
   // ── Spatial and interior projects ───────────────────────────────────
+
+  // Personal design projects share the durable project model while remaining
+  // isolated by authenticated user and independent from organization setup.
+  router.get('/personal/interior/projects', requireAuth, (req: Request, res: Response) => {
+    const scopeId = requirePersonalInteriorContext(req, res);
+    if (!scopeId) return;
+    res.json({
+      projects: InteriorProjects.listInteriorProjects(scopeId, {
+        includeArchived: req.query.includeArchived === 'true',
+      }),
+    });
+  });
+
+  router.get('/personal/interior/projects/:projectId', requireAuth, (req: Request, res: Response) => {
+    const scopeId = requirePersonalInteriorContext(req, res);
+    if (!scopeId) return;
+    const project = InteriorProjects.getInteriorProject(scopeId, req.params.projectId);
+    if (!project) {
+      res.status(404).json({ error: 'Interior project not found' });
+      return;
+    }
+    res.json(project);
+  });
+
+  router.post('/personal/interior/projects', requireAuth, (req: Request, res: Response) => {
+    const scopeId = requirePersonalInteriorContext(req, res);
+    if (!scopeId) return;
+    try {
+      res.status(201).json(InteriorProjects.createInteriorProject(scopeId, req.user!.uid, req.body || {}));
+    } catch (error) {
+      if (!respondInteriorProjectError(res, error)) throw error;
+    }
+  });
+
+  router.put('/personal/interior/projects/:projectId', requireAuth, (req: Request, res: Response) => {
+    const scopeId = requirePersonalInteriorContext(req, res);
+    if (!scopeId) return;
+    try {
+      const project = InteriorProjects.updateInteriorProject(scopeId, req.params.projectId, req.body || {});
+      if (!project) {
+        res.status(404).json({ error: 'Interior project not found' });
+        return;
+      }
+      res.json(project);
+    } catch (error) {
+      if (!respondInteriorProjectError(res, error)) throw error;
+    }
+  });
+
+  router.get('/personal/interior/projects/:projectId/assets', requireAuth, (req: Request, res: Response) => {
+    const scopeId = requirePersonalInteriorContext(req, res);
+    if (!scopeId) return;
+    if (!InteriorProjects.getInteriorProject(scopeId, req.params.projectId)) {
+      res.status(404).json({ error: 'Interior project not found' });
+      return;
+    }
+    res.json({ assets: InteriorProjectAssets.listInteriorProjectAssets(scopeId, req.params.projectId) });
+  });
+
+  router.put('/personal/interior/projects/:projectId/assets/:assetId', requireAuth, (req: Request, res: Response) => {
+    const scopeId = requirePersonalInteriorContext(req, res);
+    if (!scopeId) return;
+    try {
+      const asset = InteriorProjectAssets.updateInteriorProjectAsset(
+        scopeId,
+        req.params.projectId,
+        req.params.assetId,
+        req.body || {},
+      );
+      if (!asset) {
+        res.status(404).json({ error: 'Interior project asset not found' });
+        return;
+      }
+      res.json(asset);
+    } catch (error) {
+      if (!respondInteriorProjectError(res, error)) throw error;
+    }
+  });
+
+  router.delete('/personal/interior/projects/:projectId/assets/:assetId', requireAuth, (req: Request, res: Response) => {
+    const scopeId = requirePersonalInteriorContext(req, res);
+    if (!scopeId) return;
+    const asset = InteriorProjectAssets.removeInteriorProjectAsset(
+      scopeId,
+      req.params.projectId,
+      req.params.assetId,
+    );
+    if (!asset) {
+      res.status(404).json({ error: 'Interior project asset not found' });
+      return;
+    }
+    res.json({ success: true, asset, fileRetained: true });
+  });
 
   router.get('/org/interior/projects', requireAuth, requireOrgMember, (req: Request, res: Response) => {
     const projects = InteriorProjects.listInteriorProjects(req.user!.orgId!, {

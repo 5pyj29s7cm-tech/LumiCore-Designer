@@ -1,6 +1,7 @@
 export type InteriorProjectType = 'residential' | 'office' | 'retail' | 'hospitality' | 'other';
 export type InteriorProjectStatus = 'brief' | 'planning' | 'design' | 'visualization' | 'handoff' | 'archived';
 export type InteriorAssetCategory = 'floor-plan' | 'cad' | 'site-photo' | 'material' | 'reference' | 'other';
+export type InteriorProjectDomain = 'personal' | 'work';
 
 export interface InteriorProjectBrief {
   location: string;
@@ -64,13 +65,17 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
-export async function listInteriorProjects(): Promise<InteriorProject[]> {
-  const data = await request<{ projects: InteriorProject[] }>('/api/org/interior/projects');
+function projectRoute(domain: InteriorProjectDomain): string {
+  return domain === 'work' ? '/api/org/interior/projects' : '/api/personal/interior/projects';
+}
+
+export async function listInteriorProjects(domain: InteriorProjectDomain): Promise<InteriorProject[]> {
+  const data = await request<{ projects: InteriorProject[] }>(projectRoute(domain));
   return Array.isArray(data.projects) ? data.projects : [];
 }
 
-export function createInteriorProject(draft: InteriorProjectDraft): Promise<InteriorProject> {
-  return request<InteriorProject>('/api/org/interior/projects', {
+export function createInteriorProject(domain: InteriorProjectDomain, draft: InteriorProjectDraft): Promise<InteriorProject> {
+  return request<InteriorProject>(projectRoute(domain), {
     method: 'POST',
     body: JSON.stringify({
       name: draft.name,
@@ -80,39 +85,40 @@ export function createInteriorProject(draft: InteriorProjectDraft): Promise<Inte
   });
 }
 
-export function updateInteriorProject(projectId: string, draft: InteriorProjectDraft): Promise<InteriorProject> {
-  return request<InteriorProject>(`/api/org/interior/projects/${encodeURIComponent(projectId)}`, {
+export function updateInteriorProject(domain: InteriorProjectDomain, projectId: string, draft: InteriorProjectDraft): Promise<InteriorProject> {
+  return request<InteriorProject>(`${projectRoute(domain)}/${encodeURIComponent(projectId)}`, {
     method: 'PUT',
     body: JSON.stringify(draft),
   });
 }
 
-export async function listInteriorProjectAssets(projectId: string): Promise<InteriorProjectAsset[]> {
+export async function listInteriorProjectAssets(domain: InteriorProjectDomain, projectId: string): Promise<InteriorProjectAsset[]> {
   const data = await request<{ assets: InteriorProjectAsset[] }>(
-    `/api/org/interior/projects/${encodeURIComponent(projectId)}/assets`,
+    `${projectRoute(domain)}/${encodeURIComponent(projectId)}/assets`,
   );
   return Array.isArray(data.assets) ? data.assets : [];
 }
 
 export function updateInteriorProjectAsset(
+  domain: InteriorProjectDomain,
   projectId: string,
   assetId: string,
   category: InteriorAssetCategory,
 ): Promise<InteriorProjectAsset> {
   return request<InteriorProjectAsset>(
-    `/api/org/interior/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`,
+    `${projectRoute(domain)}/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`,
     { method: 'PUT', body: JSON.stringify({ category }) },
   );
 }
 
-export function removeInteriorProjectAsset(projectId: string, assetId: string): Promise<void> {
+export function removeInteriorProjectAsset(domain: InteriorProjectDomain, projectId: string, assetId: string): Promise<void> {
   return request(
-    `/api/org/interior/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`,
+    `${projectRoute(domain)}/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`,
     { method: 'DELETE' },
   );
 }
 
-export function interiorProjectAssetUrl(asset: Pick<InteriorProjectAsset, 'fileId'>, inline = true): string {
-  const query = inline ? '?domain=work&inline=1' : '?domain=work';
+export function interiorProjectAssetUrl(domain: InteriorProjectDomain, asset: Pick<InteriorProjectAsset, 'fileId'>, inline = true): string {
+  const query = inline ? `?domain=${domain}&inline=1` : `?domain=${domain}`;
   return `/api/files/download/${encodeURIComponent(asset.fileId)}${query}`;
 }

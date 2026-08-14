@@ -21,6 +21,11 @@ describe('spatial and interior project workflow', () => {
     return { 'Content-Type': 'application/json', Cookie: `token=${token}` };
   }
 
+  function personalHeaders(userId: string): Record<string, string> {
+    const token = jwt.sign({ uid: userId, username: userId, role: 'user' }, JWT_SECRET);
+    return { 'Content-Type': 'application/json', Cookie: `token=${token}` };
+  }
+
   beforeAll(async () => {
     const app = await makeApp();
     baseUrl = app.url;
@@ -203,6 +208,75 @@ describe('spatial and interior project workflow', () => {
     expect(persisted).toHaveLength(1);
     expect(persisted[0].status).toBe('removed');
     expect(JSON.parse(persisted[0].payload).category).toBe('reference');
+  });
+
+  it('supports user-isolated personal projects and personal project assets without an organization', async () => {
+    const personalOwner = `personal-designer-${suffix}`;
+    const otherUser = `other-personal-designer-${suffix}`;
+    const createdResponse = await fetch(`${baseUrl}/api/personal/interior/projects`, {
+      method: 'POST',
+      headers: personalHeaders(personalOwner),
+      body: JSON.stringify({
+        name: 'Personal Studio Project',
+        projectType: 'residential',
+        brief: { area: '96 m2', style: 'Warm minimal' },
+      }),
+    });
+    expect(createdResponse.status).toBe(201);
+    const project = await createdResponse.json();
+    expect(project).toMatchObject({
+      orgId: `personal:${personalOwner}`,
+      ownerUserId: personalOwner,
+      name: 'Personal Studio Project',
+    });
+
+    const ownerList = await fetch(`${baseUrl}/api/personal/interior/projects`, {
+      headers: personalHeaders(personalOwner),
+    });
+    expect((await ownerList.json()).projects).toMatchObject([{ id: project.id }]);
+
+    const otherList = await fetch(`${baseUrl}/api/personal/interior/projects`, {
+      headers: personalHeaders(otherUser),
+    });
+    expect((await otherList.json()).projects).toEqual([]);
+
+    const foreignRead = await fetch(`${baseUrl}/api/personal/interior/projects/${project.id}`, {
+      headers: personalHeaders(otherUser),
+    });
+    expect(foreignRead.status).toBe(404);
+
+    const form = new FormData();
+    form.append('files', new Blob(['Personal material reference']), 'personal-material.txt');
+    form.append('domain', 'personal');
+    form.append('interiorProjectId', project.id);
+    form.append('interiorAssetCategory', 'material');
+    const uploadResponse = await fetch(`${baseUrl}/api/files/upload?domain=personal`, {
+      method: 'POST',
+      headers: { Cookie: personalHeaders(personalOwner).Cookie },
+      body: form,
+    });
+    expect(uploadResponse.status).toBe(200);
+    const uploaded = await uploadResponse.json();
+    expect(uploaded.files[0].interiorProjectAsset).toMatchObject({
+      orgId: `personal:${personalOwner}`,
+      projectId: project.id,
+      category: 'material',
+    });
+
+    const assetsResponse = await fetch(`${baseUrl}/api/personal/interior/projects/${project.id}/assets`, {
+      headers: personalHeaders(personalOwner),
+    });
+    expect(assetsResponse.status).toBe(200);
+    expect((await assetsResponse.json()).assets).toMatchObject([{
+      projectId: project.id,
+      displayName: 'personal-material.txt',
+      category: 'material',
+    }]);
+
+    const workSessionRead = await fetch(`${baseUrl}/api/personal/interior/projects`, {
+      headers: headers(memberId),
+    });
+    expect(workSessionRead.status).toBe(409);
   });
 
   it('rejects invalid project types and oversized brief fields', async () => {

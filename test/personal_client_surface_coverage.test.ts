@@ -121,13 +121,21 @@ describe('complete personal-client surface contract', () => {
     ])).sort();
 
     expect([...PERSONAL_CLIENT_LAUNCHER_IDS].sort()).toEqual(renderedLauncherIds);
-    expect(quotedPropertyValues(desktopIcons, 'windowId')).toEqual(['tools', 'skills', 'memory-avatar']);
+    expect(quotedPropertyValues(desktopIcons, 'windowId')).toEqual([
+      'design-project',
+      'design-cad',
+      'design-visualization',
+      'design-presentation',
+      'design-handoff',
+    ]);
     expect(quotedPropertyValues(desktopIcons, 'windowId')).not.toContain('command-center');
     expect(quotedPropertyValues(desktopIcons, 'windowId')).not.toContain('runtime-log');
     expect(quotedPropertyValues(desktopIcons, 'windowId')).not.toContain('personalization');
     expect(quotedPropertyValues(desktopIcons, 'windowId')).not.toEqual(expect.arrayContaining(['avatar-studio', 'sound']));
     expect(quotedPropertyValues(utilityIcons, 'id')).toContain('personalization');
+    expect(quotedPropertyValues(utilityIcons, 'id')).toEqual(expect.arrayContaining(['personality', 'kernel']));
     expect(quotedPropertyValues(appIcons, 'id')).not.toContain('chat');
+    expect(quotedPropertyValues(appIcons, 'id')).toEqual(['devices', 'settings']);
     expect(desktop).toContain('const desktopIconColumns = 3');
     const dock = sourceBlock(desktop, '{/* Bottom Taskbar / Dock */}', '{/* Main OS Content Layer (Personal Desktop Surface) */}');
     expect(dock).toContain('data-lumi-target="personalization"');

@@ -19,6 +19,7 @@ import {
   updateInteriorProjectAsset,
   type InteriorAssetCategory,
   type InteriorProject,
+  type InteriorProjectDomain,
   type InteriorProjectAsset,
 } from '../../lib/interiorProjects';
 import {
@@ -28,6 +29,7 @@ import {
 } from '../../i18n/locales/interiorDesign';
 
 interface InteriorProjectAssetsProps {
+  domain: InteriorProjectDomain;
   project: InteriorProject;
   locale: InteriorDesignLocale;
   onAssetsChange: (assets: InteriorProjectAsset[]) => void;
@@ -51,7 +53,7 @@ function AssetIcon({ asset }: { asset: InteriorProjectAsset }) {
   return <FileText size={17} />;
 }
 
-export function InteriorProjectAssets({ project, locale, onAssetsChange }: InteriorProjectAssetsProps) {
+export function InteriorProjectAssets({ domain, project, locale, onAssetsChange }: InteriorProjectAssetsProps) {
   const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [assets, setAssets] = useState<InteriorProjectAsset[]>([]);
@@ -77,7 +79,7 @@ export function InteriorProjectAssets({ project, locale, onAssetsChange }: Inter
     setError('');
     setAssets([]);
     onAssetsChange([]);
-    listInteriorProjectAssets(project.id)
+    listInteriorProjectAssets(domain, project.id)
       .then(items => {
         if (cancelled) return;
         setAssets(items);
@@ -92,7 +94,7 @@ export function InteriorProjectAssets({ project, locale, onAssetsChange }: Inter
     return () => { cancelled = true; };
   // Project identity is the load boundary; the parent setter is stable.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project.id, locale]);
+  }, [domain, project.id, locale]);
 
   const publishAssets = (next: InteriorProjectAsset[]) => {
     setAssets(next);
@@ -107,21 +109,21 @@ export function InteriorProjectAssets({ project, locale, onAssetsChange }: Inter
     try {
       const formData = new FormData();
       selected.forEach(file => formData.append('files', file));
-      formData.append('domain', 'work');
+      formData.append('domain', domain);
       formData.append('interiorProjectId', project.id);
       formData.append('interiorAssetCategory', category);
-      const response = await fetch('/api/files/upload?domain=work', {
+      const response = await fetch(`/api/files/upload?domain=${encodeURIComponent(domain)}`, {
         method: 'POST',
         body: formData,
         credentials: 'include',
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || `Upload failed (${response.status})`);
-      const next = await listInteriorProjectAssets(project.id);
+      const next = await listInteriorProjectAssets(domain, project.id);
       publishAssets(next);
       window.dispatchEvent(new CustomEvent('lumi:knowledge-updated', {
         detail: {
-          domain: 'work',
+          domain,
           files: (data.files || []).map((file: any) => ({ id: file.id, name: file.name, displayName: file.displayName })),
         },
       }));
@@ -137,7 +139,7 @@ export function InteriorProjectAssets({ project, locale, onAssetsChange }: Inter
   const changeCategory = async (asset: InteriorProjectAsset, nextCategory: InteriorAssetCategory) => {
     setError('');
     try {
-      const updated = await updateInteriorProjectAsset(project.id, asset.id, nextCategory);
+      const updated = await updateInteriorProjectAsset(domain, project.id, asset.id, nextCategory);
       publishAssets(assets.map(item => item.id === updated.id ? updated : item));
     } catch (reason: any) {
       setError(`${m('projectSaveFailed')}：${reason?.message || reason}`);
@@ -149,7 +151,7 @@ export function InteriorProjectAssets({ project, locale, onAssetsChange }: Inter
     setRemovingId(asset.id);
     setError('');
     try {
-      await removeInteriorProjectAsset(project.id, asset.id);
+      await removeInteriorProjectAsset(domain, project.id, asset.id);
       publishAssets(assets.filter(item => item.id !== asset.id));
     } catch (reason: any) {
       setError(`${m('assetRemoveFailed')}：${reason?.message || reason}`);
@@ -213,7 +215,7 @@ export function InteriorProjectAssets({ project, locale, onAssetsChange }: Inter
             ) : (
               <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                 {assets.map(asset => {
-                  const fileUrl = interiorProjectAssetUrl(asset);
+                  const fileUrl = interiorProjectAssetUrl(domain, asset);
                   return (
                     <article key={asset.id} className="group overflow-hidden rounded-xl border border-white/[0.07] bg-white/[0.035]">
                       {isImageAsset(asset) && (
