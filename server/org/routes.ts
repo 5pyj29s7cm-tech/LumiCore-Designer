@@ -18,6 +18,7 @@ import * as WorkRouting from './work_routing';
 import * as ResourceACL from './resource_acl';
 import * as InteriorProjects from '../design/projects';
 import * as InteriorProjectAssets from '../design/project_assets';
+import { getInteriorProjectWorkflow } from '../design/project_workflow';
 import { Server as SocketIOServer } from 'socket.io';
 import { getJwtSecret } from '../config/local_identity';
 
@@ -95,6 +96,23 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
     });
   });
 
+  router.get('/personal/interior/projects/active', requireAuth, (req: Request, res: Response) => {
+    const scopeId = requirePersonalInteriorContext(req, res);
+    if (!scopeId) return;
+    res.json({ project: InteriorProjects.getActiveInteriorProject(scopeId, req.user!.uid) });
+  });
+
+  router.put('/personal/interior/projects/active', requireAuth, (req: Request, res: Response) => {
+    const scopeId = requirePersonalInteriorContext(req, res);
+    if (!scopeId) return;
+    try {
+      const projectId = req.body?.projectId == null ? null : String(req.body.projectId);
+      res.json({ project: InteriorProjects.setActiveInteriorProject(scopeId, req.user!.uid, projectId) });
+    } catch (error) {
+      if (!respondInteriorProjectError(res, error)) throw error;
+    }
+  });
+
   router.get('/personal/interior/projects/:projectId', requireAuth, (req: Request, res: Response) => {
     const scopeId = requirePersonalInteriorContext(req, res);
     if (!scopeId) return;
@@ -110,10 +128,23 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
     const scopeId = requirePersonalInteriorContext(req, res);
     if (!scopeId) return;
     try {
-      res.status(201).json(InteriorProjects.createInteriorProject(scopeId, req.user!.uid, req.body || {}));
+      const project = InteriorProjects.createInteriorProject(scopeId, req.user!.uid, req.body || {});
+      InteriorProjects.setActiveInteriorProject(scopeId, req.user!.uid, project.id);
+      res.status(201).json(project);
     } catch (error) {
       if (!respondInteriorProjectError(res, error)) throw error;
     }
+  });
+
+  router.get('/personal/interior/projects/:projectId/workflow', requireAuth, (req: Request, res: Response) => {
+    const scopeId = requirePersonalInteriorContext(req, res);
+    if (!scopeId) return;
+    const workflow = getInteriorProjectWorkflow(scopeId, req.params.projectId);
+    if (!workflow || !InteriorProjects.getInteriorProject(scopeId, req.params.projectId)) {
+      res.status(404).json({ error: 'Interior project not found' });
+      return;
+    }
+    res.json({ workflow });
   });
 
   router.put('/personal/interior/projects/:projectId', requireAuth, (req: Request, res: Response) => {
@@ -183,6 +214,23 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
     res.json({ projects });
   });
 
+  router.get('/org/interior/projects/active', requireAuth, requireOrgMember, (req: Request, res: Response) => {
+    res.json({
+      project: InteriorProjects.getActiveInteriorProject(req.user!.orgId!, req.user!.uid),
+    });
+  });
+
+  router.put('/org/interior/projects/active', requireAuth, requireOrgMember, (req: Request, res: Response) => {
+    try {
+      const projectId = req.body?.projectId == null ? null : String(req.body.projectId);
+      res.json({
+        project: InteriorProjects.setActiveInteriorProject(req.user!.orgId!, req.user!.uid, projectId),
+      });
+    } catch (error) {
+      if (!respondInteriorProjectError(res, error)) throw error;
+    }
+  });
+
   router.get('/org/interior/projects/:projectId', requireAuth, requireOrgMember, (req: Request, res: Response) => {
     const project = InteriorProjects.getInteriorProject(req.user!.orgId!, req.params.projectId);
     if (!project) {
@@ -195,6 +243,7 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
   router.post('/org/interior/projects', requireAuth, requireOrgRole('owner', 'admin', 'member'), (req: Request, res: Response) => {
     try {
       const project = InteriorProjects.createInteriorProject(req.user!.orgId!, req.user!.uid, req.body || {});
+      InteriorProjects.setActiveInteriorProject(req.user!.orgId!, req.user!.uid, project.id);
       EDB.logAudit({
         orgId: req.user!.orgId!,
         userId: req.user!.uid,
@@ -209,6 +258,15 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
     } catch (error) {
       if (!respondInteriorProjectError(res, error)) throw error;
     }
+  });
+
+  router.get('/org/interior/projects/:projectId/workflow', requireAuth, requireOrgMember, (req: Request, res: Response) => {
+    const project = InteriorProjects.getInteriorProject(req.user!.orgId!, req.params.projectId);
+    if (!project) {
+      res.status(404).json({ error: 'Interior project not found' });
+      return;
+    }
+    res.json({ workflow: getInteriorProjectWorkflow(project.orgId, project.id) });
   });
 
   router.put('/org/interior/projects/:projectId', requireAuth, requireOrgRole('owner', 'admin', 'member'), (req: Request, res: Response) => {

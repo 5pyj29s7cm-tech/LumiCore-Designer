@@ -31,6 +31,7 @@ import {
 } from './action_continuation';
 import { isCapabilityMetaQuestion } from './capability_meta';
 import {
+  isDesignProjectCreationRequest,
   isCurrentIndustryWorkflowExecutionRequest,
   matchCurrentIndustryWorkflow,
 } from '../regions/packs/cn/industry_capability_profile';
@@ -391,6 +392,8 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
     : null;
   const industryWorkflowExecutionDetected = !conceptualCapabilityQuestion
     && isCurrentIndustryWorkflowExecutionRequest(routingText);
+  const designProjectCreationRequested = !conceptualCapabilityQuestion
+    && isDesignProjectCreationRequest(routingText);
   const operationMode = normalizeOperationMode(input.operationMode);
   const requestedMode = input.requestedMode || detectRequestedOperationMode(input.text);
   const surface = resolveTurnSurface({
@@ -413,7 +416,8 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
   // Native client navigation has higher priority than industry execution.
   // Words such as “生成” or “处理” may be part of a workspace name and must
   // not create a task when the user only asked to open that workspace.
-  const industryWorkflowExecutionRequested = industryWorkflowExecutionDetected && !clientActionIntent;
+  const industryWorkflowExecutionRequested = (industryWorkflowExecutionDetected || designProjectCreationRequested)
+    && !clientActionIntent;
   const currentActionContract = buildActionContract(input.text);
   const actionContract = currentActionContract.applies || !continuationMayDriveAction
     ? currentActionContract
@@ -509,7 +513,9 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
     requestedMode,
     autoPromoteToAssistant,
     conceptualCapabilityQuestion,
-    industryWorkflowEntryId: industryWorkflowExecutionRequested ? industryWorkflowMatch?.entry.entryId || '' : '',
+    industryWorkflowEntryId: industryWorkflowExecutionRequested
+      ? designProjectCreationRequested ? 'project' : industryWorkflowMatch?.entry.entryId || ''
+      : '',
     allowToolUseForTurn,
     selfRepairTurn,
     clientActionOnlyTurn,

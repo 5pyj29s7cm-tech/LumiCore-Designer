@@ -24,6 +24,7 @@ import type { ConversationActionContinuationState } from './action_continuation'
 import { applyTaskPolicySnapshot } from './task_execution_ledger';
 import {
   formatIndustryWorkflowRoutingPrompt,
+  isDesignProjectCreationRequest,
   matchCurrentIndustryWorkflow,
 } from '../regions/packs/cn/industry_capability_profile';
 
@@ -92,6 +93,8 @@ const SELF_REPAIR_DESKTOP_RE =
   /(?:\u684c\u9762|\u7a97\u53e3|\u753b\u9762|\u9875\u9762|\u754c\u9762|\u767d\u5c4f|\u9ed1\u5c4f|\u5d29\u6e83|\u5361\u4f4f|\u5361\u6b7b|\u6ca1\u53cd\u5e94|\u6253\u4e0d\u5f00|\u542f\u52a8\u5931\u8d25|\b(?:autocad|wps|wechat|weixin|desktop|window|screen|page|ui|blank|crash(?:ed)?|stuck|hang(?:ing)?)\b|white\s+screen|black\s+screen|failed\s+to\s+(?:open|start))/iu;
 const SELF_REPAIR_ADAPTER_RE =
   /(?:\u80fd\u529b|\u9002\u914d\u5668|\u63a5\u5165|\u8fde\u63a5|\u8f6f\u4ef6|\u5e94\u7528|\b(?:mcp|skill|plugin|adapter|capability|integration|connection|autocad|wps|wechat|weixin|cad|bim)\b)/iu;
+const SELF_REPAIR_ADAPTER_RECOVERY_RE =
+  /(?:\u9002\u914d\u5668|\u63a5\u5165|\u8fde\u63a5|\u6280\u80fd|\u63d2\u4ef6|\b(?:mcp|skill|plugin|adapter|integration|connection)\b)/iu;
 const SELF_REPAIR_LEARNING_INSPECTION_RE =
   // i18n-allow: Reviewed Chinese learning-check input recognition; not user-visible copy.
   /(?:跑|做|进行|执行|查|查看|检查).{0,10}(?:一轮)?(?:学习检查|学习状态检查|学习记录检查|能力学习检查)/u;
@@ -114,6 +117,9 @@ export function buildSelfRepairToolPolicy(text: string, registry?: ToolRegistry)
 
   if (SELF_REPAIR_ADAPTER_RE.test(requested)) {
     allowedTools.push('adapter_registry_list', 'adapter_health_check');
+    if (explicitRecovery && SELF_REPAIR_ADAPTER_RECOVERY_RE.test(requested)) {
+      allowedTools.push('adapter_auto_recover');
+    }
   }
   if (SELF_REPAIR_LEARNING_INSPECTION_RE.test(requested)) {
     allowedTools.push('capability_learning_list');
@@ -192,15 +198,21 @@ function enhanceToolRouteForFlow(
   const industryWorkflowMatch = !recoveredCurrentAppEdit && flow.industryWorkflowEntryId
     ? matchCurrentIndustryWorkflow(flow.routeText)
     : null;
-  if (industryWorkflowMatch) {
+  const designProjectCreation = !recoveredCurrentAppEdit
+    && flow.industryWorkflowEntryId === 'project'
+    && isDesignProjectCreationRequest(flow.routeText);
+  if (industryWorkflowMatch || designProjectCreation) {
     addAvailable(additions, available, [
-      'industry_workflow_start',
-      'industry_workflow_complete',
+      ...(designProjectCreation
+        ? ['interior_design_project_create', 'interior_design_project_select', 'interior_design_project_status']
+        : ['industry_workflow_start', 'industry_workflow_complete']),
       'work_takeover_task_get',
       'work_takeover_task_verify_result',
     ]);
     categories.push('industry_workflow');
-    reasons.push(`matched edition outcome ${industryWorkflowMatch.entry.entryId}`);
+    reasons.push(designProjectCreation
+      ? 'new design projects must create a durable active project before stage execution'
+      : `matched edition outcome ${industryWorkflowMatch!.entry.entryId}`);
   }
   if (discoveredEvidenceTools.length) {
     addAvailable(additions, available, discoveredEvidenceTools.map(tool => tool.name));
@@ -302,7 +314,9 @@ function enhanceToolRouteForFlow(
   ));
   const priority = recoveredWpsCreateAndType && available.has(WPS_CREATE_DOCUMENT_TOOL)
     ? [WPS_CREATE_DOCUMENT_TOOL]
-    : industryWorkflowMatch
+    : designProjectCreation
+      ? ['interior_design_project_create'].filter(name => available.has(name))
+      : industryWorkflowMatch
       ? ['industry_workflow_start', 'industry_workflow_complete'].filter(name => available.has(name))
       : [];
   const merged = unique([...priority, ...routeNames, ...Array.from(additions)]);

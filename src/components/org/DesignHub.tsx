@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from 'react';
 import {
   CheckCircle,
   FileText,
@@ -16,8 +16,9 @@ import type {
   InteriorProjectAsset,
   InteriorProjectStatus,
   InteriorProjectType,
+  InteriorProjectWorkflowState,
 } from '../../lib/interiorProjects';
-import { listInteriorProjectAssets } from '../../lib/interiorProjects';
+import { getInteriorProjectWorkflow, listInteriorProjectAssets } from '../../lib/interiorProjects';
 import {
   interiorDesignMessage,
   type InteriorDesignLocale,
@@ -72,6 +73,7 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
   const [view, setView] = useState<DesignView>(initialView);
   const [activeProject, setActiveProject] = useState<InteriorProject | null>(null);
   const [projectAssets, setProjectAssets] = useState<InteriorProjectAsset[]>([]);
+  const [projectWorkflow, setProjectWorkflow] = useState<InteriorProjectWorkflowState | null>(null);
   const t = useT();
   const { workDomain } = useApp();
   const locale: InteriorDesignLocale = t.langCode === 'en' ? 'en' : 'zh';
@@ -85,16 +87,38 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
     let cancelled = false;
     if (!activeProject) {
       setProjectAssets([]);
+      setProjectWorkflow(null);
       return () => { cancelled = true; };
     }
-    listInteriorProjectAssets(workDomain, activeProject.id)
-      .then(items => {
-        if (!cancelled) setProjectAssets(items);
+    Promise.all([
+      listInteriorProjectAssets(workDomain, activeProject.id),
+      getInteriorProjectWorkflow(workDomain, activeProject.id),
+    ])
+      .then(([items, workflow]) => {
+        if (!cancelled) {
+          setProjectAssets(items);
+          setProjectWorkflow(workflow);
+        }
       })
       .catch(() => {
-        if (!cancelled) setProjectAssets([]);
+        if (!cancelled) {
+          setProjectAssets([]);
+          setProjectWorkflow(null);
+        }
       });
     return () => { cancelled = true; };
+  }, [activeProject, workDomain]);
+
+  const refreshProjectWorkflow = useCallback(async () => {
+    if (!activeProject) {
+      setProjectWorkflow(null);
+      return;
+    }
+    try {
+      setProjectWorkflow(await getInteriorProjectWorkflow(workDomain, activeProject.id));
+    } catch {
+      setProjectWorkflow(null);
+    }
   }, [activeProject, workDomain]);
 
   const tools = useMemo<Record<DesignView, ToolConfig>>(() => ({
@@ -190,6 +214,20 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
                 <span className="block truncate text-sm font-bold">{item.label}</span>
                 <span className="mt-0.5 line-clamp-2 block text-[12px] leading-relaxed text-white/35">{item.desc}</span>
               </span>
+              {activeProject && projectWorkflow && (
+                <span
+                  className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${
+                    projectWorkflow.stages[item.id].status === 'completed'
+                      ? 'bg-emerald-300'
+                      : projectWorkflow.stages[item.id].status === 'blocked'
+                        ? 'bg-rose-300'
+                        : ['in_progress', 'waiting_confirmation'].includes(projectWorkflow.stages[item.id].status)
+                          ? 'bg-amber-300'
+                          : 'bg-white/15'
+                  }`}
+                  title={`${item.label}: ${projectWorkflow.stages[item.id].status}`}
+                />
+              )}
             </button>
           ))}
         </nav>
@@ -206,6 +244,14 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
         {activeProject && view === 'project' && (
           <InteriorProjectAssets key={`${workDomain}:${activeProject.id}`} domain={workDomain} project={activeProject} locale={locale} onAssetsChange={setProjectAssets} />
         )}
+        {activeProject && projectWorkflow && (
+          <ProjectWorkflowStrip
+            workflow={projectWorkflow}
+            tools={tools}
+            activeView={view}
+            onSelect={setView}
+          />
+        )}
         <DesignToolView
           key={`${activeProject?.id || 'standalone'}:${activeProject?.updatedAt || ''}:${view}`}
           config={tools[view]}
@@ -213,13 +259,15 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
           locale={locale}
           project={activeProject}
           assets={activeProject ? projectAssets : []}
+          workflow={activeProject ? projectWorkflow : null}
+          onWorkflowChange={refreshProjectWorkflow}
         />
       </main>
     </div>
   );
 }
 
-function useDesignChat(locale: InteriorDesignLocale) {
+function useDesignChat(locale: InteriorDesignLocale, onWorkflowChange?: () => void | Promise<void>) {
   const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
   const [input, setInput] = useState('');
   const [result, setResult] = useState('');
@@ -255,6 +303,7 @@ function useDesignChat(locale: InteriorDesignLocale) {
       });
       setWorkflowTaskId(started.task.id);
       setWorkflowStatus('in_progress');
+      await onWorkflowChange?.();
       const res = await fetch('/api/chat?stream=true', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -312,6 +361,7 @@ function useDesignChat(locale: InteriorDesignLocale) {
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
       setLoading(false);
+      await onWorkflowChange?.();
     }
   };
 
@@ -369,6 +419,47 @@ interface DesignToolViewProps {
   locale: InteriorDesignLocale;
   project: InteriorProject | null;
   assets: InteriorProjectAsset[];
+  workflow: InteriorProjectWorkflowState | null;
+  onWorkflowChange: () => void | Promise<void>;
+}
+
+function ProjectWorkflowStrip({ workflow, tools, activeView, onSelect }: {
+  workflow: InteriorProjectWorkflowState;
+  tools: Record<DesignView, ToolConfig>;
+  activeView: DesignView;
+  onSelect: (view: DesignView) => void;
+}) {
+  const statusClass = (status: string) => status === 'completed'
+    ? 'border-emerald-300/20 bg-emerald-400/10 text-emerald-100'
+    : status === 'blocked'
+      ? 'border-rose-300/20 bg-rose-400/10 text-rose-100'
+      : ['in_progress', 'waiting_confirmation'].includes(status)
+        ? 'border-amber-300/20 bg-amber-400/10 text-amber-100'
+        : 'border-white/[0.07] bg-white/[0.025] text-white/45';
+  return (
+    <section className="border-b border-white/[0.08] bg-black/15 px-6 py-3">
+      <div className="mx-auto grid max-w-6xl gap-2 sm:grid-cols-5">
+        {(Object.keys(tools) as DesignView[]).map((entryId, index) => {
+          const stage = workflow.stages[entryId];
+          return (
+            <button
+              key={entryId}
+              type="button"
+              onClick={() => onSelect(entryId)}
+              className={`rounded-xl border px-3 py-2 text-left transition-colors ${statusClass(stage.status)} ${activeView === entryId ? 'ring-1 ring-cyan-300/30' : ''}`}
+            >
+              <span className="flex items-center justify-between gap-2">
+                <span className="text-[10px] font-black opacity-45">{String(index + 1).padStart(2, '0')}</span>
+                <span className="text-[10px] font-mono opacity-45">{stage.receiptIds.length}R</span>
+              </span>
+              <span className="mt-1 block truncate text-xs font-black">{tools[entryId].title}</span>
+              <span className="mt-0.5 block truncate text-[10px] opacity-55">{stage.status}</span>
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
 }
 
 function DesignToolView(props: DesignToolViewProps) {
@@ -385,9 +476,10 @@ function GenericDesignToolView({
   locale,
   project,
   assets,
+  onWorkflowChange,
 }: DesignToolViewProps) {
   const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
-  const { input, setInput, result, loading, workflowTaskId, workflowStatus, send, stop } = useDesignChat(locale);
+  const { input, setInput, result, loading, workflowTaskId, workflowStatus, send, stop } = useDesignChat(locale, onWorkflowChange);
 
   const run = () => {
     const outputGuide = config.output.map(item => `- ${item}`).join('\n');
@@ -535,7 +627,7 @@ function ProjectWorkspace(props: DesignToolViewProps) {
 function useStageWorkflow(props: DesignToolViewProps) {
   const { config, entryId, locale, project, assets } = props;
   const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
-  const chat = useDesignChat(locale);
+  const chat = useDesignChat(locale, props.onWorkflowChange);
   const run = (details: string) => {
     const projectContext = project ? formatProjectContext(project, locale) : m('standaloneContext');
     const assetContext = project ? formatProjectAssets(assets, locale) : '';

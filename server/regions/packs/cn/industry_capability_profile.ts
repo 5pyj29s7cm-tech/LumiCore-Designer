@@ -196,10 +196,18 @@ export function isCurrentIndustryWorkflowExecutionRequest(text: unknown): boolea
   return /(?:请|帮我|给我|替我|开始|启动|继续|执行|处理|整理|生成|制作|创建|输出|分析|汇总|核对|检查|审查|审核|检索|查找|查一下|查一查|预测|准备|导入|归档|做一|做个|做份|做一下|看一下|看一看|算一下|算一算|review|analy[sz]e|generate|create|prepare|start|run|check|audit|draft|build|produce|reconcile|forecast|file)/iu.test(normalized);
 }
 
+export function isDesignProjectCreationRequest(text: unknown): boolean {
+  if (currentProductLine() !== 'design') return false;
+  const normalized = String(text || '').trim();
+  return /\b(?:create|start|new)\b.{0,24}\b(?:interior\s+)?design\s+project\b/i.test(normalized)
+    || /(?:\u65b0\u5efa|\u521b\u5efa|\u65b0\u589e|\u5efa\u4e00\u4e2a).{0,12}(?:\u5ba4\u5185|\u88c5\u4fee|\u8bbe\u8ba1)?\u9879\u76ee/u.test(normalized);
+}
+
 export function formatIndustryCapabilityProfilePrompt(text?: unknown): string {
   const profile = getCurrentIndustryCapabilityProfile();
   if (!profile) return '';
   const match = text == null ? null : matchCurrentIndustryWorkflow(text);
+  const createDesignProject = text == null ? false : isDesignProjectCreationRequest(text);
   return [
     '## Industry Variant Capability Profile (authoritative)',
     `Identity: ${profile.displayName}; variant=${profile.variantId}; productLine=${profile.productLine}.`,
@@ -214,7 +222,9 @@ export function formatIndustryCapabilityProfilePrompt(text?: unknown): string {
     match
       ? `Current request matches ${match.entry.displayName} [${match.entry.entryId}] from terms: ${match.matchedTerms.join(', ')}.`
       : '',
-    match
+    createDesignProject
+      ? 'This request creates a new durable project container. Call interior_design_project_create first with the explicit project name and known brief fields. If the name is missing, ask one short question. Do not substitute industry_workflow_start for project creation.'
+      : match
       ? `When this is an execution request and no existing industry task is named, call industry_workflow_start exactly once with entryId=${match.entry.entryId}. The server binds the current request from trusted turn context; never copy raw business text into tool arguments. Continue the returned task with real domain tools and verify it before claiming completion.`
       : 'For an industry execution request, select exactly one matching outcome workspace. If the target is genuinely ambiguous, ask one short clarification instead of creating multiple tasks.',
     'If a wt_task_* industry task is already named, continue that task and never create a duplicate. Capability questions and self-introductions explain this profile without starting tools.',
@@ -223,6 +233,13 @@ export function formatIndustryCapabilityProfilePrompt(text?: unknown): string {
 }
 
 export function formatIndustryWorkflowRoutingPrompt(text: unknown): string {
+  if (isDesignProjectCreationRequest(text)) {
+    return [
+      '## Design Project Creation Route',
+      'Create exactly one durable project with interior_design_project_create. Require an explicit project name and keep known brief fields on that project.',
+      'Do not call industry_workflow_start as a substitute for creating the project container. Stage execution begins only after the project exists and is active.',
+    ].join('\n');
+  }
   if (!isCurrentIndustryWorkflowExecutionRequest(text)) return '';
   const match = matchCurrentIndustryWorkflow(text);
   if (!match) return '';

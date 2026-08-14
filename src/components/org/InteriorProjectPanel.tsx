@@ -2,7 +2,9 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { FolderOpen, Loader2, Pencil, Plus, Save, X } from 'lucide-react';
 import {
   createInteriorProject,
+  getActiveInteriorProject,
   listInteriorProjects,
+  setActiveInteriorProject,
   updateInteriorProject,
   type InteriorProject,
   type InteriorProjectDomain,
@@ -15,8 +17,6 @@ import {
   type InteriorDesignLocale,
   type InteriorDesignMessageKey,
 } from '../../i18n/locales/interiorDesign';
-
-const SELECTED_PROJECT_KEY = 'lumi.interior.selected-project';
 
 function emptyDraft(): InteriorProjectDraft {
   return {
@@ -67,13 +67,11 @@ export function InteriorProjectPanel({ domain, locale, onProjectChange }: Interi
 
   useEffect(() => {
     let cancelled = false;
-    listInteriorProjects(domain)
-      .then(items => {
+    Promise.all([listInteriorProjects(domain), getActiveInteriorProject(domain)])
+      .then(([items, activeProject]) => {
         if (cancelled) return;
         setProjects(items);
-        let storedId = '';
-        try { storedId = sessionStorage.getItem(`${SELECTED_PROJECT_KEY}.${domain}`) || ''; } catch {}
-        const selected = items.find(project => project.id === storedId) || null;
+        const selected = items.find(project => project.id === activeProject?.id) || null;
         setSelectedId(selected?.id || '');
         onProjectChange(selected);
       })
@@ -88,16 +86,17 @@ export function InteriorProjectPanel({ domain, locale, onProjectChange }: Interi
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [domain, locale]);
 
-  const chooseProject = (projectId: string) => {
+  const chooseProject = async (projectId: string) => {
     const project = projects.find(item => item.id === projectId) || null;
-    setSelectedId(project?.id || '');
-    setEditor(null);
-    setError('');
     try {
-      if (project) sessionStorage.setItem(`${SELECTED_PROJECT_KEY}.${domain}`, project.id);
-      else sessionStorage.removeItem(`${SELECTED_PROJECT_KEY}.${domain}`);
-    } catch {}
-    onProjectChange(project);
+      const persisted = await setActiveInteriorProject(domain, project?.id || null);
+      setSelectedId(persisted?.id || '');
+      setEditor(null);
+      setError('');
+      onProjectChange(persisted);
+    } catch (reason: any) {
+      setError(`${m('projectLoadFailed')}: ${reason?.message || reason}`);
+    }
   };
 
   const openCreate = () => {
@@ -131,7 +130,6 @@ export function InteriorProjectPanel({ domain, locale, onProjectChange }: Interi
       setProjects(nextProjects);
       setSelectedId(project.id);
       setEditor(null);
-      try { sessionStorage.setItem(`${SELECTED_PROJECT_KEY}.${domain}`, project.id); } catch {}
       onProjectChange(project);
     } catch (reason: any) {
       setError(`${m('projectSaveFailed')}：${reason?.message || reason}`);
@@ -165,7 +163,7 @@ export function InteriorProjectPanel({ domain, locale, onProjectChange }: Interi
           </span>
           <select
             value={selectedId}
-            onChange={event => chooseProject(event.target.value)}
+            onChange={event => { void chooseProject(event.target.value); }}
             disabled={loading}
             aria-label={m('selectProject')}
             className="lumi-field min-w-52 flex-1 py-2 text-sm disabled:opacity-50"

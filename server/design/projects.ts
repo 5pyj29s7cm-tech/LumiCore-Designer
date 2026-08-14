@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { readDB, writeDB } from '../../db_layer';
+import type { InteriorProjectWorkflowState } from './project_workflow';
 
 export const INTERIOR_PROJECT_TYPES = [
   'residential',
@@ -39,6 +40,8 @@ export interface InteriorProject {
   projectType: InteriorProjectType;
   status: InteriorProjectStatus;
   brief: InteriorProjectBrief;
+  /** Durable project-level execution chain shared by every design workspace. */
+  workflow?: InteriorProjectWorkflowState;
   createdAt: string;
   updatedAt: string;
 }
@@ -86,6 +89,8 @@ const EMPTY_BRIEF: InteriorProjectBrief = {
   constraints: '',
 };
 
+const ACTIVE_PROJECT_SETTING_KEY = 'interior_active_projects_v1';
+
 const BRIEF_LIMITS: Record<keyof InteriorProjectBrief, number> = {
   location: 240,
   area: 120,
@@ -99,6 +104,35 @@ const BRIEF_LIMITS: Record<keyof InteriorProjectBrief, number> = {
 function projectRows(db: any): InteriorProject[] {
   if (!Array.isArray(db.interiorProjects)) db.interiorProjects = [];
   return db.interiorProjects as InteriorProject[];
+}
+
+function cloneProject(project: InteriorProject): InteriorProject {
+  return {
+    ...project,
+    brief: { ...project.brief },
+    ...(project.workflow ? { workflow: structuredClone(project.workflow) } : {}),
+  };
+}
+
+function activeProjectSelections(db: any): Record<string, string> {
+  if (!Array.isArray(db.settings)) db.settings = [];
+  const row = db.settings.find((item: any) => item.key === ACTIVE_PROJECT_SETTING_KEY);
+  if (!row?.value) return {};
+  try {
+    const parsed = JSON.parse(row.value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function activeProjectSelectionKey(orgId: string, userId: string): string {
+  const normalizedScope = String(orgId || '').trim();
+  const normalizedUser = String(userId || '').trim();
+  if (!normalizedScope || !normalizedUser) {
+    throw new InteriorProjectValidationError('orgId and userId are required for active project selection');
+  }
+  return `${normalizedScope}::${normalizedUser}`;
 }
 
 function textField(value: unknown, field: string, maxLength: number, required = false): string {
@@ -155,12 +189,49 @@ export function listInteriorProjects(
     .filter(project => project.orgId === orgId)
     .filter(project => options.includeArchived || project.status !== 'archived')
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-  return rows.map(project => ({ ...project, brief: { ...project.brief } }));
+  return rows.map(cloneProject);
 }
 
 export function getInteriorProject(orgId: string, projectId: string): InteriorProject | null {
   const project = projectRows(readDB()).find(item => item.orgId === orgId && item.id === projectId);
-  return project ? { ...project, brief: { ...project.brief } } : null;
+  return project ? cloneProject(project) : null;
+}
+
+export function getActiveInteriorProject(orgId: string, userId: string): InteriorProject | null {
+  const db = readDB();
+  const projectId = activeProjectSelections(db)[activeProjectSelectionKey(orgId, userId)];
+  if (!projectId) return null;
+  const project = projectRows(db).find(item => item.orgId === orgId && item.id === projectId && item.status !== 'archived');
+  return project ? cloneProject(project) : null;
+}
+
+export function setActiveInteriorProject(
+  orgId: string,
+  userId: string,
+  projectId: string | null,
+): InteriorProject | null {
+  const db = readDB();
+  const key = activeProjectSelectionKey(orgId, userId);
+  const selections = activeProjectSelections(db);
+  const normalizedProjectId = String(projectId || '').trim();
+  let project: InteriorProject | null = null;
+  if (normalizedProjectId) {
+    project = projectRows(db).find(item => (
+      item.orgId === orgId
+      && item.id === normalizedProjectId
+      && item.status !== 'archived'
+    )) || null;
+    if (!project) throw new InteriorProjectValidationError('Active interior project was not found in this scope');
+    selections[key] = project.id;
+  } else {
+    delete selections[key];
+  }
+  const row = db.settings.find((item: any) => item.key === ACTIVE_PROJECT_SETTING_KEY);
+  const value = JSON.stringify(selections);
+  if (row) row.value = value;
+  else db.settings.push({ key: ACTIVE_PROJECT_SETTING_KEY, value });
+  writeDB(db);
+  return project ? cloneProject(project) : null;
 }
 
 export function createInteriorProject(
@@ -183,7 +254,7 @@ export function createInteriorProject(
   };
   projectRows(db).push(project);
   writeDB(db);
-  return { ...project, brief: { ...project.brief } };
+  return cloneProject(project);
 }
 
 export function updateInteriorProject(
@@ -212,5 +283,5 @@ export function updateInteriorProject(
   }
   project.updatedAt = new Date().toISOString();
   writeDB(db);
-  return { ...project, brief: { ...project.brief } };
+  return cloneProject(project);
 }

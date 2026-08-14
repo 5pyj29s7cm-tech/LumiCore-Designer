@@ -8,6 +8,16 @@ import {
   startIndustryWorkflow,
 } from '../../industry/workflow_service';
 import type { ToolContext } from '../types';
+import { PRODUCT_VARIANT } from '../../../shared/product_variant';
+import {
+  createInteriorProject,
+  getActiveInteriorProject,
+  getInteriorProject,
+  listInteriorProjects,
+  personalInteriorProjectScope,
+  setActiveInteriorProject,
+} from '../../design/projects';
+import { getInteriorProjectWorkflow } from '../../design/project_workflow';
 
 // i18n-allow: The multilingual routing hints below are internal tool-selection
 // aliases for Chinese industry requests; they are never rendered as UI copy.
@@ -20,7 +30,160 @@ function scope(context?: ToolContext) {
   };
 }
 
+function designScope(context?: ToolContext): { scopeId: string; userId: string } {
+  const active = scope(context);
+  const scopeId = active.domain === 'work' ? active.orgId : personalInteriorProjectScope(active.userId);
+  if (!scopeId) throw new Error('Organization scope is required for organization design projects.');
+  return { scopeId, userId: active.userId };
+}
+
+function findDesignProject(args: Record<string, any>, context?: ToolContext) {
+  const active = designScope(context);
+  const projectId = String(args.projectId || '').trim();
+  if (projectId) return { ...active, project: getInteriorProject(active.scopeId, projectId) };
+  const name = String(args.name || '').trim().toLocaleLowerCase();
+  if (name) {
+    const matches = listInteriorProjects(active.scopeId).filter(project => project.name.toLocaleLowerCase() === name);
+    if (matches.length > 1) throw new Error('More than one design project has that name; use projectId.');
+    return { ...active, project: matches[0] || null };
+  }
+  return { ...active, project: getActiveInteriorProject(active.scopeId, active.userId) };
+}
+
+function registerDesignProjectTools(registry: ToolRegistry): void {
+  registry.register({
+    name: 'interior_design_project_create',
+    description: 'Create and activate one durable interior design project before CAD, visualization, proposal, and handoff work. Use this for a new project, not industry_workflow_start alone.',
+    // i18n-allow: Reviewed Chinese input-recognition aliases; not rendered as UI copy.
+    routingHints: ['new interior design project', 'create design project', '新建室内设计项目', '创建设计项目', '新建设计项目'],
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Project name. Ask the user when it is missing.' },
+        projectType: { type: 'string', enum: ['residential', 'office', 'retail', 'hospitality', 'other'] },
+        location: { type: 'string' },
+        area: { type: 'string' },
+        occupants: { type: 'string' },
+        budget: { type: 'string' },
+        style: { type: 'string' },
+        requirements: { type: 'string' },
+        constraints: { type: 'string' },
+      },
+      required: ['name'],
+    },
+    handler: async (args, context) => {
+      const active = designScope(context);
+      const project = createInteriorProject(active.scopeId, active.userId, {
+        name: args.name,
+        projectType: args.projectType || 'other',
+        brief: {
+          location: args.location || '',
+          area: args.area || '',
+          occupants: args.occupants || '',
+          budget: args.budget || '',
+          style: args.style || '',
+          requirements: args.requirements || '',
+          constraints: args.constraints || '',
+        },
+      });
+      setActiveInteriorProject(active.scopeId, active.userId, project.id);
+      return JSON.stringify({
+        ok: true,
+        status: 'created',
+        persisted: true,
+        active: true,
+        project,
+        workflow: getInteriorProjectWorkflow(active.scopeId, project.id),
+      }, null, 2);
+    },
+    permission: 'user',
+    securityLevel: 'safe',
+    capability: capabilityContract({
+      id: 'design.project.create', family: 'industry', lane: 'industry', operation: 'create', risk: 'low',
+      sideEffects: [{ type: 'local_state_change', scope: 'interior design project and active project binding', reversible: true }],
+      verification: {
+        strategy: 'artifact', required: true,
+        requiredFields: ['ok', 'status', 'persisted', 'active', 'project.id', 'project.name'],
+        requiredValues: { ok: true, persisted: true, active: true }, successStatuses: ['created'],
+        successSignals: ['durable scoped project returned'],
+        limitations: ['Creates the project container; it does not complete any design deliverable.'],
+      },
+    }),
+    evidence: capabilityEvidence({ id: 'design.project.create', operation: 'create', subjectArgument: 'name', limitations: ['Later stage receipts are required.'] }),
+  });
+
+  registry.register({
+    name: 'interior_design_project_select',
+    description: 'Select the active durable design project by exact id or exact name so later voice/chat workflow commands inherit the same project.',
+    // i18n-allow: Reviewed Chinese input-recognition aliases; not rendered as UI copy.
+    routingHints: ['select design project', 'switch design project', '选择设计项目', '切换设计项目', '打开这个项目'],
+    parameters: {
+      type: 'object',
+      properties: { projectId: { type: 'string' }, name: { type: 'string' } },
+      required: [],
+    },
+    handler: async (args, context) => {
+      const resolved = findDesignProject(args, context);
+      if (!resolved.project) throw new Error('Design project not found. Provide an exact project id or name.');
+      const project = setActiveInteriorProject(resolved.scopeId, resolved.userId, resolved.project.id);
+      return JSON.stringify({
+        ok: true, status: 'selected', persisted: true, active: true, project,
+        workflow: getInteriorProjectWorkflow(resolved.scopeId, resolved.project.id),
+      }, null, 2);
+    },
+    permission: 'user',
+    securityLevel: 'safe',
+    capability: capabilityContract({
+      id: 'design.project.select', family: 'industry', lane: 'industry', operation: 'mutate', risk: 'low',
+      sideEffects: [{ type: 'local_state_change', scope: 'active design project binding', reversible: true }],
+      verification: {
+        strategy: 'state_diff', required: true,
+        requiredFields: ['ok', 'status', 'persisted', 'active', 'project.id'],
+        requiredValues: { ok: true, persisted: true, active: true }, successStatuses: ['selected'],
+        successSignals: ['server-owned active project binding updated'],
+        limitations: ['Does not execute a design stage.'],
+      },
+    }),
+    evidence: capabilityEvidence({ id: 'design.project.select', operation: 'mutate', subjectArgument: 'projectId', limitations: ['Only changes the current project context.'] }),
+  });
+
+  registry.register({
+    name: 'interior_design_project_status',
+    description: 'Read the active design project and its durable project/CAD/visualization/presentation/handoff task, receipt, artifact, blocker, and completion state.',
+    // i18n-allow: Reviewed Chinese input-recognition aliases; not rendered as UI copy.
+    routingHints: ['design project status', 'project delivery progress', '设计项目进度', '项目做到哪了', 'CAD效果图PPT进度'],
+    parameters: {
+      type: 'object',
+      properties: { projectId: { type: 'string' }, name: { type: 'string' } },
+      required: [],
+    },
+    handler: async (args, context) => {
+      const resolved = findDesignProject(args, context);
+      if (!resolved.project) throw new Error('No active design project is bound. Create or select a project first.');
+      return JSON.stringify({
+        ok: true, status: 'observed', persisted: true, project: resolved.project,
+        workflow: getInteriorProjectWorkflow(resolved.scopeId, resolved.project.id),
+      }, null, 2);
+    },
+    permission: 'user',
+    securityLevel: 'safe',
+    capability: capabilityContract({
+      id: 'design.project.status', family: 'industry', lane: 'industry', operation: 'observe', risk: 'low',
+      sideEffects: [{ type: 'none', scope: 'design project workflow state', reversible: true }],
+      verification: {
+        strategy: 'measured', required: true,
+        requiredFields: ['ok', 'status', 'persisted', 'project.id', 'workflow.stages'],
+        requiredValues: { ok: true, persisted: true }, successStatuses: ['observed'],
+        successSignals: ['durable project workflow state returned'],
+        limitations: ['Reports persisted receipts and blockers; it does not infer unrecorded progress.'],
+      },
+    }),
+    evidence: capabilityEvidence({ id: 'design.project.status', operation: 'observe', subjectArgument: 'projectId', limitations: ['Read-only status query.'] }),
+  });
+}
+
 export function registerIndustryWorkflowTools(registry: ToolRegistry): void {
+  if (PRODUCT_VARIANT.productLine === 'design') registerDesignProjectTools(registry);
   registry.register({
     name: 'industry_capability_profile_get',
     description: 'Read the authoritative identity, outcome workspaces, automatic preparation actions, professional-review boundaries, and optional extensions for this exact Lumi industry edition.',

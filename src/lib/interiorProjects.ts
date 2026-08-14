@@ -2,6 +2,47 @@ export type InteriorProjectType = 'residential' | 'office' | 'retail' | 'hospita
 export type InteriorProjectStatus = 'brief' | 'planning' | 'design' | 'visualization' | 'handoff' | 'archived';
 export type InteriorAssetCategory = 'floor-plan' | 'cad' | 'site-photo' | 'material' | 'reference' | 'other';
 export type InteriorProjectDomain = 'personal' | 'work';
+export type InteriorDesignStageId = 'project' | 'cad' | 'visualization' | 'presentation' | 'handoff';
+export type InteriorDesignStageStatus = 'not_started' | 'in_progress' | 'waiting_confirmation' | 'blocked' | 'completed';
+
+export interface InteriorProjectWorkflowArtifactRef {
+  label: string;
+  type: string;
+  path: string;
+  fileName: string;
+  status: string;
+  taskId: string;
+  recordedAt: string;
+}
+
+export interface InteriorProjectWorkflowStageState {
+  entryId: InteriorDesignStageId;
+  status: InteriorDesignStageStatus;
+  currentTaskId: string;
+  taskIds: string[];
+  conversationTaskId: string;
+  parentTaskId: string;
+  sourceTaskIds: string[];
+  receiptIds: string[];
+  artifacts: InteriorProjectWorkflowArtifactRef[];
+  verificationId: string;
+  verificationStatus: string;
+  blocker: string;
+  attempts: number;
+  startedAt: string;
+  updatedAt: string;
+  completedAt: string;
+}
+
+export interface InteriorProjectWorkflowState {
+  schemaVersion: 1;
+  rootConversationId: string;
+  rootTaskId: string;
+  activeStage: InteriorDesignStageId | '';
+  stages: Record<InteriorDesignStageId, InteriorProjectWorkflowStageState>;
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface InteriorProjectBrief {
   location: string;
@@ -21,6 +62,7 @@ export interface InteriorProject {
   projectType: InteriorProjectType;
   status: InteriorProjectStatus;
   brief: InteriorProjectBrief;
+  workflow?: InteriorProjectWorkflowState;
   createdAt: string;
   updatedAt: string;
 }
@@ -72,6 +114,32 @@ function projectRoute(domain: InteriorProjectDomain): string {
 export async function listInteriorProjects(domain: InteriorProjectDomain): Promise<InteriorProject[]> {
   const data = await request<{ projects: InteriorProject[] }>(projectRoute(domain));
   return Array.isArray(data.projects) ? data.projects : [];
+}
+
+export async function getActiveInteriorProject(domain: InteriorProjectDomain): Promise<InteriorProject | null> {
+  const data = await request<{ project: InteriorProject | null }>(`${projectRoute(domain)}/active`);
+  return data.project || null;
+}
+
+export async function setActiveInteriorProject(
+  domain: InteriorProjectDomain,
+  projectId: string | null,
+): Promise<InteriorProject | null> {
+  const data = await request<{ project: InteriorProject | null }>(`${projectRoute(domain)}/active`, {
+    method: 'PUT',
+    body: JSON.stringify({ projectId }),
+  });
+  return data.project || null;
+}
+
+export async function getInteriorProjectWorkflow(
+  domain: InteriorProjectDomain,
+  projectId: string,
+): Promise<InteriorProjectWorkflowState> {
+  const data = await request<{ workflow: InteriorProjectWorkflowState }>(
+    `${projectRoute(domain)}/${encodeURIComponent(projectId)}/workflow`,
+  );
+  return data.workflow;
 }
 
 export function createInteriorProject(domain: InteriorProjectDomain, draft: InteriorProjectDraft): Promise<InteriorProject> {
