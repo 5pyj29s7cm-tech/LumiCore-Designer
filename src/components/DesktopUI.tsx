@@ -5729,7 +5729,14 @@ export function DesktopUI({
                             }}
                           />
                         ) : (
-                          <DesktopPersonalizationSoundPanel t={t} onOpenAppearance={() => setPersonalizationSection('appearance')} />
+                          <DesktopPersonalizationSoundPanel
+                            t={t}
+                            onOpenAppearance={() => setPersonalizationSection('appearance')}
+                            onOpenVoiceSettings={() => {
+                              setSettingsSection('voice-model');
+                              toggleWindow('settings');
+                            }}
+                          />
                         )}
                       </div>
                     </div>
