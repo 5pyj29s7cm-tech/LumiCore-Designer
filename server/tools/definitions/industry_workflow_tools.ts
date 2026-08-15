@@ -18,6 +18,7 @@ import {
   setActiveInteriorProject,
 } from '../../design/projects';
 import { getInteriorProjectWorkflow } from '../../design/project_workflow';
+import { registerIndustryGuidanceTools } from './industry_guidance_tools';
 
 // i18n-allow: The multilingual routing hints below are internal tool-selection
 // aliases for Chinese industry requests; they are never rendered as UI copy.
@@ -184,6 +185,32 @@ function registerDesignProjectTools(registry: ToolRegistry): void {
 
 export function registerIndustryWorkflowTools(registry: ToolRegistry): void {
   if (PRODUCT_VARIANT.productLine === 'design') registerDesignProjectTools(registry);
+  registerIndustryGuidanceTools(registry, (context) => {
+    try {
+      const active = designScope(context);
+      const project = getActiveInteriorProject(active.scopeId, active.userId);
+      if (!project) return null;
+      const workflow = getInteriorProjectWorkflow(active.scopeId, project.id);
+      const nextStage = workflow
+        ? Object.values(workflow.stages).find(stage => stage.status !== 'completed') || null
+        : null;
+      return {
+        kind: 'project',
+        id: project.id,
+        name: project.name,
+        projectType: project.projectType,
+        status: project.status,
+        updatedAt: project.updatedAt,
+        nextStage: nextStage ? {
+          entryId: nextStage.entryId,
+          status: nextStage.status,
+          blocker: nextStage.blocker,
+        } : null,
+      };
+    } catch {
+      return null;
+    }
+  });
   registry.register({
     name: 'industry_capability_profile_get',
     description: 'Read the authoritative identity, outcome workspaces, automatic preparation actions, professional-review boundaries, and optional extensions for this exact Lumi industry edition.',
@@ -313,6 +340,8 @@ export function registerIndustryWorkflowTools(registry: ToolRegistry): void {
       }
       const excluded = new Set([
         'industry_capability_profile_get',
+        'industry_user_guide',
+        'industry_guidance_preference_set',
         'industry_workflow_start',
         'industry_workflow_complete',
         'work_takeover_task_get',

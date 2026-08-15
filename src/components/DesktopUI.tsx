@@ -5779,6 +5779,13 @@ export function DesktopUI({
               setViewMode('world');
               setActiveTab('home');
             }}
+            voiceSession={{
+              callState,
+              audioLevel,
+              error: callError,
+              onStart: startStandardVoiceCall,
+              onEnd: endVoiceCallFromUI,
+            }}
             prefillMessage={chatPrefill}
             prefillSource={chatPrefillSource}
             onPrefillConsumed={() => { setChatPrefill(''); setChatPrefillSource('proactive'); }}

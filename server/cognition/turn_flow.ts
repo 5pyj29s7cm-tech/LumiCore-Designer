@@ -35,6 +35,8 @@ import {
   isCurrentIndustryWorkflowExecutionRequest,
   matchCurrentIndustryWorkflow,
 } from '../regions/packs/cn/industry_capability_profile';
+import { isCurrentIndustryGuidanceRequest } from '../industry/user_guidance';
+import { normalizeActionIntent } from './normalized_action_intent';
 
 export type LumiTurnChannel = 'chat' | 'voice' | 'task' | 'scheduler' | 'agent';
 export type LumiVerificationIntent = 'none' | 'completion_evidence' | 'work_takeover_result' | 'capability_experiment';
@@ -69,6 +71,7 @@ export interface LumiTurnFlow {
   autoPromoteToAssistant: boolean;
   conceptualCapabilityQuestion?: boolean;
   industryWorkflowEntryId?: string;
+  industryGuidanceRequest?: boolean;
   allowToolUseForTurn: boolean;
   selfRepairTurn: boolean;
   clientActionOnlyTurn: boolean;
@@ -419,6 +422,11 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
   const industryWorkflowExecutionRequested = (industryWorkflowExecutionDetected || designProjectCreationRequested)
     && !clientActionIntent;
   const currentActionContract = buildActionContract(input.text);
+  const normalizedActionIntent = normalizeActionIntent(input.text);
+  const industryGuidanceRequest = !conceptualCapabilityQuestion
+    && !statusOnlyContinuation
+    && normalizedActionIntent.kind !== 'correction_explanation'
+    && isCurrentIndustryGuidanceRequest(input.text);
   const actionContract = currentActionContract.applies || !continuationMayDriveAction
     ? currentActionContract
     : buildActionContract(routingText);
@@ -462,6 +470,8 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
   const explicitBackgroundDelegation = hasExplicitBackgroundDelegationPreference(input.text);
   const allowToolUseForTurn = conceptualCapabilityQuestion || statusOnlyContinuation
     ? false
+    : industryGuidanceRequest
+    ? true
     : chatModePureConversation
     ? clientActionOnlyTurn
     : clientActionOnlyTurn ||
@@ -516,6 +526,7 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
     industryWorkflowEntryId: industryWorkflowExecutionRequested
       ? designProjectCreationRequested ? 'project' : industryWorkflowMatch?.entry.entryId || ''
       : '',
+    industryGuidanceRequest,
     allowToolUseForTurn,
     selfRepairTurn,
     clientActionOnlyTurn,
