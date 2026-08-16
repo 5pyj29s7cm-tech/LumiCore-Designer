@@ -86,6 +86,17 @@ function parseLegacyParameterValue(value: string): unknown {
   try { return JSON.parse(decoded); } catch { return decoded; }
 }
 
+/** Normalize the full-width DeepSeek DSML tag variant into the legacy XML
+ * shape handled below. This is deliberately limited to tool-protocol tag names;
+ * arbitrary XML or undeclared tool names are never promoted to executable calls.
+ */
+export function normalizeLegacyToolProtocolText(text: string | null): string {
+  return String(text || '').replace(
+    /<\s*(\/?)\s*[|｜]{1,4}\s*DSML\s*[|｜]{1,4}\s*(tool_calls|function_calls|invoke|parameter)\b([^>]*)>/giu,
+    (_match, closing: string, name: string, suffix: string) => `<${closing}${name}${suffix}>`,
+  );
+}
+
 /**
  * Some OpenAI-compatible models occasionally print the older XML function-call
  * protocol in message content instead of returning structured tool_calls. Only
@@ -95,7 +106,7 @@ export function parseLegacyXmlToolCalls(
   text: string | null,
   toolDeclarations: ToolDeclaration[],
 ): ParsedToolCall[] | null {
-  const raw = String(text || '');
+  const raw = normalizeLegacyToolProtocolText(text);
   if (!/<(?:function_calls|invoke)\b/i.test(raw)) return null;
   const allowed = new Set(toolDeclarations.map(declaration => declaration.function.name));
   if (allowed.size === 0) return null;
@@ -124,12 +135,20 @@ function createLegacyProtocolChunkFilter(onChunk: (chunk: string) => void) {
   let state: 'pending' | 'normal' | 'suppressed' = 'pending';
   let pending = '';
   const prefixes = ['<function_calls', '<tool_calls', '<invoke', '```xml<function_calls', '```xml<tool_calls'];
+  const dsmlPrefixes = ['<｜dsml｜', '<｜｜dsml｜｜', '<|dsml|', '<||dsml||'];
   return {
     emit(chunk: string) {
       if (state === 'normal') { onChunk(chunk); return; }
       if (state === 'suppressed') return;
       pending += chunk;
-      const probe = pending.trimStart().replace(/\s+/g, '').toLowerCase();
+      const rawProbe = pending.trimStart().replace(/\s+/g, '').toLowerCase();
+      if (dsmlPrefixes.some(prefix => prefix.startsWith(rawProbe))) return;
+      if (dsmlPrefixes.some(prefix => rawProbe.startsWith(prefix))) {
+        state = 'suppressed';
+        pending = '';
+        return;
+      }
+      const probe = normalizeLegacyToolProtocolText(pending).trimStart().replace(/\s+/g, '').toLowerCase();
       if (!probe) return;
       if (prefixes.some(prefix => prefix.startsWith(probe))) return;
       if (prefixes.some(prefix => probe.startsWith(prefix))) {
@@ -443,7 +462,10 @@ function extractUsage(rawResponse: any) {
   };
 }
 
-export function parseDeepSeekResponse(rawResponse: any): NormalizedLLMResponse {
+export function parseDeepSeekResponse(
+  rawResponse: any,
+  toolDeclarations: ToolDeclaration[] = [],
+): NormalizedLLMResponse {
   const message = rawResponse.choices?.[0]?.message;
   if (!message) return { text: null, toolCalls: null };
 
@@ -462,6 +484,11 @@ export function parseDeepSeekResponse(rawResponse: any): NormalizedLLMResponse {
       return { id: tc.id, name: tc.function?.name || '', arguments: args };
     });
     return { text, toolCalls, reasoningContent, usage };
+  }
+
+  const legacyToolCalls = parseLegacyXmlToolCalls(text, toolDeclarations);
+  if (legacyToolCalls) {
+    return { text: null, toolCalls: legacyToolCalls, reasoningContent, usage };
   }
 
   return { text, toolCalls: null, reasoningContent, usage };
@@ -980,7 +1007,7 @@ export async function makeLLMCallDirect(
       if (extensionProvider) throw extensionProviderFailure(config.provider, error);
       throw error;
     }
-    return parseDeepSeekResponse(response);
+    return parseDeepSeekResponse(response, toolDeclarations);
   }
 
   if (config.provider === 'gemini') {

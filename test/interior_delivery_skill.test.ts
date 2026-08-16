@@ -22,6 +22,34 @@ describe('spatial and interior delivery skill', () => {
     expect(result.toolSequence.join(' ')).toContain('mcp_paddleocr-local_pp_structurev3');
   });
 
+  it('does not treat negated Chinese evidence or total area as verified geometry', () => {
+    const result = buildDrawingIngestQa({
+      projectName: '澄境样板间',
+      sources: ['无实测平面图源文件', '当前仅有三室两厅需求文字'],
+      knownDimensions: '无已核验尺寸；120平方米仅为总面积',
+      evidenceNotes: '无图名、出图日期、版本、比例尺或测绘来源',
+    });
+
+    expect(result.status).toBe('needs_review');
+    expect(result.sources).toEqual([]);
+    expect(result.knownDimensions).toEqual([]);
+    expect(result.evidenceGaps).toHaveLength(3);
+    expect(result.rejectedEvidenceClaims.join(' ')).toContain('120平方米');
+  });
+
+  it('accepts an actual source reference and independently verified linear dimensions', () => {
+    const result = buildDrawingIngestQa({
+      projectName: 'Measured apartment',
+      sources: ['survey-rev-b.pdf'],
+      knownDimensions: 'north wall 9000 x 7600 mm',
+      evidenceNotes: 'Site survey by Li on 2026-08-15; drawing revision B.',
+    });
+
+    expect(result.status).toBe('ready_for_geometry_extraction');
+    expect(result.knownDimensions).toEqual(['north wall 9000 x 7600 mm']);
+    expect(result.evidenceGaps).toEqual([]);
+  });
+
   it('keeps IFC and Revit work read-only with explicit stop conditions', () => {
     const ifc = buildIfcSpaceAuditPlan({ modelPath: 'project/model.ifc' });
     const revit = buildRevitReadOnlyPlan({ objective: 'Check room finishes' });

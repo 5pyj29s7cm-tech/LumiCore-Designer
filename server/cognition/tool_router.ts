@@ -303,7 +303,7 @@ function isDirectAutocadOperationsPlayback(text: string): boolean {
   return hasOperations && hasAutocadTarget && hasRunIntent;
 }
 
-function requestsExplicitCadFileExport(text: string): boolean {
+export function requestsExplicitCadFileExport(text: string): boolean {
   const raw = String(text || '');
   return /(?:\u5bfc\u51fa|\u751f\u6210|\u4fdd\u5b58|\u4ea4\u4ed8).{0,24}(?:DXF|DWG)|(?:DXF|DWG).{0,24}(?:\u5bfc\u51fa|\u751f\u6210|\u4fdd\u5b58|\u4ea4\u4ed8)/iu.test(raw)
     || /\b(?:export|generate|save|deliver)\b.{0,24}\b(?:DXF|DWG)\b|\b(?:DXF|DWG)\b.{0,24}\b(?:export|generate|save|deliver)\b/i.test(raw);

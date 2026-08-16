@@ -15,6 +15,7 @@ import { readDB, writeDB } from '../db_layer';
 import { getIndustryWorkflowTask } from '../server/industry/workflow_service';
 import { getOrCreateActiveConversation } from '../server/conversation/manager';
 import { ensureBackgroundConversationActionTask } from '../server/conversation/action_ledger';
+import { bindIndustryWorkflowToolPolicy } from '../server/routes/chat_routes';
 
 beforeAll(async () => {
   const { initDatabase } = await import('../db_layer');
@@ -120,6 +121,13 @@ describe('industry capability profile and channel routing', () => {
         expect(pipeline.capabilityPlan.taskLedgerRequired).toBe(false);
       }
     }
+  });
+
+  it('matches compact mixed-language workspace names before dependency mentions', () => {
+    if (PRODUCT_VARIANT.productLine !== 'design') return;
+    const request = '矩衡验收户型A进入提案PPT阶段，请沿用已核验的CAD成果和效果图成果生成本地提案。';
+    expect(matchCurrentIndustryWorkflow(request)?.entry.entryId).toBe('presentation');
+    expect(isCurrentIndustryWorkflowExecutionRequest(request)).toBe(true);
   });
 
   it('keeps capability questions, status follow-ups and corrections tool-free', () => {
@@ -254,6 +262,64 @@ describe('industry capability profile and channel routing', () => {
       .rejects.toThrow(/No verified domain-tool receipt/);
   });
 
+  it('keeps a bound workflow on one immutable task id', async () => {
+    const registry = createRegistry();
+    const scenario = SCENARIOS[PRODUCT_VARIANT.productLine][0];
+    const context: any = {
+      userId: `industry_bound_task_${Date.now()}`,
+      domain: 'personal', orgId: '', source: 'chat', actionIntent: scenario.command,
+      routedTaskText: scenario.command, requestId: `bound-task-${Date.now()}`,
+      idempotencyKey: `bound-task-${Date.now()}`,
+    };
+    const started = JSON.parse(await registry.execute('industry_workflow_start', { entryId: scenario.entryId }, context));
+    context.industryWorkflowTaskId = started.task.id;
+
+    const reused = JSON.parse(await registry.execute('industry_workflow_start', { entryId: scenario.entryId }, context));
+    expect(reused.task.id).toBe(started.task.id);
+    await expect(registry.execute('industry_workflow_complete', { taskId: 'wt_task_foreign' }, context))
+      .rejects.toThrow(/task mismatch/i);
+  });
+
+  it('restricts a bound workflow continuation to its persisted execution contract', () => {
+    const policy = bindIndustryWorkflowToolPolicy({
+      allowedTools: ['*'],
+      requireConfirmation: [],
+      forbiddenTools: ['*'],
+      maxIterations: 0,
+    }, {
+      metadata: {
+        industryWorkflow: {
+          contract: {
+            executionTools: [
+              'mcp_design-studio-pack_drawing_ingest_qa',
+              'cad_generate_dxf',
+            ],
+          },
+        },
+      },
+    }, [
+      'work_takeover_task_get',
+      'mcp_design-studio-pack_drawing_ingest_qa',
+      'cad_generate_dxf',
+      'industry_workflow_complete',
+      'work_takeover_task_verify_result',
+      'list_directory',
+      'search_files',
+    ]);
+
+    expect(policy.allowedTools).toEqual([
+      'work_takeover_task_get',
+      'mcp_design-studio-pack_drawing_ingest_qa',
+      'cad_generate_dxf',
+      'industry_workflow_complete',
+      'work_takeover_task_verify_result',
+    ]);
+    expect(policy.allowedTools).not.toContain('list_directory');
+    expect(policy.allowedTools).not.toContain('search_files');
+    expect(policy.forbiddenTools).not.toContain('*');
+    expect(policy.maxIterations).toBe(6);
+  });
+
   it('settles the persistent workflow from a verified domain receipt in the same tool loop', async () => {
     const registry = createRegistry();
     const scenario = SCENARIOS[PRODUCT_VARIANT.productLine][0];
@@ -266,11 +332,15 @@ describe('industry capability profile and channel routing', () => {
       idempotencyKey: `industry-verified-loop-${PRODUCT_VARIANT.productLine}`,
     };
     const started = JSON.parse(await registry.execute('industry_workflow_start', { entryId: scenario.entryId }, context));
-    context.getCurrentToolRecords = () => [{
-      id: 'verified-domain-receipt', name: 'industry_domain_result_probe', arguments: {},
+    context.getCurrentToolRecords = () => (
+      entry.contract.requiredToolReceipts?.length
+        ? entry.contract.requiredToolReceipts
+        : ['industry_domain_result_probe']
+    ).map((name: string, index: number) => ({
+      id: `verified-domain-receipt-${index}`, name, arguments: {},
       result: JSON.stringify({ ok: true, status: 'verified', summary: entry.contract.expectedContentTerms.join(' ') }),
       terminalVerification: { status: 'verified', strategy: 'measured', reason: 'verified domain result' },
-    }];
+    }));
     const completed = JSON.parse(await registry.execute('industry_workflow_complete', { taskId: started.task.id }, context));
     expect(completed).toMatchObject({ ok: true, status: 'verified', persisted: true });
     const actionTask = readDB().conversationActionTasks.find((task: any) => task.id === started.conversationTaskId);

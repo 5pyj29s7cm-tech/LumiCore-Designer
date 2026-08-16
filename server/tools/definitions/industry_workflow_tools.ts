@@ -1,9 +1,13 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import JSZip from 'jszip';
 import { ToolRegistry } from '../registry';
 import { capabilityContract, capabilityEvidence } from '../capability_contracts';
 import { getCurrentIndustryCapabilityProfile, matchCurrentIndustryWorkflow } from '../../regions/packs/cn/industry_capability_profile';
 import {
   getIndustryWorkflowTask,
   listIndustryWorkflowTasks,
+  reconcileVerifiedDesignProjectBrief,
   recordIndustryWorkflowExecution,
   startIndustryWorkflow,
 } from '../../industry/workflow_service';
@@ -19,6 +23,7 @@ import {
 } from '../../design/projects';
 import { getInteriorProjectWorkflow } from '../../design/project_workflow';
 import { registerIndustryGuidanceTools } from './industry_guidance_tools';
+import { getGeneratedOutputDir } from '../../config/data_path';
 
 // i18n-allow: The multilingual routing hints below are internal tool-selection
 // aliases for Chinese industry requests; they are never rendered as UI copy.
@@ -42,13 +47,128 @@ function findDesignProject(args: Record<string, any>, context?: ToolContext) {
   const active = designScope(context);
   const projectId = String(args.projectId || '').trim();
   if (projectId) return { ...active, project: getInteriorProject(active.scopeId, projectId) };
+  const projects = listInteriorProjects(active.scopeId);
+  const routedText = String(context?.routedTaskText || '');
+  const routedMatch = projects.find(project => routedText.includes(project.name));
+  if (routedMatch) return { ...active, project: routedMatch };
   const name = String(args.name || '').trim().toLocaleLowerCase();
   if (name) {
-    const matches = listInteriorProjects(active.scopeId).filter(project => project.name.toLocaleLowerCase() === name);
+    const matches = projects.filter(project => project.name.toLocaleLowerCase() === name);
     if (matches.length > 1) throw new Error('More than one design project has that name; use projectId.');
     return { ...active, project: matches[0] || null };
   }
-  return { ...active, project: getActiveInteriorProject(active.scopeId, active.userId) };
+  const selected = getActiveInteriorProject(active.scopeId, active.userId);
+  if (selected) return { ...active, project: selected };
+  const owned = projects.filter(project => project.ownerUserId === active.userId);
+  return { ...active, project: owned.length === 1 ? owned[0] : null };
+}
+
+function projectStatusProjection(workflow: NonNullable<ReturnType<typeof getInteriorProjectWorkflow>>) {
+  const stages = Object.fromEntries(Object.entries(workflow.stages).map(([entryId, stage]) => [
+    entryId,
+    {
+      entryId: stage.entryId,
+      status: stage.status,
+      currentTaskId: stage.currentTaskId,
+      verificationId: stage.verificationId,
+      verificationStatus: stage.verificationStatus,
+      blocker: stage.blocker,
+      attempts: stage.attempts,
+      startedAt: stage.startedAt,
+      updatedAt: stage.updatedAt,
+      completedAt: stage.completedAt,
+      artifacts: stage.artifacts
+        .filter(artifact => Boolean(artifact.path) || artifact.status === 'delivered')
+        .slice(-8),
+    },
+  ]));
+  const ordered = ['project', 'cad', 'visualization', 'presentation', 'handoff'];
+  const completedStages = ordered.filter(entryId => (stages as any)[entryId]?.status === 'completed');
+  const nextStage = ordered.find(entryId => (stages as any)[entryId]?.status !== 'completed') || '';
+  return {
+    schemaVersion: workflow.schemaVersion,
+    rootTaskId: workflow.rootTaskId,
+    activeStage: workflow.activeStage,
+    completedStages,
+    nextStage,
+    stages,
+    createdAt: workflow.createdAt,
+    updatedAt: workflow.updatedAt,
+  };
+}
+
+function safeDeliveryName(value: unknown): string {
+  return String(value || 'interior-design')
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+    .replace(/\s+/g, '_')
+    .slice(0, 90) || 'interior-design';
+}
+
+async function createDesignDeliveryPackage(args: Record<string, any>, context?: ToolContext): Promise<string> {
+  const resolved = findDesignProject(args, context);
+  if (!resolved.project) throw new Error('No active design project is bound. Create or select a project first.');
+  const workflow = getInteriorProjectWorkflow(resolved.scopeId, resolved.project.id);
+  if (!workflow) throw new Error('The active design project has no durable workflow ledger.');
+  const requiredStages = ['project', 'cad', 'visualization', 'presentation'] as const;
+  const missingStages = requiredStages.filter(entryId => workflow.stages[entryId].status !== 'completed');
+  if (missingStages.length) {
+    throw new Error(`Delivery package is blocked until verified upstream stages complete: ${missingStages.join(', ')}.`);
+  }
+
+  const zip = new JSZip();
+  const included: Array<{ stage: string; label: string; fileName: string; size: number }> = [];
+  const seen = new Set<string>();
+  for (const entryId of requiredStages) {
+    for (const artifact of workflow.stages[entryId].artifacts) {
+      const filePath = String(artifact.path || '').trim();
+      if (!filePath || seen.has(filePath) || !fs.existsSync(filePath)) continue;
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile() || stat.size < 1) continue;
+      seen.add(filePath);
+      const fileName = path.basename(filePath);
+      zip.file(`${entryId}/${fileName}`, fs.readFileSync(filePath));
+      included.push({ stage: entryId, label: artifact.label, fileName, size: stat.size });
+    }
+  }
+  if (!included.length) throw new Error('No verified upstream files are available for the delivery package.');
+
+  const version = String(args.version || 'v1').trim().slice(0, 40) || 'v1';
+  const manifest = {
+    schemaVersion: 1,
+    project: { id: resolved.project.id, name: resolved.project.name, type: resolved.project.projectType },
+    version,
+    createdAt: new Date().toISOString(),
+    scope: 'Local review package; external delivery and professional sign-off are not implied.',
+    checklist: requiredStages.map(entryId => ({
+      stage: entryId,
+      status: workflow.stages[entryId].status,
+      verificationId: workflow.stages[entryId].verificationId,
+      artifacts: included.filter(item => item.stage === entryId),
+    })),
+    drawingCount: included.filter(item => item.stage === 'cad').length,
+    schedule: 'Review drawing, visualization, presentation, version, and client-facing claims before handoff.',
+    handoff: { externallyDelivered: false, approvalRequired: true },
+  };
+  zip.file('manifest.json', JSON.stringify(manifest, null, 2));
+  const outputDir = getGeneratedOutputDir();
+  fs.mkdirSync(outputDir, { recursive: true });
+  const outputPath = path.join(outputDir, `${safeDeliveryName(resolved.project.name)}_${safeDeliveryName(version)}_delivery.zip`);
+  const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  fs.writeFileSync(outputPath, buffer);
+  const size = fs.statSync(outputPath).size;
+  if (size < 16) throw new Error('Delivery archive writer returned an empty package.');
+  return JSON.stringify({
+    ok: true,
+    status: 'created',
+    outputPath,
+    size,
+    projectId: resolved.project.id,
+    projectName: resolved.project.name,
+    version,
+    includedFiles: included,
+    manifest,
+  }, null, 2);
 }
 
 function registerDesignProjectTools(registry: ToolRegistry): void {
@@ -103,7 +223,7 @@ function registerDesignProjectTools(registry: ToolRegistry): void {
       id: 'design.project.create', family: 'industry', lane: 'industry', operation: 'create', risk: 'low',
       sideEffects: [{ type: 'local_state_change', scope: 'interior design project and active project binding', reversible: true }],
       verification: {
-        strategy: 'artifact', required: true,
+        strategy: 'terminal_receipt', required: true,
         requiredFields: ['ok', 'status', 'persisted', 'active', 'project.id', 'project.name'],
         requiredValues: { ok: true, persisted: true, active: true }, successStatuses: ['created'],
         successSignals: ['durable scoped project returned'],
@@ -161,9 +281,17 @@ function registerDesignProjectTools(registry: ToolRegistry): void {
     handler: async (args, context) => {
       const resolved = findDesignProject(args, context);
       if (!resolved.project) throw new Error('No active design project is bound. Create or select a project first.');
+      const workflow = getInteriorProjectWorkflow(resolved.scopeId, resolved.project.id);
+      if (!workflow) throw new Error('The active design project has no durable workflow ledger.');
+      const reconciled = reconcileVerifiedDesignProjectBrief(
+        resolved.scopeId,
+        resolved.project.id,
+        resolved.userId,
+      ) || resolved.project;
+      const { workflow: _omittedWorkflow, ...project } = reconciled;
       return JSON.stringify({
-        ok: true, status: 'observed', persisted: true, project: resolved.project,
-        workflow: getInteriorProjectWorkflow(resolved.scopeId, resolved.project.id),
+        ok: true, status: 'observed', persisted: true, project,
+        workflow: projectStatusProjection(workflow),
       }, null, 2);
     },
     permission: 'user',
@@ -180,6 +308,40 @@ function registerDesignProjectTools(registry: ToolRegistry): void {
       },
     }),
     evidence: capabilityEvidence({ id: 'design.project.status', operation: 'observe', subjectArgument: 'projectId', limitations: ['Read-only status query.'] }),
+  });
+
+  registry.register({
+    name: 'design_delivery_package_create',
+    description: 'Create a local ZIP handoff package for the active interior project from verified upstream CAD, visualization, and presentation artifacts. Refuses to package incomplete stages and never sends the archive externally.',
+    routingHints: ['create design delivery package', 'package verified project files', '生成交付包', '打包项目交付文件'],
+    parameters: {
+      type: 'object',
+      properties: {
+        projectId: { type: 'string', description: 'Optional exact project id; defaults to the active project.' },
+        name: { type: 'string', description: 'Optional exact project name.' },
+        version: { type: 'string', description: 'Local package version, for example v1 or review-2026-08-16.' },
+      },
+      required: [],
+    },
+    handler: createDesignDeliveryPackage,
+    permission: 'user',
+    securityLevel: 'safe',
+    capability: capabilityContract({
+      id: 'design.delivery.package.create', family: 'industry', lane: 'industry', operation: 'create', risk: 'low',
+      sideEffects: [{ type: 'local_write', scope: 'verified interior design delivery ZIP', reversible: true }],
+      verification: {
+        strategy: 'artifact', required: true,
+        requiredFields: ['ok', 'status', 'outputPath', 'size', 'projectId', 'version', 'manifest.checklist'],
+        requiredValues: { ok: true, status: 'created' }, successStatuses: ['created'],
+        requiredArtifacts: ['outputPath'],
+        successSignals: ['non-empty archive contains a manifest and verified upstream project files'],
+        limitations: ['Archive creation is not professional sign-off, client acceptance, or external delivery.'],
+      },
+    }),
+    evidence: capabilityEvidence({
+      id: 'design.delivery.package.create', operation: 'create', subjectArgument: 'projectId',
+      limitations: ['Creates a local review package only; sending remains a separate confirmed action.'],
+    }),
   });
 }
 
@@ -265,8 +427,14 @@ export function registerIndustryWorkflowTools(registry: ToolRegistry): void {
       const entryId = String(args.entryId || '').trim();
       const entry = profile?.entries.find(candidate => candidate.entryId === entryId);
       if (!profile || !entry) throw new Error(`Industry entry is not available in this edition: ${entryId}`);
-      const namedTaskId = String(context?.routedTaskText || '').match(/\bwt_task_[a-zA-Z0-9_-]+\b/)?.[0] || '';
+      const boundTaskId = String(context?.industryWorkflowTaskId || '').trim();
+      const namedTaskId = boundTaskId
+        || String(context?.routedTaskText || '').match(/\bwt_task_[a-zA-Z0-9_-]+\b/)?.[0]
+        || '';
       const namedTask = namedTaskId ? getIndustryWorkflowTask(activeScope, namedTaskId) : null;
+      if (boundTaskId && (!namedTask || namedTask.metadata?.industryWorkflow?.entryId !== entryId)) {
+        throw new Error('The bound industry workflow task cannot be replaced or changed to another entry in this execution.');
+      }
       if (namedTask?.metadata?.industryWorkflow?.entryId === entryId) {
         const metadata = namedTask.metadata.industryWorkflow;
         return JSON.stringify({
@@ -323,21 +491,24 @@ export function registerIndustryWorkflowTools(registry: ToolRegistry): void {
     routingHints: ['complete industry workflow', 'verify industry result', 'archive outcome', '验收行业任务', '归档行业结果'],
     parameters: {
       type: 'object',
-      properties: { taskId: { type: 'string', description: 'The wt_task_* id returned by industry_workflow_start.' } },
+      properties: {
+        taskId: { type: 'string', description: 'The wt_task_* id returned by industry_workflow_start.' },
+        resultSummary: {
+          type: 'string',
+          description: 'Optional evidence-grounded summary to archive with current-loop receipts. State verified output, source constraints, assumptions, risks, and next review step.',
+        },
+      },
       required: ['taskId'],
     },
     handler: async (args, context) => {
       const activeScope = scope(context);
       const taskId = String(args.taskId || '').trim();
+      const boundTaskId = String(context?.industryWorkflowTaskId || '').trim();
+      if (boundTaskId && taskId !== boundTaskId) {
+        throw new Error(`Completion receipt task mismatch: expected ${boundTaskId}, received ${taskId || 'empty'}.`);
+      }
       const task = getIndustryWorkflowTask(activeScope, taskId);
       if (!task) throw new Error('Industry workflow task was not found in the active user scope.');
-      const previousVerification = task.metadata?.workTakeoverVerification;
-      if (task.status === 'delivered' && previousVerification?.passed === true) {
-        return JSON.stringify({
-          ok: true, status: 'verified', persisted: true, reused: true,
-          task, verification: previousVerification,
-        }, null, 2);
-      }
       const excluded = new Set([
         'industry_capability_profile_get',
         'industry_user_guide',
@@ -356,10 +527,14 @@ export function registerIndustryWorkflowTools(registry: ToolRegistry): void {
         throw new Error('No verified domain-tool receipt exists in this execution loop. Run the real industry capability before verification.');
       }
       const receiptText = evidenceRecords.map(record => String(record.result || '')).join('\n\n').slice(0, 12_000);
+      const resultSummary = String(args.resultSummary || '').trim().slice(0, 8_000);
+      const archivedResult = resultSummary
+        ? `${resultSummary}\n\nVerified current-loop receipts:\n${receiptText}`
+        : receiptText;
       const recorded = recordIndustryWorkflowExecution({
         ...activeScope,
         taskId,
-        resultText: receiptText,
+        resultText: archivedResult,
         toolRecords: evidenceRecords,
         source: context?.source || 'industry_natural_language',
       });
@@ -367,7 +542,13 @@ export function registerIndustryWorkflowTools(registry: ToolRegistry): void {
         ok: recorded.verification.passed,
         status: recorded.verification.passed ? 'verified' : recorded.verification.status,
         persisted: true,
-        task: recorded.task,
+        task: {
+          id: recorded.task.id,
+          status: recorded.task.status,
+          title: recorded.task.title,
+          entryId: recorded.task.metadata?.industryWorkflow?.entryId,
+          updatedAt: recorded.task.updatedAt,
+        },
         verification: recorded.verification,
         archivedFilePaths: recorded.archivedFilePaths,
       }, null, 2);
@@ -378,7 +559,7 @@ export function registerIndustryWorkflowTools(registry: ToolRegistry): void {
       id: 'industry.workflow.complete', family: 'industry', lane: 'industry', operation: 'test', risk: 'low',
       sideEffects: [{ type: 'local_state_change', scope: 'industry workflow archive, verification and linked action ledger', reversible: true }],
       verification: {
-        strategy: 'artifact', required: true,
+        strategy: 'terminal_receipt', required: true,
         requiredFields: ['ok', 'status', 'persisted', 'task.id', 'verification.passed'],
         requiredValues: { ok: true, persisted: true, 'verification.passed': true },
         successStatuses: ['verified'], failureStatuses: ['blocked', 'needs_review'],

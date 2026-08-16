@@ -662,6 +662,12 @@ export class ToolRegistry {
       return { level: 'forbidden', reason: 'personality forbiddenTools list' };
     }
 
+    // Security overrides may tune an authorized tool but cannot grant a tool
+    // omitted from the current execution allowlist.
+    if (!isToolNameAllowedByPolicy(toolName, policy)) {
+      return { level: 'forbidden', reason: 'not in allowedTools list' };
+    }
+
     // 2. Explicit per-tool security override
     if (policy.securityOverrides?.[toolName]) {
       return { level: policy.securityOverrides[toolName], reason: 'personality security override' };
@@ -673,10 +679,6 @@ export class ToolRegistry {
     }
 
     // 4. allowedTools check — if '*' all allowed, otherwise specific list
-    if (!isToolNameAllowedByPolicy(toolName, policy)) {
-      return { level: 'forbidden', reason: 'not in allowedTools list' };
-    }
-
     return { level: builtIn, reason: 'tool default' };
   }
 

@@ -5,6 +5,7 @@ import { buildUnifiedLegalEntryPrompt } from './legal_entry';
 import {
   formatToolRouteForPrompt,
   mergeToolPolicyWithRoute,
+  requestsExplicitCadFileExport,
   routeToolsForTurn,
   type ToolRoute,
 } from './tool_router';
@@ -21,6 +22,8 @@ import {
 } from './current_app_execution';
 import { WPS_CREATE_DOCUMENT_TOOL } from '../external_control/wps_automation';
 import type { ConversationActionContinuationState } from './action_continuation';
+import { isDesignProjectStatusRequest } from '../design/status_intent';
+import { requiresVisibleAutoCadExecution } from './action_contract';
 import { applyTaskPolicySnapshot } from './task_execution_ledger';
 import {
   formatIndustryWorkflowRoutingPrompt,
@@ -208,6 +211,19 @@ function enhanceToolRouteForFlow(
       maxIterations: Math.min(route.maxIterations || 2, 2),
     };
   }
+  const designProjectStatusRequest = available.has('interior_design_project_status')
+    && isDesignProjectStatusRequest(flow.routeText);
+  if (designProjectStatusRequest) {
+    return {
+      ...route,
+      toolNames: ['interior_design_project_status'],
+      categories: unique([...route.categories, 'industry_workflow']),
+      reasons: unique([...route.reasons, 'design project status uses the durable project ledger']),
+      truncated: false,
+      hardAllowlist: true,
+      maxIterations: 2,
+    };
+  }
   if (route.hardAllowlist && !flow.industryWorkflowEntryId) return route;
 
   const additions = new Set<string>();
@@ -222,6 +238,7 @@ function enhanceToolRouteForFlow(
   const industryWorkflowMatch = !recoveredCurrentAppEdit && flow.industryWorkflowEntryId
     ? matchCurrentIndustryWorkflow(flow.routeText)
     : null;
+  const industryExecutionTools = industryWorkflowMatch?.entry.contract.executionTools || [];
   const designProjectCreation = !recoveredCurrentAppEdit
     && flow.industryWorkflowEntryId === 'project'
     && isDesignProjectCreationRequest(flow.routeText);
@@ -232,11 +249,65 @@ function enhanceToolRouteForFlow(
         : ['industry_workflow_start', 'industry_workflow_complete']),
       'work_takeover_task_get',
       'work_takeover_task_verify_result',
+      ...industryExecutionTools,
     ]);
     categories.push('industry_workflow');
     reasons.push(designProjectCreation
       ? 'new design projects must create a durable active project before stage execution'
       : `matched edition outcome ${industryWorkflowMatch!.entry.entryId}`);
+  }
+  if (industryWorkflowMatch && industryExecutionTools.length && !designProjectCreation) {
+    const persistentTaskTools = flow.channel === 'task' || flow.workTakeover.shouldResumeTask
+      ? [
+          'work_takeover_task_continue',
+          'work_takeover_task_advance',
+          'work_takeover_task_autorun',
+          'work_takeover_task_export_packet',
+          'work_takeover_task_run_suggested_tool',
+        ]
+      : [];
+    const localCadDiscoveryTools = route.categories.includes('cad_design')
+      && flow.workSurfaceRoute.artifactFirst
+      && flow.workSurfaceRoute.directDesktop
+      ? [
+          'desktop_list_files',
+          'desktop_path_info',
+          'desktop_list_apps',
+          'ocr_image_file',
+        ]
+      : [];
+    const boundedIndustryExecutionTools = requiresVisibleAutoCadExecution(flow.routeText)
+      && !requestsExplicitCadFileExport(flow.routeText)
+      ? industryExecutionTools.filter(name => ![
+          'cad_generate_dxf',
+          'mcp_cad-drafting_cad_renovation_folder_workflow',
+        ].includes(name))
+      : industryExecutionTools;
+    const toolNames = unique([
+      'industry_workspace_status',
+      'industry_workspace_bind',
+      'work_takeover_task_get',
+      ...persistentTaskTools,
+      ...localCadDiscoveryTools,
+      ...boundedIndustryExecutionTools,
+      'industry_workflow_start',
+      'industry_workflow_complete',
+      'work_takeover_task_verify_result',
+    ]).filter(name => available.has(name));
+    return {
+      ...route,
+      toolNames,
+      categories: unique(categories),
+      reasons: unique([
+        ...reasons,
+        'industry workflow contract supplies the exact execution allowlist',
+        ...(persistentTaskTools.length ? ['persistent task entry keeps task-state continuation tools in the industry allowlist'] : []),
+        ...(localCadDiscoveryTools.length ? ['local visible CAD work keeps bounded file and application discovery ahead of production tools'] : []),
+      ]),
+      truncated: false,
+      hardAllowlist: true,
+      maxIterations: Math.max(route.maxIterations || 0, 12),
+    };
   }
   if (discoveredEvidenceTools.length) {
     addAvailable(additions, available, discoveredEvidenceTools.map(tool => tool.name));

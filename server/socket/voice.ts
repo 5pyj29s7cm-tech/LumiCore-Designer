@@ -83,6 +83,7 @@ import { formatOperationModeSwitchResponse } from "../i18n/operation_mode_messag
 import { buildInternalOpenCommand } from "../i18n/naturalness_messages";
 import { buildInteractionModeOverlay } from "../cognition/turn_flow";
 import { buildLumiExecutionPipeline } from "../cognition/execution_pipeline";
+import { shouldAllowExplicitLocalFileWrite } from "../cognition/local_write_intent";
 import { shouldRunLegacyDirectExecution } from "../cognition/legacy_route_policy";
 import { bindCapabilityExecutionPlanTask } from "../cognition/capability_execution_plan";
 import { buildForegroundMessagingArguments, executeForegroundMessagingAction } from "../cognition/foreground_messaging_execution";
@@ -164,6 +165,13 @@ import {
 import { normalizeSpeechCommand, speechCommandKey } from '../cognition/speech_normalization';
 import { isCurrentVoiceInputSource, isRepeatedVoiceFinal } from '../cognition/voice_input_guard';
 import { normalizeVoiceHistory } from './voice_history';
+import {
+  getIndustryWorkflowPrerequisiteStatus,
+  recordIndustryWorkflowExecution,
+  startIndustryWorkflow,
+} from '../industry/workflow_service';
+import { bindIndustryWorkflowToolPolicy } from '../industry/execution_policy';
+import { formatIndustryWorkflowPrerequisiteBlocker } from '../industry/user_facing';
 export { normalizeVoiceHistory, normalizeVoiceHistoryRecord } from './voice_history';
 
 interface AudioSession {
@@ -495,6 +503,7 @@ function buildVoiceReplyStyleOverlay(): string {
 function shouldAllowVoiceLocalFileWriteForTurn(userText: string): boolean {
   const clean = String(userText || '').trim();
   if (!clean) return false;
+  if (shouldAllowExplicitLocalFileWrite(clean)) return true;
   return /\b(?:create|generate|write|save|export|make|draft|draw|build)\b.{0,80}\b(?:file|document|docx|word|pdf|txt|markdown|transcript|notes|minutes|report|pptx?|xlsx?|cad|dxf|dwg|drawing|floor\s*plan|blueprint)\b/i.test(clean)
     || /(?:生成|创建|新建|制作|写成|做成|整理成|汇总成|保存|导出|输出|画|绘制).{0,60}(?:文件|文档|材料|报告|笔记|纪要|记录|文本|文字|清单|方案|表格|图纸|平面图|CAD|DXF|DWG|PPT|PDF|Word|Excel|TXT|MD)/u.test(clean);
 }
@@ -1598,7 +1607,7 @@ async function processVoiceInput(
     capabilityExecutionPlan: executionPipeline.executionPlan,
   });
   const desktopExecutionTracker = createDesktopExecutionTracker(desktopExecutionPolicy.executionPlan);
-  const routedToolPolicy = executionDecision.toolPolicy;
+  let routedToolPolicy = executionDecision.toolPolicy;
   const actionFollowupIntent = classifyConversationActionFollowupIntent(
     actionIntentText,
     conversationTurn.conversation.actionContinuationState,
@@ -1618,6 +1627,29 @@ async function processVoiceInput(
         toolPolicy: routedToolPolicy,
         forceResume: Boolean(pendingConfirmation || actionFollowupIntent === 'execute'),
       });
+  let voiceIndustryWorkflowTask: ReturnType<typeof startIndustryWorkflow>['task'] | null = null;
+  let voiceIndustryPrerequisite: ReturnType<typeof getIndustryWorkflowPrerequisiteStatus> = null;
+  if (turnFlow.industryWorkflowEntryId) {
+    const startedIndustryWorkflow = startIndustryWorkflow({
+      userId: session.userId,
+      domain: voiceScope.domain,
+      orgId: voiceScope.orgId,
+      entryId: turnFlow.industryWorkflowEntryId,
+      sourceInput: actionIntentText,
+      source: 'voice',
+      context: { source: 'voice', autoBound: true },
+      conversationId: conversationTurn.conversation.id,
+      conversationTaskId: actionTaskExecution.state?.taskId,
+      requestId,
+    });
+    voiceIndustryWorkflowTask = startedIndustryWorkflow.task;
+    voiceIndustryPrerequisite = getIndustryWorkflowPrerequisiteStatus(voiceIndustryWorkflowTask);
+    routedToolPolicy = bindIndustryWorkflowToolPolicy(
+      routedToolPolicy,
+      voiceIndustryWorkflowTask,
+      toolRegistry.getToolDeclarations().map(declaration => declaration.function.name),
+    );
+  }
   if (actionTaskExecution.state?.taskId) {
     executionPipeline.executionPlan = bindCapabilityExecutionPlanTask(
       executionPipeline.executionPlan,
@@ -1731,7 +1763,10 @@ async function processVoiceInput(
   const organizationKnowledgeOverlay = voiceOrganizationKnowledge
     ? `\n\n## Company Knowledge Base\n${voiceOrganizationKnowledge}\n\nUse this authorized organization knowledge when relevant and cite article titles when referencing it.`
     : '';
-  const voiceSystemPrompt = fullPersonalityPrompt + interactionOverlay + opModeOverlay + workSurfaceOverlay + visionRoutingOverlay + buildVoiceReplyStyleOverlay() + proactiveContextOverlay + actionContinuationOverlay + clientSelfPrompt + topicContext + organizationKnowledgeOverlay + dispatchOverlay + turnFlowOverlay + executionOverlay + capabilitySelectionOverlay + desktopExecutionOverlay + runtimeCapabilityOverlay + operatingKernelOverlay + (executionDecision.allowToolUse ? `\n${GENERIC_TOOL_PLANNING_PROMPT}` : '');
+  const voiceIndustryOverlay = voiceIndustryWorkflowTask
+    ? `\n\n## Bound Industry Workflow\nContinue only the server-bound ${String(voiceIndustryWorkflowTask.metadata?.industryWorkflow?.entryId || '')} task. Do not create a replacement. Inspect persisted project state before downstream creators, never invent paths, and never claim completion without the contract's verified receipts.`
+    : '';
+  const voiceSystemPrompt = fullPersonalityPrompt + interactionOverlay + opModeOverlay + workSurfaceOverlay + visionRoutingOverlay + buildVoiceReplyStyleOverlay() + proactiveContextOverlay + actionContinuationOverlay + clientSelfPrompt + topicContext + organizationKnowledgeOverlay + dispatchOverlay + turnFlowOverlay + executionOverlay + capabilitySelectionOverlay + desktopExecutionOverlay + runtimeCapabilityOverlay + operatingKernelOverlay + voiceIndustryOverlay + (executionDecision.allowToolUse ? `\n${GENERIC_TOOL_PLANNING_PROMPT}` : '');
 
   const userLLMPrefs = getScopedPreferredLLM(session.userId, voiceScope);
   const provider = userLLMPrefs.provider || 'deepseek';
@@ -1998,6 +2033,15 @@ async function processVoiceInput(
     },
     toolPolicy: routedToolPolicy,
     desktopExecutionTracker,
+    ...(voiceIndustryWorkflowTask ? {
+      industryWorkflowTaskId: voiceIndustryWorkflowTask.id,
+      industryWorkflowEntryId: String(voiceIndustryWorkflowTask.metadata?.industryWorkflow?.entryId || ''),
+      industryWorkflowProductLine: String(voiceIndustryWorkflowTask.metadata?.industryWorkflow?.productLine || ''),
+      industryWorkflowSourceInput: actionIntentText,
+      industryWorkflowRequiredToolReceipts: Array.isArray(voiceIndustryWorkflowTask.metadata?.industryWorkflow?.contract?.requiredToolReceipts)
+        ? voiceIndustryWorkflowTask.metadata.industryWorkflow.contract.requiredToolReceipts.map(String)
+        : [],
+    } : {}),
   };
   const ttsProvider = getTTSProvider();
   // Emotion-adaptive voice: map mood to speech parameters, preserve user's chosen voiceId
@@ -2261,6 +2305,57 @@ async function processVoiceInput(
       flushSentence(sentence);
     }
   };
+
+  if (voiceIndustryWorkflowTask && voiceIndustryPrerequisite) {
+    const statusRecord = await executeToolCall({
+      registry: toolRegistry,
+      name: 'interior_design_project_status',
+      arguments: { projectId: voiceIndustryPrerequisite.projectId },
+      context: toolContext,
+    });
+    responseText = formatIndustryWorkflowPrerequisiteBlocker(voiceIndustryPrerequisite);
+    const recorded = recordIndustryWorkflowExecution({
+      userId: session.userId,
+      domain: voiceScope.domain,
+      orgId: voiceScope.orgId,
+      taskId: voiceIndustryWorkflowTask.id,
+      resultText: responseText,
+      toolRecords: [statusRecord],
+      source: 'voice_prerequisite_guard',
+    });
+    emitAgent('agent:response', {
+      text: responseText,
+      agentName: 'Lumi',
+      source: 'voice_industry_prerequisite_guard',
+      finalized: true,
+      blocked: true,
+      reason: recorded.verification.summary,
+    });
+    persistVoiceTakeoverExecution(responseText, {
+      toolRecords: [statusRecord],
+      source: 'voice_industry_prerequisite_guard',
+      sourceInteractionId: `voice_industry_prerequisite_${Date.now()}`,
+      finalizationBlocked: true,
+      assistantTextTrusted: true,
+      finalizationReason: recorded.verification.summary,
+    });
+    persistVoiceAssistantMessage(conversationTurn.conversation.id, responseText, {
+      toolCalls: [statusRecord],
+      cognitiveIntent: 'industry_prerequisite_blocked',
+      llmWasCalled: false,
+      source: 'voice_industry_prerequisite_guard',
+    });
+    persistVoiceUserMessage('industry_prerequisite_blocked');
+    queueFinalizedSpeech(responseText);
+    await Promise.allSettled(ttsPromises);
+    if (!isCurrentTurn()) return;
+    socket.emit('chat:conversation_updated', {
+      conversationId: conversationTurn.conversation.id,
+      agentId: session.agentId,
+      source: 'voice',
+    });
+    return;
+  }
 
   if (userObservedCompletion) {
     const conversation = conversationTurn.conversation;

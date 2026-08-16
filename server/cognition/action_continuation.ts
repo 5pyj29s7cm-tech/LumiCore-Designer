@@ -910,13 +910,23 @@ export function buildRecentActionContinuationBridge(
     ? durableState.toolSummaries
     : summarizeToolCalls(executionTail);
   const state = durableState || extractRecentActionContinuationState(executionTail);
+  const hasTerminalToolEvidence = executionTail.some(item =>
+    parseToolCalls(item).some(call => Boolean(
+      toolCallName(call)
+      && (toolCallFailure(call) || compact(call?.result, 240)),
+    )),
+  );
 
   // A terse conversational follow-up must not promote an ordinary prior
   // exchange into executable work. Guard output is excluded above, and a
   // history-only bridge is allowed only when its actual user goal carries an
   // external-action contract. Durable state remains safe because it can only
   // be created from terminal tool evidence.
-  if (!durableState && !isActionBearingGoal(state.goal)) return '';
+  if (
+    !durableState
+    && !isActionBearingGoal(state.goal)
+    && !(followupIntent === 'status' && hasTerminalToolEvidence)
+  ) return '';
 
   if (
     userTurns.length === 0

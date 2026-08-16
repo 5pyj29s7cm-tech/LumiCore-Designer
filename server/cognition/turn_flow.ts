@@ -37,6 +37,7 @@ import {
 } from '../regions/packs/cn/industry_capability_profile';
 import { isCurrentIndustryGuidanceRequest } from '../industry/user_guidance';
 import { normalizeActionIntent } from './normalized_action_intent';
+import { isDesignProjectStatusRequest } from '../design/status_intent';
 
 export type LumiTurnChannel = 'chat' | 'voice' | 'task' | 'scheduler' | 'agent';
 export type LumiVerificationIntent = 'none' | 'completion_evidence' | 'work_takeover_result' | 'capability_experiment';
@@ -358,7 +359,11 @@ function buildExecutionGovernance(input: {
 }
 
 export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
-  const conceptualCapabilityQuestion = isCapabilityMetaQuestion(input.text);
+  // Workflow handoffs contain governance words such as "call tools". They are
+  // still execution requests, not capability questions.
+  const directIndustryWorkflowExecution = isCurrentIndustryWorkflowExecutionRequest(input.text);
+  const conceptualCapabilityQuestion = isCapabilityMetaQuestion(input.text)
+    && !directIndustryWorkflowExecution;
   const continuationContext = compact(input.continuationContext);
   const hasContinuationContext = Boolean(continuationContext);
   const directActionFollowupIntent = classifyRecentActionFollowupIntent(input.text);
@@ -394,9 +399,11 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
     ? matchCurrentIndustryWorkflow(routingText)
     : null;
   const industryWorkflowExecutionDetected = !conceptualCapabilityQuestion
-    && isCurrentIndustryWorkflowExecutionRequest(routingText);
+    && (directIndustryWorkflowExecution || isCurrentIndustryWorkflowExecutionRequest(routingText));
   const designProjectCreationRequested = !conceptualCapabilityQuestion
     && isDesignProjectCreationRequest(routingText);
+  const designProjectStatusRequested = !conceptualCapabilityQuestion
+    && isDesignProjectStatusRequest(routingText);
   const operationMode = normalizeOperationMode(input.operationMode);
   const requestedMode = input.requestedMode || detectRequestedOperationMode(input.text);
   const surface = resolveTurnSurface({
@@ -406,12 +413,14 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
     domain: input.domain,
     explicitSurface: input.surface,
   });
-  const workTakeover = buildWorkTakeoverContinuityContext(input.userId, input.text, {
+  let workTakeover = buildWorkTakeoverContinuityContext(input.userId, input.text, {
     domain: input.domain,
     orgId: input.orgId,
     surface,
   });
-  const rawClientActionIntent = !conceptualCapabilityQuestion && hasClientActionOnlyIntent(input.text);
+  const rawClientActionIntent = !conceptualCapabilityQuestion
+    && !directIndustryWorkflowExecution
+    && hasClientActionOnlyIntent(input.text);
   // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
   const continuationNamesExternalTarget = continuationMayDriveAction
     && /(?:desktop_|wechat_|browser_|mcp_|AutoCAD|\bCAD\b|微信|浏览器)/iu.test(continuationContext); // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
@@ -423,6 +432,21 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
     && !clientActionIntent;
   const currentActionContract = buildActionContract(input.text);
   const normalizedActionIntent = normalizeActionIntent(input.text);
+  const explicitlyReferencesExistingWork = /(?:\u7ee7\u7eed|\u63a5\u7740|\u4e0b\u4e00\u6b65|\u63a8\u8fdb|\u6062\u590d|\u91cd\u8bd5|\u521a\u624d|\u521a\u521a|\u4e0a\u4e00(?:\u4e2a|\u6761|\u8f6e)|\u8fd9\u4e2a\u4efb\u52a1|\u8be5\u4efb\u52a1|\u90a3\u4ef6\u4e8b)|\b(?:continue|resume|next\s+step|retry|previous|last\s+(?:task|turn)|this\s+task)\b/iu
+    .test(input.text);
+  const startsSpecificNewAction = currentActionContract.applies
+    && currentActionContract.kind !== 'task_control'
+    && !explicitlyReferencesExistingWork;
+  if (startsSpecificNewAction && workTakeover.shouldResumeTask) {
+    // A long, explicit new action may contain sequencing words such as
+    // "after completion". Those words describe the new action's reporting
+    // order; they must not let an unrelated active task replace routeText.
+    workTakeover = {
+      ...workTakeover,
+      shouldResumeTask: false,
+      routeText: input.text,
+    };
+  }
   const industryGuidanceRequest = !conceptualCapabilityQuestion
     && !statusOnlyContinuation
     && normalizedActionIntent.kind !== 'correction_explanation'
@@ -436,7 +460,7 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
     operationMode,
     requestedMode,
     input.channel,
-  ) || industryWorkflowExecutionRequested || Boolean(
+  ) || industryWorkflowExecutionRequested || designProjectStatusRequested || Boolean(
     explicitTeamExecution
     && operationMode === 'chat'
     && !requestedMode
@@ -468,8 +492,10 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
   const workSurfaceRoute = resolveWorkSurfaceRoute(routingText);
   const recoveredCurrentAppEdit = isRecoveredCurrentAppEditingContinuation(routingText);
   const explicitBackgroundDelegation = hasExplicitBackgroundDelegationPreference(input.text);
-  const allowToolUseForTurn = conceptualCapabilityQuestion || statusOnlyContinuation
+  const allowToolUseForTurn = conceptualCapabilityQuestion || (statusOnlyContinuation && !designProjectStatusRequested)
     ? false
+    : designProjectStatusRequested
+    ? true
     : industryGuidanceRequest
     ? true
     : chatModePureConversation

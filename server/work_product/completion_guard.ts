@@ -10,6 +10,7 @@ import {
   requiresCurrentAppUiMutation,
 } from '../cognition/action_contract';
 import { formatCnToolFailureDetail, isInternalExecutionDetail } from '../regions/packs/cn/voice_fast_path_messages';
+import { isDesignProjectStatusRequest } from '../design/status_intent';
 
 export interface CompletionGuardResult {
   text: string;
@@ -153,13 +154,13 @@ const OPEN_TOOL_RE =
   /^(desktop_open|client_action|computer_use|external_app_.*open|open_)/i;
 
 const ACTION_PROMISE_EVIDENCE_TOOL_RE =
-  /^(read_|extract_document_text|read_docx|read_pdf|pdf_to_text|ocr_image_file|transcribe_audio_to_text_file|desktop_open|desktop_capture_screen|desktop_ui_snapshot|capture_screen|computer_use|client_get_state|client_action|work_product_verify|create_|write_|generate_|export_|save_)/i;
+  /^(read_|extract_document_text|read_docx|read_pdf|pdf_to_text|ocr_image_file|transcribe_audio_to_text_file|desktop_open|desktop_capture_screen|desktop_ui_snapshot|capture_screen|computer_use|client_get_state|client_action|work_product_verify|interior_design_project_status|mcp_design-studio-pack_drawing_ingest_qa|create_|write_|generate_|export_|save_)/i;
 
 const READ_REVIEW_PROMISE_RE =
   /\b(?:read|open|check|review|analy[sz]e|inspect|process)\b|(?:\u8bfb\u53d6|\u8bfb\u4e00\u4e0b|\u8bfb\u4e0b|\u6253\u5f00|\u67e5\u770b|\u770b\u770b|\u5ba1\u67e5|\u5ba1\u9605|\u5206\u6790|\u68c0\u67e5|\u5904\u7406)/iu;
 
 const READ_REVIEW_EVIDENCE_TOOL_RE =
-  /^(read_|extract_document_text|read_docx|read_pdf|pdf_to_text|ocr_image_file|transcribe_audio_to_text_file|desktop_open|desktop_capture_screen|desktop_ui_snapshot|capture_screen|computer_use|client_get_state|client_action)/i;
+  /^(read_|extract_document_text|read_docx|read_pdf|pdf_to_text|ocr_image_file|transcribe_audio_to_text_file|desktop_open|desktop_capture_screen|desktop_ui_snapshot|capture_screen|computer_use|client_get_state|client_action|interior_design_project_status|mcp_design-studio-pack_drawing_ingest_qa)/i;
 
 const DESKTOP_ACTION_TASK_RE =
   /\b(?:desktop|screen|app|application|program|software|wechat|weixin|browser|open|launch|start|run)\b|(?:\u684c\u9762|\u5c4f\u5e55|\u5fae\u4fe1|\u5feb\u6377\u65b9\u5f0f|\u5e94\u7528|\u7a0b\u5e8f|\u8f6f\u4ef6|\u6253\u5f00|\u6253\u4e0d\u5f00|\u542f\u52a8|\u8fd0\u884c|\u5f00\u542f)/iu;
@@ -282,6 +283,62 @@ function parseStructuredToolResult(value: string): ParsedJsonToolResult {
       ? parsed as Record<string, unknown>
       : null,
   };
+}
+
+function hasVerifiedIndustryWorkflowCompletion(calls: ToolExecutionRecord[]): boolean {
+  return calls.some(call => {
+    if (call.name !== 'industry_workflow_complete' || call.error) return false;
+    if (call.terminalVerification?.status !== 'verified') return false;
+    const payload = parseStructuredToolResult(String(call.result || '')).payload;
+    const verification = payload?.verification && typeof payload.verification === 'object' && !Array.isArray(payload.verification)
+      ? payload.verification as Record<string, unknown>
+      : null;
+    return payload?.ok === true
+      && payload?.persisted === true
+      && String(payload?.status || '').toLowerCase() === 'verified'
+      && verification?.passed === true;
+  });
+}
+
+function hasVerifiedDesignProjectStatus(calls: ToolExecutionRecord[], task: string): boolean {
+  if (!isDesignProjectStatusRequest(task)) return false;
+  return calls.some(call => {
+    if (call.name !== 'interior_design_project_status' || call.error) return false;
+    if (call.terminalVerification?.status !== 'verified') return false;
+    const payload = parseStructuredToolResult(String(call.result || '')).payload;
+    return payload?.ok === true && payload?.persisted === true && Boolean((payload?.project as any)?.id);
+  });
+}
+
+function hasVerifiedDesignProjectCreation(calls: ToolExecutionRecord[], task: string): boolean {
+  const wantsProjectCreation = (
+    /(?:新建|创建|建立)[^。！？\n]{0,40}(?:室内|设计)?项目/u.test(task)
+    || /(?:new|create|establish)[^.!?\n]{0,48}(?:interior|design)?\s*project/i.test(task)
+  );
+  if (!wantsProjectCreation) return false;
+  return calls.some(call => {
+    if (call.name !== 'interior_design_project_create' || call.error) return false;
+    const payload = parseStructuredToolResult(String(call.result || '')).payload;
+    const project = payload?.project && typeof payload.project === 'object' && !Array.isArray(payload.project)
+      ? payload.project as Record<string, unknown>
+      : null;
+    return payload?.ok === true
+      && payload?.persisted === true
+      && payload?.active === true
+      && String(payload?.status || '').toLowerCase() === 'created'
+      && Boolean(String(project?.id || '').trim())
+      && Boolean(String(project?.name || '').trim());
+  });
+}
+
+function hasVerifiedDesignDrawingAssessment(calls: ToolExecutionRecord[], task: string): boolean {
+  if (!/(?:\bCAD\b|\bDXF\b|\bDWG\b|平面图|图纸).{0,36}(?:检查|质检|资料|完整|足够|缺失|核验)|(?:检查|质检|资料|完整|足够|缺失|核验).{0,36}(?:\bCAD\b|\bDXF\b|\bDWG\b|平面图|图纸)/iu.test(task)) return false;
+  return calls.some(call => (
+    call.name === 'mcp_design-studio-pack_drawing_ingest_qa'
+    && !call.error
+    && call.terminalVerification?.status === 'verified'
+    && Boolean(String(call.result || '').trim())
+  ));
 }
 
 const INCOMPLETE_TOOL_STATUSES = new Set([
@@ -528,7 +585,18 @@ export function guardCompletionClaims(input: CompletionGuardInput): CompletionGu
   const claimsCompletion = COMPLETION_CLAIM_RE.test(completionClaimText) || claimsSelfCompletion;
   if (!needsEvidence || !claimsCompletion) return { text: response, blocked: false };
 
-  const currentAppMutationTask = requiresCurrentAppUiMutation(task);
+  if (
+    hasVerifiedIndustryWorkflowCompletion(successful)
+    || hasVerifiedDesignProjectCreation(successful, task)
+    || hasVerifiedDesignProjectStatus(successful, task)
+    || hasVerifiedDesignDrawingAssessment(successful, task)
+  ) {
+    return { text: response, blocked: false };
+  }
+
+  const actionContract = buildActionContract(task);
+  const currentAppMutationTask = actionContract.kind === 'desktop_operation'
+    && requiresCurrentAppUiMutation(task);
   if (currentAppMutationTask && !hasCurrentAppUiMutationEvidence(toolCalls, task)) {
     const reason = 'Missing verified in-app UI mutation evidence.';
     return {
@@ -551,7 +619,6 @@ export function guardCompletionClaims(input: CompletionGuardInput): CompletionGu
     };
   }
 
-  const actionContract = buildActionContract(task);
   const hasDomainCompletionEvidence = actionContract.applies
     && hasCoreActionEvidence(actionContract, toolCalls, task);
   const unverifiedReceipts = hasDomainCompletionEvidence
@@ -568,6 +635,11 @@ export function guardCompletionClaims(input: CompletionGuardInput): CompletionGu
       reason,
     };
   }
+
+  // A domain action contract may deliberately complete without a file (for
+  // example creating and activating a durable design project). Its verified
+  // receipt is stronger than the generic file/action heuristics below.
+  if (hasDomainCompletionEvidence) return { text: response, blocked: false };
 
   const hasAnySuccess = successful.length > 0;
   const hasActionTool = successful.some(call => !INSPECTION_ONLY_TOOL_RE.test(call.name));

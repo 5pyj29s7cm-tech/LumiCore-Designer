@@ -181,6 +181,7 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     id: 'command-center',
     label: 'Lumi command center',
     target: 'command-center',
+    navigationAliases: ['Lumi 指挥中心', '指挥中心', 'command center'],
     actions: ['open_command_center', 'open_chat', 'open_team'],
     commandCenterViewByAction: {
       open_command_center: 'office',

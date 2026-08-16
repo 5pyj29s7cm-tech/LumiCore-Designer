@@ -10,6 +10,7 @@ import { guardCompletionClaims, needsCompletionEvidence } from '../work_product/
 import { hasVisibleAutoCadExecutionEvidence, requiresVisibleAutoCadExecution } from '../cognition/action_contract';
 import { guardCurrentAppToolCall } from '../cognition/current_app_execution';
 import { isConfirmationBlockedToolRecord } from '../tools/confirmation_block';
+import { isDesignProjectStatusRequest } from '../design/status_intent';
 import { executeToolCall } from '../tools/execution_engine';
 import {
   GENERIC_TOOL_PLANNING_PROMPT,
@@ -556,7 +557,13 @@ export async function runWithTools(
     : config.provider;
 
   const effectiveMaxIterations = Math.max(0, Math.min(maxIterations, context?.toolPolicy?.maxIterations ?? maxIterations));
-  for (let iteration = 0; iteration < effectiveMaxIterations; iteration++) {
+  // maxIterations=0 disables tools; it must not suppress the one model call
+  // needed for ordinary chat, explanations, corrections, and receipt recall.
+  let loopLimit = Math.max(1, effectiveMaxIterations);
+  let forceVerifiedIndustryFinalResponse = false;
+  let requiredIndustryReplans = 0;
+  let industryAssessmentFinalResponseReserved = false;
+  for (let iteration = 0; iteration < loopLimit; iteration++) {
     // Check for cancellation between iterations
     if (context?.isCancelled?.()) {
       return {
@@ -565,10 +572,11 @@ export async function runWithTools(
         usageRecords,
       };
     }
-    const toolDeclarations = toolRegistry.getToolDeclarationsForPolicy(
+    const policyToolDeclarations = toolRegistry.getToolDeclarationsForPolicy(
       context?.toolPolicy,
       { failClosedWithoutPolicy: context?.source === 'orchestrator' },
     );
+    const toolDeclarations = forceVerifiedIndustryFinalResponse ? [] : policyToolDeclarations;
     const exposedToolNames = new Set(toolDeclarations.map(declaration => declaration.function.name));
 
     const llmStart = Date.now();
@@ -640,6 +648,27 @@ export async function runWithTools(
     }
 
     if (!response.toolCalls || response.toolCalls.length === 0) {
+      const firstRequiredIndustryTool = context?.industryWorkflowRequiredToolReceipts?.[0] || '';
+      const attemptedRequiredIndustryAssessment = !firstRequiredIndustryTool
+        || executionLog.some(record => record.name === firstRequiredIndustryTool);
+      if (
+        firstRequiredIndustryTool
+        && !attemptedRequiredIndustryAssessment
+        && requiredIndustryReplans < 1
+        && exposedToolNames.has(firstRequiredIndustryTool)
+      ) {
+        requiredIndustryReplans += 1;
+        conversationHistory.push({
+          role: 'system',
+          content: [
+            `The bound industry contract requires an actual ${firstRequiredIndustryTool} receipt before an answer is accepted.`,
+            'Call that exact professional assessment tool now using only the server-bound source facts.',
+            'If the source is insufficient, record the missing facts in the tool arguments and stop downstream creation rather than guessing.',
+          ].join('\n'),
+        });
+        if (iteration + 1 >= loopLimit) loopLimit += 1;
+        continue;
+      }
       if (
         iteration === 0
         && executionLog.length === 0
@@ -728,6 +757,32 @@ export async function runWithTools(
         continue;
       }
 
+      const sameToolFailures = executionLog.filter(record => record.name === tc.name && Boolean(record.error)).length;
+      if (sameToolFailures >= 3) {
+        recordWorkflowIfToolsUsed(executionLog, messages, config);
+        const isZh = /[\u3400-\u9fff]/.test(primaryTask);
+        return {
+          text: isZh
+            ? `工具 ${tc.name} 已连续失败 3 次，本轮已停止重复调用。请检查精确输入、文件路径或服务状态后再继续；现有失败不能算作任务完成。`
+            : `Tool ${tc.name} failed three times, so repeated calls were stopped for this turn. Check the exact input, file path, or service health before continuing; the failed attempts are not task completion.`,
+          toolCalls: executionLog,
+          usageRecords,
+        };
+      }
+
+      const toolCallBudget = Math.max(8, Math.min(24, effectiveMaxIterations * 3));
+      if (executionLog.length >= toolCallBudget) {
+        recordWorkflowIfToolsUsed(executionLog, messages, config);
+        const isZh = /[\u3400-\u9fff]/.test(primaryTask);
+        return {
+          text: isZh
+            ? `本轮已达到 ${toolCallBudget} 次工具调用安全上限，已停止继续执行。请从现有真实回执继续，未验证的步骤不会标记为完成。`
+            : `This turn reached the ${toolCallBudget}-call safety limit and stopped. Continue from the existing receipts; unverified steps remain incomplete.`,
+          toolCalls: executionLog,
+          usageRecords,
+        };
+      }
+
       const currentAppGuard = guardCurrentAppToolCall({
         taskText: primaryTask,
         toolName: tc.name,
@@ -778,6 +833,65 @@ export async function runWithTools(
           usageRecords,
         };
       }
+    }
+
+    const verifiedIndustryCompletion = [...executionLog].reverse().find(record => {
+      if (record.name !== 'industry_workflow_complete' || record.error) return false;
+      try {
+        const parsed = JSON.parse(String(record.result || ''));
+        return parsed?.ok === true
+          && parsed?.status === 'verified'
+          && parsed?.verification?.passed === true;
+      } catch {
+        return false;
+      }
+    });
+    if (verifiedIndustryCompletion && !forceVerifiedIndustryFinalResponse) {
+      forceVerifiedIndustryFinalResponse = true;
+      conversationHistory.push({
+        role: 'system',
+        content: [
+          'The industry workflow now has a verified server receipt.',
+          'Write the final human-facing answer only from the domain-tool results already in this conversation.',
+          'State the verified deliverable paths, source constraints, assumptions or missing fields, risks, and the next review step.',
+          'Do not call another tool and do not claim external delivery or professional approval unless a separate receipt proves it.',
+        ].join('\n'),
+      });
+      if (iteration + 1 >= loopLimit) loopLimit += 1;
+    }
+
+    const verifiedDesignProjectStatus = [...executionLog].reverse().find(record => (
+      record.name === 'interior_design_project_status'
+      && !record.error
+      && record.terminalVerification?.status === 'verified'
+      && String(record.result || '').trim().length > 0
+    ));
+    if (
+      verifiedDesignProjectStatus
+      && isDesignProjectStatusRequest(primaryTask)
+      && !forceVerifiedIndustryFinalResponse
+    ) {
+      forceVerifiedIndustryFinalResponse = true;
+      conversationHistory.push({
+        role: 'system',
+        content: [
+          'The durable interior-design project status has been read successfully.',
+          'Answer now without another tool call.',
+          'Treat each workflow stage status, verificationStatus, blocker, completedStages, and nextStage as authoritative.',
+          'Do not reinterpret older artifact history as the current state, and do not claim that an uncompleted stage is done.',
+        ].join('\n'),
+      });
+      if (iteration + 1 >= loopLimit) loopLimit += 1;
+    }
+
+    const firstRequiredIndustryTool = context?.industryWorkflowRequiredToolReceipts?.[0] || '';
+    if (
+      firstRequiredIndustryTool
+      && !industryAssessmentFinalResponseReserved
+      && executionLog.some(record => record.name === firstRequiredIndustryTool)
+    ) {
+      industryAssessmentFinalResponseReserved = true;
+      if (iteration + 1 >= loopLimit) loopLimit += 1;
     }
 
     const readyWorkProduct = buildReadyWorkProductSummary(messages, executionLog);

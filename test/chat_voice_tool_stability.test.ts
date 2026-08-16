@@ -63,6 +63,8 @@ describe('chat and voice tool-call stability', () => {
     expect(restChat).toContain('finalizeLumiResponse');
     expect(restChat).toContain("source: 'rest_chat'");
     expect(restChat).toContain('blocked: finalized.blocked');
+    expect(restChat).toContain('do not call downstream creators merely to satisfy the receipt list');
+    expect(restChat).toContain('mergeIndustryWorkflowFinalState');
   });
 
   it('archives legal meeting analysis through the legal casework toolchain', () => {
@@ -108,8 +110,10 @@ describe('chat and voice tool-call stability', () => {
 
   it('keeps voice tool execution visible and aligned with chat permission behavior', () => {
     const voice = readFileSync(path.join(process.cwd(), 'server/socket/voice.ts'), 'utf8');
+    const restChat = readFileSync(path.join(process.cwd(), 'server/routes/chat_routes.ts'), 'utf8');
 
     expect(voice).toContain('shouldAllowVoiceLocalFileWriteForTurn');
+    expect(voice).toContain('shouldAllowExplicitLocalFileWrite');
     expect(voice).toContain('allowLocalFileWrites');
     expect(voice).toContain('localWriteIntentReason');
     expect(voice).toContain('emitToolLifecycle');
@@ -117,6 +121,14 @@ describe('chat and voice tool-call stability', () => {
     expect(voice).toContain('activeTurnRequestId');
     expect(voice).toContain("channel: payload.channel || 'voice'");
     expect(voice).toContain('onProgress');
+    expect(restChat).toContain('shouldAllowExplicitLocalFileWrite(localWriteAuthorizationText)');
+    expect(restChat).toContain('[routeText, industryWorkflowSourceInput]');
+    expect(restChat).toContain('allowLocalFileWrites,');
+    expect(restChat).toContain('localWriteIntentReason,');
+    expect(voice).toContain('startIndustryWorkflow({');
+    expect(voice).toContain('getIndustryWorkflowPrerequisiteStatus');
+    expect(voice).toContain('voice_industry_prerequisite_guard');
+    expect(voice).toContain('bindIndustryWorkflowToolPolicy');
   });
 
   it('keeps personal and organization knowledge retrieval aligned across text and voice', () => {

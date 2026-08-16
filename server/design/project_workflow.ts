@@ -174,9 +174,10 @@ export function getMissingInteriorProjectPrerequisites(
   workflow: InteriorProjectWorkflowState,
   entryId: InteriorDesignStageId,
 ): InteriorDesignStageId[] {
-  if (entryId !== 'handoff') return [];
+  const stageIndex = INTERIOR_DESIGN_STAGE_IDS.indexOf(entryId);
+  if (stageIndex <= 0) return [];
   return INTERIOR_DESIGN_STAGE_IDS
-    .slice(0, INTERIOR_DESIGN_STAGE_IDS.indexOf('handoff'))
+    .slice(0, stageIndex)
     .filter(stageId => workflow.stages[stageId].status !== 'completed');
 }
 

@@ -9,6 +9,7 @@ import {
   getActiveInteriorProject,
   personalInteriorProjectScope,
   setActiveInteriorProject,
+  updateInteriorProject,
 } from '../server/design/projects';
 import { getInteriorProjectWorkflow } from '../server/design/project_workflow';
 import {
@@ -56,6 +57,26 @@ function stageFile(directory: string, entryId: string): string[] {
   return [filePath];
 }
 
+function stageToolRecords(entryId: string): any[] {
+  const names: Record<string, string[]> = {
+    project: [
+      'mcp_design-studio-pack_interior_project_brief',
+      'mcp_design-studio-pack_space_planning_checklist',
+    ],
+    cad: ['mcp_design-studio-pack_drawing_ingest_qa', 'cad_generate_dxf'],
+    visualization: ['mcp_design-studio-pack_interior_visual_direction', 'generate_image'],
+    presentation: ['interior_design_project_status', 'create_ppt'],
+    handoff: ['interior_design_project_status', 'design_delivery_package_create'],
+  };
+  return (names[entryId] || []).map((name, index) => ({
+    id: `${entryId}-${index}`,
+    name,
+    arguments: {},
+    result: JSON.stringify({ ok: true, status: 'verified', summary: stageResult(entryId) }),
+    terminalVerification: { status: 'verified', strategy: 'terminal_receipt', reason: 'verified test receipt' },
+  }));
+}
+
 describe('designer project delivery loop', () => {
   it('persists an active project binding per user for voice and chat inheritance', () => {
     const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -99,6 +120,7 @@ describe('designer project delivery loop', () => {
         taskId: earlyHandoff.task.id,
         resultText: stageResult('handoff'),
         filePaths: stageFile(directory, 'handoff'),
+        toolRecords: stageToolRecords('handoff'),
       });
       expect(blockedHandoff.verification.passed).toBe(false);
       expect(blockedHandoff.verification.summary).toMatch(/upstream stages/i);
@@ -107,6 +129,7 @@ describe('designer project delivery loop', () => {
         ...scope,
         taskId: projectStage.task.id,
         resultText: stageResult('project'),
+        toolRecords: stageToolRecords('project'),
       });
       expect(projectResult.verification.passed).toBe(true);
 
@@ -118,6 +141,7 @@ describe('designer project delivery loop', () => {
           taskId: started.task.id,
           resultText: stageResult(entryId),
           filePaths: stageFile(directory, entryId),
+          toolRecords: stageToolRecords(entryId),
         });
         expect(recorded.verification.passed, `${entryId}: ${recorded.verification.summary}; ${JSON.stringify(recorded.verification.checks)}`).toBe(true);
       }
@@ -129,6 +153,7 @@ describe('designer project delivery loop', () => {
         taskId: resumedHandoff.task.id,
         resultText: stageResult('handoff'),
         filePaths: stageFile(directory, 'handoff'),
+        toolRecords: stageToolRecords('handoff'),
       });
       expect(delivered.verification.passed).toBe(true);
 
@@ -145,6 +170,15 @@ describe('designer project delivery loop', () => {
       expect(rootTask).toMatchObject({ status: 'completed', completionSource: 'tool_receipt' });
       const childTasks = db.conversationActionTasks.filter((task: any) => task.parentTaskId === workflow.rootTaskId);
       expect(childTasks.length).toBeGreaterThanOrEqual(5);
+
+      const statusRegistry = new ToolRegistry();
+      registerIndustryWorkflowTools(statusRegistry);
+      const projected = JSON.parse(await statusRegistry.execute('interior_design_project_status', {
+        projectId: project.id,
+      }, { userId, domain: 'personal', orgId: '' } as any));
+      expect(projected.workflow.completedStages).toEqual(['project', 'cad', 'visualization', 'presentation', 'handoff']);
+      expect(Object.values(projected.workflow.stages).flatMap((stage: any) => stage.artifacts)
+        .every((artifact: any) => Boolean(artifact.path) || artifact.status === 'delivered')).toBe(true);
     } finally {
       fs.rmSync(directory, { recursive: true, force: true });
     }
@@ -167,6 +201,277 @@ describe('designer project delivery loop', () => {
     const status = JSON.parse(await registry.execute('interior_design_project_status', {}, context));
     expect(status.project.id).toBe(created.project.id);
     expect(status.workflow.stages).toHaveProperty('handoff');
+  });
+
+  it('reports insufficient CAD source as a business blocker instead of a capability failure', async () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_cad_blocker_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, { name: 'CAD blocker project' });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const scope = { userId, domain: 'personal' as const, orgId: '' };
+    const projectStage = startIndustryWorkflow({ ...scope, entryId: 'project', source: 'chat' });
+    recordIndustryWorkflowExecution({
+      ...scope,
+      taskId: projectStage.task.id,
+      resultText: stageResult('project'),
+      toolRecords: stageToolRecords('project'),
+    });
+    const started = startIndustryWorkflow({ ...scope, entryId: 'cad', source: 'chat' });
+    const assessment = stageToolRecords('cad')[0];
+    assessment.result = JSON.stringify({
+      status: 'insufficient_verified_geometry',
+      evidenceGaps: ['No measured wall coordinates or openings'],
+    });
+
+    const recorded = recordIndustryWorkflowExecution({
+      ...scope,
+      taskId: started.task.id,
+      resultText: 'The source has no measured wall coordinates, openings, level heights, or verified dimensions, so drawing generation stopped without a placeholder.',
+      toolRecords: [assessment],
+    });
+
+    expect(recorded.task.status).toBe('blocked');
+    expect(recorded.verification.status).toBe('blocked');
+    expect(recorded.verification.summary).toMatch(/verified geometry/i);
+    expect(recorded.verification.summary).not.toMatch(/cad_generate_dxf/i);
+
+    const registry = new ToolRegistry();
+    registerIndustryWorkflowTools(registry);
+    const status = JSON.parse(await registry.execute('interior_design_project_status', {
+      projectId: project.id,
+    }, { userId, domain: 'personal', orgId: '' } as any));
+    expect(status.workflow.stages.cad.status).toBe('blocked');
+    expect(status.workflow.stages.cad.blocker).toMatch(/verified geometry/i);
+  });
+
+  it('reports a failed CAD generator honestly after source QA has passed', () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_cad_generator_blocker_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, { name: 'CAD generator blocker project' });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const scope = { userId, domain: 'personal' as const, orgId: '' };
+    const projectStage = startIndustryWorkflow({ ...scope, entryId: 'project', source: 'chat' });
+    recordIndustryWorkflowExecution({
+      ...scope,
+      taskId: projectStage.task.id,
+      resultText: stageResult('project'),
+      toolRecords: stageToolRecords('project'),
+    });
+    const started = startIndustryWorkflow({ ...scope, entryId: 'cad', source: 'chat' });
+    const assessment = stageToolRecords('cad')[0];
+    assessment.result = JSON.stringify({ status: 'ready_for_geometry_extraction', evidenceGaps: [] });
+    const generation = {
+      ...stageToolRecords('cad')[1],
+      result: '',
+      error: 'Tool "cad_generate_dxf" requires user confirmation: Local write actions require confirmation unless the current turn explicitly requested a local deliverable.',
+      terminalVerification: { status: 'failed', strategy: 'terminal_receipt', reason: 'confirmation required' },
+    };
+
+    const recorded = recordIndustryWorkflowExecution({
+      ...scope,
+      taskId: started.task.id,
+      resultText: 'The CAD file could not be created.',
+      toolRecords: [assessment, generation],
+    });
+
+    expect(recorded.task.status).toBe('blocked');
+    expect(recorded.verification.summary).toMatch(/did not run.*local-file authorization/i);
+    expect(recorded.verification.summary).not.toMatch(/does not contain enough verified geometry/i);
+  });
+
+  it('preserves the real image-provider blocker without exposing internal tool names', () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_visual_provider_blocker_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, { name: 'Visualization provider blocker' });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const scope = { userId, domain: 'personal' as const, orgId: '' };
+    const projectStage = startIndustryWorkflow({ ...scope, entryId: 'project', source: 'chat' });
+    recordIndustryWorkflowExecution({
+      ...scope,
+      taskId: projectStage.task.id,
+      resultText: stageResult('project'),
+      toolRecords: stageToolRecords('project'),
+    });
+    const cadStage = startIndustryWorkflow({ ...scope, entryId: 'cad', source: 'chat' });
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi-design-provider-blocker-'));
+    try {
+      recordIndustryWorkflowExecution({
+        ...scope,
+        taskId: cadStage.task.id,
+        resultText: stageResult('cad'),
+        filePaths: stageFile(directory, 'cad'),
+        toolRecords: stageToolRecords('cad'),
+      });
+      const visual = startIndustryWorkflow({ ...scope, entryId: 'visualization', source: 'chat' });
+      const direction = stageToolRecords('visualization')[0];
+      const failedImage = {
+        ...stageToolRecords('visualization')[1],
+        result: '',
+        error: 'All configured image providers failed: qwen: DashScope image error (Arrearage): Access denied.',
+        terminalVerification: { status: 'failed', strategy: 'provider_ack', reason: 'provider failure' },
+      };
+      const recorded = recordIndustryWorkflowExecution({
+        ...scope,
+        taskId: visual.task.id,
+        resultText: 'The visual direction is ready, but no image file was produced.',
+        toolRecords: [direction, failedImage],
+      });
+
+      expect(recorded.verification.summary).toMatch(/Image generation failed.*Arrearage/i);
+      expect(recorded.verification.summary).not.toMatch(/generate_image/i);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('does not archive historical paths returned by a read-only project-status receipt as new output', () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_status_path_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, { name: 'Read-only path project' });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const scope = { userId, domain: 'personal' as const, orgId: '' };
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi-design-status-path-'));
+    try {
+      const projectStage = startIndustryWorkflow({ ...scope, entryId: 'project', source: 'chat' });
+      recordIndustryWorkflowExecution({
+        ...scope,
+        taskId: projectStage.task.id,
+        resultText: stageResult('project'),
+        toolRecords: stageToolRecords('project'),
+      });
+      const cadStage = startIndustryWorkflow({ ...scope, entryId: 'cad', source: 'chat' });
+      recordIndustryWorkflowExecution({
+        ...scope,
+        taskId: cadStage.task.id,
+        resultText: stageResult('cad'),
+        filePaths: stageFile(directory, 'cad'),
+        toolRecords: stageToolRecords('cad'),
+      });
+      const historicalPpt = stageFile(directory, 'presentation')[0];
+      const presentation = startIndustryWorkflow({ ...scope, entryId: 'presentation', source: 'chat' });
+      const statusRecord = {
+        id: 'status-with-history',
+        name: 'interior_design_project_status',
+        arguments: { projectId: project.id },
+        result: JSON.stringify({
+          ok: true,
+          status: 'observed',
+          persisted: true,
+          project: { id: project.id },
+          workflow: { stages: { prior: { artifacts: [{ path: historicalPpt }] } } },
+        }),
+        terminalVerification: { status: 'verified', strategy: 'measured', reason: 'durable state' },
+        capability: {
+          capabilityId: 'design.project.status', lane: 'industry', operation: 'observe', risk: 'low',
+          sideEffects: [{ type: 'none', scope: 'project state', reversible: true }],
+          verification: { strategy: 'measured', required: true, requiredFields: [], successSignals: [], limitations: [] },
+        },
+      } as any;
+
+      const recorded = recordIndustryWorkflowExecution({
+        ...scope,
+        taskId: presentation.task.id,
+        resultText: 'Visualization is not complete, so no presentation was generated.',
+        toolRecords: [statusRecord],
+      });
+
+      expect(recorded.archivedFilePaths).toEqual([]);
+      expect(recorded.task.status).toBe('blocked');
+      expect(recorded.task.artifacts.some(artifact => artifact.path === historicalPpt)).toBe(false);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('writes the verified professional brief back to the durable project facts', async () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_brief_sync_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, {
+      name: 'Brief sync project',
+      brief: { area: '96 m2', constraints: 'Measured shell: 9600 x 10000 mm' },
+    });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const scope = { userId, domain: 'personal' as const, orgId: '' };
+    const started = startIndustryWorkflow({ ...scope, entryId: 'project', source: 'chat' });
+    const toolRecords = stageToolRecords('project');
+    toolRecords[0].result = JSON.stringify({
+      grossArea: '96 m2 measured shell',
+      occupants: 'Three-person household',
+      budget: 'CNY 350,000',
+      priorities: ['modern natural style', 'south daylight'],
+      requiredSpaces: ['three bedrooms', 'connected living and dining'],
+      existingConstraints: 'Measured shell: 9600 x 10000 mm; height 2800 mm',
+      decisions: ['verify structure and MEP before drawing'],
+    });
+
+    const recorded = recordIndustryWorkflowExecution({
+      ...scope,
+      taskId: started.task.id,
+      resultText: stageResult('project'),
+      toolRecords,
+    });
+
+    expect(recorded.verification.passed).toBe(true);
+    const updated = getActiveInteriorProject(scopeId, userId)!;
+    expect(updated.brief.occupants).toBe('Three-person household');
+    expect(updated.brief.budget).toBe('CNY 350,000');
+    expect(updated.brief.style).toContain('modern natural style');
+    expect(updated.brief.requirements).toContain('three bedrooms');
+    expect(updated.brief.constraints).toContain('height 2800 mm');
+
+    updateInteriorProject(scopeId, project.id, {
+      brief: { occupants: '', budget: '', style: '', requirements: '', constraints: '' },
+    });
+    const registry = new ToolRegistry();
+    registerIndustryWorkflowTools(registry);
+    const status = JSON.parse(await registry.execute('interior_design_project_status', {
+      projectId: project.id,
+    }, { userId, domain: 'personal', orgId: '' } as any));
+    expect(status.project.brief.occupants).toBe('Three-person household');
+    expect(status.project.brief.budget).toBe('CNY 350,000');
+    expect(status.project.brief.constraints).toContain('height 2800 mm');
+  });
+
+  it('never reuses a verified completion receipt from another workflow task', () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_cross_receipt_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, { name: 'Receipt isolation project' });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const scope = { userId, domain: 'personal' as const, orgId: '' };
+    const started = startIndustryWorkflow({ ...scope, entryId: 'project', source: 'chat' });
+    const delivered = recordIndustryWorkflowExecution({
+      ...scope,
+      taskId: started.task.id,
+      resultText: stageResult('project'),
+      toolRecords: stageToolRecords('project'),
+    });
+    expect(delivered.verification.passed).toBe(true);
+
+    const foreignReceipt: any = {
+      id: 'foreign-completion',
+      name: 'industry_workflow_complete',
+      arguments: { taskId: 'wt_task_foreign' },
+      result: JSON.stringify({
+        ok: true, status: 'verified', persisted: true,
+        task: { id: 'wt_task_foreign' }, verification: { passed: true },
+      }),
+      terminalVerification: { status: 'verified', strategy: 'terminal_receipt', reason: 'foreign receipt' },
+    };
+    const rejected = recordIndustryWorkflowExecution({
+      ...scope,
+      taskId: started.task.id,
+      resultText: stageResult('project'),
+      toolRecords: [foreignReceipt],
+    });
+    expect(rejected.verification.passed).toBe(false);
+    expect(rejected.task.status).not.toBe('delivered');
+    expect(rejected.verification.summary).toMatch(/Missing verified required capability receipts/i);
   });
 
   it('routes spoken project creation to the durable project tool before stage execution', () => {
@@ -195,6 +500,67 @@ describe('designer project delivery loop', () => {
       expect(pipeline.turnIntent.flow.industryWorkflowEntryId).toBe('project');
       expect(pipeline.execution.toolPolicy.allowedTools).toContain('interior_design_project_create');
       expect(pipeline.execution.promptOverlay).toContain('interior_design_project_create');
+    }
+  });
+
+  it('routes a natural project-name progress question to the aggregate project ledger', () => {
+    const registry = new ToolRegistry();
+    registerAllTools(registry);
+    for (const channel of ['voice', 'chat'] as const) {
+      const pipeline = buildLumiExecutionPipeline({
+        dispatch: {
+          userId: `design_project_status_${channel}`,
+          text: '澄境样板间现在进行到哪一步？',
+          channel,
+          source: channel,
+          operationMode: 'chat',
+          targetIsLumi: true,
+        },
+        registry,
+        source: channel,
+      });
+      expect(pipeline.execution.toolPolicy.allowedTools).toEqual(['interior_design_project_status']);
+    }
+  });
+
+  it('routes a named-project facts-and-progress question identically in voice and chat', () => {
+    const registry = new ToolRegistry();
+    registerAllTools(registry);
+    for (const channel of ['voice', 'chat'] as const) {
+      const pipeline = buildLumiExecutionPipeline({
+        dispatch: {
+          userId: `design_project_facts_${channel}`,
+          text: '矩衡验收户型A现在的项目事实和进度是什么？',
+          channel,
+          source: channel,
+          operationMode: 'chat',
+          targetIsLumi: true,
+        },
+        registry,
+        source: channel,
+      });
+      expect(pipeline.execution.toolPolicy.allowedTools).toEqual(['interior_design_project_status']);
+    }
+  });
+
+  it('does not misroute a named-project stage command as a status-only query', () => {
+    const registry = new ToolRegistry();
+    registerAllTools(registry);
+    for (const channel of ['voice', 'chat'] as const) {
+      const pipeline = buildLumiExecutionPipeline({
+        dispatch: {
+          userId: `design_project_visualization_${channel}`,
+          text: '矩衡验收户型A进入效果图阶段，先读取项目事实再开始生成。',
+          channel,
+          source: channel,
+          operationMode: 'chat',
+          targetIsLumi: true,
+        },
+        registry,
+        source: channel,
+      });
+      expect(pipeline.execution.toolPolicy.allowedTools).toContain('industry_workflow_start');
+      expect(pipeline.execution.toolPolicy.allowedTools).not.toEqual(['interior_design_project_status']);
     }
   });
 });

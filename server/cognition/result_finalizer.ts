@@ -42,6 +42,7 @@ import { CN_RESULT_GROUNDING_MESSAGES } from '../regions/packs/cn/voice_fast_pat
 import { CN_EXECUTION_EVIDENCE_MESSAGES } from '../regions/packs/cn/execution_evidence_messages';
 import { CN_EXTERNAL_AI_MESSAGES } from '../regions/packs/cn/external_ai_messages';
 import { coalesceToolExecutionRecords } from './task_execution_ledger';
+import { normalizeLegacyToolProtocolText } from '../llm/providers';
 import {
   hasContinuousStockWatchIntent,
   hasContinuousStockWatchEvidence,
@@ -86,11 +87,12 @@ function resultTaskText(input: LumiResultFinalizerInput): string {
 
 function leakedLegacyToolProtocol(input: LumiResultFinalizerInput): LumiResultFinalizerResult | null {
   const raw = String(input.responseText || '').trim();
-  const hasXmlProtocol = /<(?:function_calls|tool_calls|invoke)\b/i.test(raw);
+  const normalized = normalizeLegacyToolProtocolText(raw);
+  const hasXmlProtocol = /<(?:function_calls|tool_calls|invoke)\b/i.test(normalized);
   // i18n-allow: Chinese internal tool-protocol recognition; not user-visible copy.
   const hasBracketProtocol = /\[(?:[^\]\r\n]{1,48})\]\s*[A-Za-z][A-Za-z0-9_.:-]{1,127}\s*\([^\r\n)]*\)|\[(?:调用|call(?:ing)?|tool)\s+[A-Za-z][A-Za-z0-9_.:-]{1,127}\s*\](?:\s*\{)?/iu.test(raw);
   if (!hasXmlProtocol && !hasBracketProtocol) return null;
-  const names = Array.from(raw.matchAll(/<invoke\s+name=["']([^"']+)["']/gi), match => match[1]);
+  const names = Array.from(normalized.matchAll(/<invoke\s+name=["']([^"']+)["']/gi), match => match[1]);
   const clientStateRequested = names.includes('client_get_state');
   const chinese = isChineseText(resultTaskText(input));
   const text = chinese

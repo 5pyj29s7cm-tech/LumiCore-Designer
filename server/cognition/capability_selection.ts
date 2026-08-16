@@ -92,8 +92,8 @@ function availablePreferredTools(input: LumiCapabilitySelectionInput, lane: Lumi
     self_repair: ['client', 'system', 'desktop'],
     capability_learning: ['agents'],
     skill_workflow: ['agents'],
-    task_center: ['agents'],
-    work_takeover: ['agents'],
+    task_center: ['agents', 'general'],
+    work_takeover: ['agents', 'general'],
     legal_casework: ['industry', 'web', 'office'],
     messaging: ['messaging', 'desktop'],
     internal_memory: ['memory'],
@@ -107,11 +107,19 @@ function availablePreferredTools(input: LumiCapabilitySelectionInput, lane: Lumi
   const runtimeManifest = (input.registry || toolRegistry).getCapabilityManifest(input.execution.toolPolicy, {
     executableOnly: true,
   });
-  const manifest = runtimeManifest.length > 0
-    ? runtimeManifest
-    : routeTools.map(name => projectToolDeclarationForRouting({
+  const manifestedNames = new Set(runtimeManifest.map(entry => entry.toolName));
+  // Tests, startup recovery, and on-demand MCP registration can produce a
+  // mixed route: some tools already have runtime manifests while other valid
+  // declarations are only present in the route. Project just the missing
+  // entries instead of dropping them as soon as one runtime entry exists.
+  const manifest = [
+    ...runtimeManifest,
+    ...routeTools
+      .filter(name => !manifestedNames.has(name))
+      .map(name => projectToolDeclarationForRouting({
         function: { name, description: name.replace(/_/g, ' ') },
-      }));
+      })),
+  ];
   const manifestMatches = manifest
     .filter(entry => (
       available.has(entry.toolName)

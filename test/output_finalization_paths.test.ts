@@ -63,7 +63,7 @@ describe('finalized output paths', () => {
     expect(rest).toContain('createPreFinalizationTextGate');
     expect(rest).toContain('restTextGate.push(chunk)');
     expect(rest).toContain('if (!deferRestStream)');
-    expect(rest).toContain('toolPolicy: restExecutionDecision.toolPolicy');
+    expect(rest).toContain('toolPolicy: restToolPolicy');
     expect(rest).toContain('source: \'rest_chat_stream\'');
     expect(rest).toContain('finalized: true');
     expect(rest).toContain('blocked: finalized.blocked');

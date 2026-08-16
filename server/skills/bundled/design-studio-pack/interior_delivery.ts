@@ -6,6 +6,27 @@ export function splitInteriorList(value: unknown): string[] {
     .filter(Boolean);
 }
 
+const NEGATED_EVIDENCE_RE = /(?:^|[\s:：,，;；])(?:(?:no|none|not supplied|not provided|missing|without|unavailable|unknown)\b|无|未提供|没有|暂无|缺少|不含|未知)/i;
+const NON_SOURCE_DESCRIPTION_RE = /(?:仅有|只有|仅存在).*(?:需求|文字|描述|信息|面积)/i;
+const LINEAR_DIMENSION_RE = /(?:\d+(?:\.\d+)?(?:\s*[x×*]\s*\d+(?:\.\d+)?){0,2}\s*(?:mm|cm|m\b|毫米|厘米|米(?!方|²|2)))/i;
+
+function isPositiveEvidenceClaim(value: string): boolean {
+  const text = String(value || '').trim();
+  return Boolean(text) && !NEGATED_EVIDENCE_RE.test(` ${text}`);
+}
+
+function isPositiveSourceReference(value: string): boolean {
+  const text = String(value || '').trim();
+  return isPositiveEvidenceClaim(text) && !NON_SOURCE_DESCRIPTION_RE.test(text);
+}
+
+function isVerifiedLinearDimension(value: string): boolean {
+  const text = String(value || '').trim();
+  if (!isPositiveEvidenceClaim(text)) return false;
+  if (/(?:平方米|平方公尺|m\s*[²2]|sq\.?\s*m)/i.test(text) && !/(?:mm|cm|毫米|厘米)/i.test(text)) return false;
+  return LINEAR_DIMENSION_RE.test(text);
+}
+
 export function buildDrawingIngestQa(input: {
   projectName: string;
   sources: string | string[];
@@ -13,12 +34,16 @@ export function buildDrawingIngestQa(input: {
   evidenceNotes?: string;
   intendedUse?: string;
 }) {
-  const sources = splitInteriorList(input.sources);
-  const knownDimensions = splitInteriorList(input.knownDimensions);
+  const sourceClaims = splitInteriorList(input.sources);
+  const dimensionClaims = splitInteriorList(input.knownDimensions);
+  const sources = sourceClaims.filter(isPositiveSourceReference);
+  const knownDimensions = dimensionClaims.filter(isVerifiedLinearDimension);
+  const evidenceNotes = String(input.evidenceNotes || '').trim();
+  const hasPositiveProvenance = isPositiveEvidenceClaim(evidenceNotes);
   const gaps = [
     ...(sources.length ? [] : ['No source drawing or scan was supplied.']),
     ...(knownDimensions.length ? [] : ['No independently verified dimension was supplied for scale calibration.']),
-    ...(input.evidenceNotes?.trim() ? [] : ['No survey provenance, issue date, or drawing revision was supplied.']),
+    ...(hasPositiveProvenance ? [] : ['No survey provenance, issue date, or drawing revision was supplied.']),
   ];
   return {
     projectName: input.projectName,
@@ -27,8 +52,13 @@ export function buildDrawingIngestQa(input: {
     sources,
     intendedUse: input.intendedUse || 'space-planning base information',
     knownDimensions,
-    evidenceNotes: input.evidenceNotes || '',
+    evidenceNotes,
     evidenceGaps: gaps,
+    rejectedEvidenceClaims: [
+      ...sourceClaims.filter(value => !sources.includes(value)),
+      ...dimensionClaims.filter(value => !knownDimensions.includes(value)),
+      ...(!hasPositiveProvenance && evidenceNotes ? [evidenceNotes] : []),
+    ],
     toolSequence: [
       'read_pdf or ocr_image_file for legible source evidence',
       'mcp_paddleocr-local_pp_structurev3 for complex scanned layout and table extraction',

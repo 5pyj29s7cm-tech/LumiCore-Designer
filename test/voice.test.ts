@@ -90,7 +90,15 @@ describe('Voice API', () => {
     const doubaoBody = await doubao.json();
     expect(doubao.status).toBe(200);
     expect(doubaoBody.provider).toBe('ark');
-    expect(doubaoBody.premade).toHaveLength(12);
+    expect(doubaoBody.premade.length).toBeGreaterThanOrEqual(12);
+    expect(new Set(doubaoBody.premade.map((voice: any) => voice.voiceId)).size)
+      .toBe(doubaoBody.premade.length);
+    expect(doubaoBody.premade.map((voice: any) => voice.voiceId)).toEqual(expect.arrayContaining([
+      'zh_female_vv_uranus_bigtts',
+      'zh_male_dayi_uranus_bigtts',
+      'zh_male_m191_uranus_bigtts',
+      'zh_male_taocheng_uranus_bigtts',
+    ]));
     expect(doubaoBody.premade.every((voice: any) => voice.provider === 'ark')).toBe(true);
     expect(doubaoBody.cloned.every((voice: any) => voice.provider === 'ark')).toBe(true);
     expect(doubaoBody.capabilities).toEqual({ clone: true, design: false });

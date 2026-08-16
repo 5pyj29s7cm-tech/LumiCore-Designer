@@ -54,6 +54,20 @@ describe('Lumi result finalizer', () => {
     expect(result.text).toContain('没有读取到当前客户端状态');
   });
 
+  it('blocks raw DeepSeek DSML tool markup from reaching the user', async () => {
+    const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
+    const result = finalizeLumiResponse({
+      taskText: '进入效果图阶段。',
+      responseText: '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="industry_workflow_start"><｜｜DSML｜｜parameter name="entryId" string="true">visualization</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>',
+      toolRecords: [],
+      source: 'chat',
+    });
+
+    expect(result.blocked).toBe(true);
+    expect(result.text).not.toContain('DSML');
+    expect(result.text).not.toContain('industry_workflow_start');
+  });
+
   it('blocks a fabricated prior self-check explanation without diagnostic receipts', async () => {
     const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
 
@@ -832,6 +846,25 @@ describe('Lumi result finalizer', () => {
     expect(result.blocked).toBe(true);
     expect(result.text).toContain('not actually started');
     expect(result.reason).toContain('content-read/open/review');
+  });
+
+  it('accepts a verified design project status receipt as evidence for an upstream-stage review', async () => {
+    const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
+
+    const result = finalizeLumiResponse({
+      taskText: '核验设计项目全部上游阶段，未完成就不要生成交付包。',
+      responseText: '已核对项目账本：CAD 已完成，效果图和提案尚未完成，所以没有生成交付包。',
+      toolRecords: [{
+        name: 'interior_design_project_status',
+        arguments: { name: '矩衡验收户型A' },
+        result: JSON.stringify({ ok: true, status: 'observed', persisted: true, project: { id: 'p1' }, workflow: { stages: {} } }),
+        terminalVerification: { status: 'verified', strategy: 'measured', reason: 'durable project state returned' },
+      }],
+      source: 'rest_chat',
+    });
+
+    expect(result.text).toContain('已核对项目账本');
+    expect(result.text).not.toContain('没有真正开始读取');
   });
 
   it('keeps blocked background delegation results compact', async () => {

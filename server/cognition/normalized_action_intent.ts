@@ -123,11 +123,22 @@ function correctionOrExplanation(text: string): NormalizedActionIntent | null {
   // i18n-allow: Explicit correction prefaces remain explanation-only even when
   // the rest of the sentence contains a tool or usage verb.
   const explicitCorrection = /(?:\u4f60(?:\u641e\u9519|\u5f04\u9519)\u4e86?|\u4e0d\u662f\u8fd9\u4e2a\u610f\u601d|\u6211\u8bf4\u7684\u662f|\u6211\u53ea\u662f(?:\u95ee|\u60f3\u77e5\u9053))/u;
+  // A correction about the completeness or wording of Lumi's immediately
+  // prior answer stays conversational. Words such as "漏了" and "补充" must
+  // not be mistaken for a runtime failure or a fresh work task.
+  // i18n-allow: Chinese conversational correction recognition; not user-visible copy.
+  const responseCorrection = /(?:\u4f60|lumi)?[^\u3002\uff01\uff1f.!?\n]{0,24}(?:\u6f0f(?:\u4e86|\u6389)?|\u5c11(?:\u4e86|\u8bf4)|\u6ca1(?:\u6709)?(?:\u56de\u7b54|\u8bf4|\u8bb2)(?:\u5b8c|\u5b8c\u6574)|\u56de\u7b54(?:\u4e0d\u5b8c\u6574|\u5c11\u4e86|\u6f0f\u4e86)|\u53ea(?:\u9700|\u8981)?\u8865\u5145|\u8865\u5145(?:\u4e00\u53e5|\u56de\u7b54)|\u6539\u6b63(?:\u4e00\u4e0b)?(?:\u56de\u7b54|\u8bf4\u6cd5))/iu;
+  // An explicit request to stay tool-free is authoritative for this turn,
+  // even when the sentence mentions tools by name.
+  // i18n-allow: Multilingual explicit no-tool instruction recognition.
+  const explicitNoTool = /(?:\u4e0d\u8981|\u522b|\u65e0\u9700|\u4e0d\u7528).{0,16}(?:\u8c03\u7528|\u4f7f\u7528|\u6267\u884c|\u5f00\u542f).{0,8}(?:\u5de5\u5177|\u63d2\u4ef6|\u6280\u80fd)|\b(?:do\s+not|don'?t|without)\s+(?:call(?:ing)?|use|using|run(?:ning)?)\s+(?:any\s+)?(?:tools?|plugins?|skills?)\b/iu;
   if (
     !negativeAuthorization.test(text)
     && !actionComplaint.test(text)
     && !terseComplaint.test(text)
     && !explicitCorrection.test(text)
+    && !responseCorrection.test(text)
+    && !explicitNoTool.test(text)
   ) return null;
   return {
     kind: 'correction_explanation',

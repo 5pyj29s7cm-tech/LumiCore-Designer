@@ -311,6 +311,7 @@ function useDesignChat(locale: InteriorDesignLocale, onWorkflowChange?: () => vo
         signal: controller.signal,
         body: JSON.stringify({
           industryWorkflowTaskId: started.task.id,
+          industryWorkflowSourceInput: workflow.sourceInput,
           messages: [{ role: 'user', content: `${started.handoffPrompt}\n\n${prompt}` }],
         }),
       });

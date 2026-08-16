@@ -51,6 +51,35 @@ describe('Lumi turn flow', () => {
     expect(flow.routeText).toBe('为什么不回我');
   });
 
+  it.each(['chat', 'voice'] as const)('keeps an answer-completeness correction tool-free in %s', async (channel) => {
+    const { initDatabase } = await import('../db_layer');
+    const { buildLumiTurnFlow } = await import('../server/cognition/turn_flow');
+    const { normalizeActionIntent } = await import('../server/cognition/normalized_action_intent');
+    await initDatabase();
+
+    const text = '你漏了第二句。只补充一句：你不能保证什么？不要调用工具。';
+    expect(normalizeActionIntent(text)).toMatchObject({
+      kind: 'correction_explanation',
+      operation: 'explain',
+      sideEffectClass: 'none',
+      relation: 'correction',
+    });
+
+    const flow = buildLumiTurnFlow({
+      userId: `turn_flow_answer_correction_${channel}`,
+      text,
+      channel,
+      source: channel === 'chat' ? 'command-center-chat' : 'voice',
+      operationMode: 'assistant',
+      targetIsLumi: true,
+    });
+
+    expect(flow.selfRepairTurn).toBe(false);
+    expect(flow.clientActionOnlyTurn).toBe(false);
+    expect(flow.allowToolUseForTurn).toBe(false);
+    expect(flow.completionEvidenceNeeded).toBe(false);
+  });
+
   it('keeps artifact inspection and repair on ordinary work routes', async () => {
     const { initDatabase } = await import('../db_layer');
     const { buildLumiTurnFlow } = await import('../server/cognition/turn_flow');
@@ -187,6 +216,35 @@ describe('Lumi turn flow', () => {
     expect(flow.workTakeover.shouldResumeTask).toBe(false);
     expect(flow.allowToolUseForTurn).toBe(false);
     expect(flow.promptOverlay).toContain('Do not force a task/tool path');
+  });
+
+  it('does not let an active task hijack a specific new AutoCAD action', async () => {
+    const { initDatabase } = await import('../db_layer');
+    const { createWorkTakeoverTask } = await import('../server/work_takeover/tasks');
+    const { buildLumiTurnFlow } = await import('../server/cognition/turn_flow');
+    await initDatabase();
+
+    createWorkTakeoverTask({
+      userId: 'turn_flow_new_autocad_action_user',
+      category: 'general_work',
+      title: '历史设计任务',
+      nextActions: ['继续准备历史交付物'],
+      source: 'manual',
+      status: 'in_progress',
+    });
+
+    const text = '外部软件协同复测：请通过 mcp_cad-drafting_autocad_new_document 在真实 AutoCAD 中新建一个空白图纸，完成后只根据工具回执说明结果。';
+    const flow = buildLumiTurnFlow({
+      userId: 'turn_flow_new_autocad_action_user',
+      text,
+      channel: 'chat',
+      source: 'rest_chat',
+      operationMode: 'assistant',
+    });
+
+    expect(flow.workTakeover.shouldResumeTask).toBe(false);
+    expect(flow.routeText).toBe(text);
+    expect(flow.allowToolUseForTurn).toBe(true);
   });
 
   it('binds assistant work-surface follow-ups to the task center', async () => {

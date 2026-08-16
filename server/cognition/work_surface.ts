@@ -110,15 +110,9 @@ export function resolveWorkSurfaceRoute(text: string): WorkSurfaceRoute {
       : forbidComputerUse
       ? {
           allowedTools: ['*'],
-          requireConfirmation: [
-            'write_file',
-            'web_search',
-            'url_fetch',
-            'read_file',
-            'read_files_batch',
-            'search_files',
-            'grep_files',
-          ],
+          // Scoped observation is not an external side effect. File and public
+          // web reads stay automatic; unbound writes keep their normal gate.
+          requireConfirmation: ['write_file'],
           forbiddenTools: ['computer_use', 'desktop_run_command', 'run_command'],
           maxIterations: 12,
         }

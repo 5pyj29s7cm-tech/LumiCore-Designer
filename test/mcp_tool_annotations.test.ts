@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   resolveMCPToolCapability,
   resolveMCPToolOperation,
@@ -101,5 +103,31 @@ describe('MCP standard tool annotations', () => {
     expect(resolveMCPToolSecurity(tool(), declaredRead)).toBe('safe');
     expect(resolveMCPToolOperation(tool(), declaredRead)).toBe('observe');
     expect(resolveMCPToolSecurity(tool())).toBe('confirm');
+  });
+
+  it('allows the bundled design studio analysis tools without a confirmation prompt', () => {
+    const designManifest = JSON.parse(
+      readFileSync(join(process.cwd(), 'server', 'skills', 'bundled', 'design-studio-pack', 'package.json'), 'utf8'),
+    );
+    const config: MCPServerConfig = {
+      enabled: true,
+      source: 'local',
+      capabilityDefault: designManifest.lumi.capabilityDefault,
+    };
+    const briefTool: MCPToolDef = {
+      serverName: 'design-studio-pack',
+      name: 'mcp_design-studio-pack_interior_project_brief',
+      inputSchema: { type: 'object', properties: {} },
+    };
+
+    expect(resolveMCPToolSecurity(briefTool, config)).toBe('safe');
+    expect(resolveMCPToolOperation(briefTool, config)).toBe('observe');
+    expect(resolveMCPToolCapability(briefTool, config)).toMatchObject({
+      lane: 'industry',
+      operation: 'observe',
+      risk: 'low',
+      sideEffects: [],
+      provenance: { trust: 'official' },
+    });
   });
 });

@@ -264,6 +264,13 @@ export interface ToolContext {
   source?: string;
   /** Current canonical records from this exact model tool loop, before the active call. */
   getCurrentToolRecords?: () => ToolExecutionRecord[];
+  /** Transient source text whose digest matches the bound industry task. */
+  industryWorkflowSourceInput?: string;
+  industryWorkflowTaskId?: string;
+  industryWorkflowEntryId?: string;
+  industryWorkflowProductLine?: string;
+  /** Canonical receipt tools required by the bound industry contract. */
+  industryWorkflowRequiredToolReceipts?: string[];
 }
 
 export interface ToolDefinition {

@@ -26,11 +26,18 @@ describe('image generation model routing', () => {
       video: { provider: 'qwen' },
     });
 
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ data: [{ url: 'https://example.test/generated.png' }] }),
-    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [{ url: 'https://example.test/generated.png' }] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'image/png' },
+        arrayBuffer: async () => new Uint8Array(32).fill(1).buffer,
+      });
     vi.stubGlobal('fetch', fetchMock);
 
     const registry = new ToolRegistry();
@@ -46,9 +53,14 @@ describe('image generation model routing', () => {
       success: true,
       provider: 'siliconflow',
       model: 'stabilityai/stable-diffusion-3-5-large',
-      images: ['https://example.test/generated.png'],
+      images: [expect.stringMatching(/generated_image_siliconflow_.+\.png$/)],
+      artifacts: [{
+        type: 'image',
+        path: expect.stringMatching(/generated_image_siliconflow_.+\.png$/),
+        url: 'https://example.test/generated.png',
+      }],
     });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock.mock.calls[0][0]).toBe('https://api.siliconflow.cn/v1/images/generations');
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
       model: 'stabilityai/stable-diffusion-3-5-large',

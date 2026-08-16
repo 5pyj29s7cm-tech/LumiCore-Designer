@@ -8,6 +8,7 @@ import {
 import { classifyRuntimeWorkIntent } from './runtime_work_intent';
 import { CN_ACTION_CONTRACT_BLOCKERS } from '../regions/packs/cn/voice_fast_path_messages';
 import { normalizeActionIntent } from './normalized_action_intent';
+import { isDesignProjectStatusRequest } from '../design/status_intent';
 
 export type LumiActionContractKind =
   | 'none'
@@ -157,6 +158,15 @@ export function requestedDesktopWindowAction(input: string): DesktopWindowAction
 export function requiresCurrentAppUiMutation(input: string): boolean {
   const raw = String(input || '');
   const primary = compact(extractPrimaryTaskText(input));
+  // AutoCAD has dedicated COM/MCP contracts whose receipts prove mutations in
+  // the external CAD application. Treating those requests as generic current-
+  // app UI editing makes the WPS/UIA evidence gate reject a real CAD receipt.
+  // Keep the generic gate for ordinary authoring-app keyboard/UI work only.
+  if (
+    requestsBlankAutoCadDocument(primary)
+    || requiresVisibleAutoCadExecution(primary)
+    || requiresAutoCadMcpPlayback(primary)
+  ) return false;
   const hasRecoveredTarget = /(?:^|\r?\n)\s*-\s*appTarget:\s*(?!none|null|unknown|n\/a)[^\r\n]+/i.test(raw);
   const authoringTarget = primary.match(AUTHORING_APP_TARGET_RE);
   const openIntent = primary.match(APP_OPEN_INTENT_RE);
@@ -1800,6 +1810,27 @@ export function hasVerifiedCadGeometryExtractionEvidence(
 }
 
 function hasDesignDeliveryEvidence(records: ToolExecutionRecord[], taskText: string): boolean {
+  const wantsProjectStatus = isDesignProjectStatusRequest(taskText);
+  if (wantsProjectStatus) {
+    return records.some(record => {
+      if (record.name !== 'interior_design_project_status' || record.error) return false;
+      const payload = parseRecordJson(record);
+      return payload?.ok === true
+        && payload?.persisted === true
+        && Boolean(compact(payload?.project?.id));
+    });
+  }
+  const wantsProjectCreation = /(?:新建|创建).{0,12}(?:室内)?设计项目|(?:new|create).{0,18}(?:interior|design)\s+project/iu.test(taskText);
+  if (wantsProjectCreation) {
+    return records.some(record => {
+      if (record.name !== 'interior_design_project_create' || record.error) return false;
+      const payload = parseRecordJson(record);
+      return payload?.ok === true
+        && payload?.persisted === true
+        && payload?.active === true
+        && Boolean(compact(payload?.project?.id));
+    });
+  }
   const sourceRequired = requiresSourceGrounding(taskText);
   const wantsCompositePackage = /(?:\u5168\u5957\u8bbe\u8ba1|\u5168\u6848\u8bbe\u8ba1|\u5b8c\u6574\u4ea4\u4ed8\u5305|\u8bbe\u8ba1\u4ea4\u4ed8|\u88c5\u4fee\u4ea4\u4ed8|full\s+(?:design|renovation|interior)|design\s+(?:delivery|package|handoff))/iu.test(taskText);
   const wantsCad = /(?:\bCAD\b|\bDXF\b|\bDWG\b|AutoCAD|\u65bd\u5de5\u56fe|\u5e73\u9762\u56fe)/iu.test(taskText);

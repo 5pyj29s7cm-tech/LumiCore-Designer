@@ -229,6 +229,37 @@ describe('AutoCAD MCP operation preparation', () => {
     })).rejects.toThrow(/width and height must be positive finite values/i);
   });
 
+  it('frames preview dimensions and outward door swings without clipping them', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi_cad_preview_frame_'));
+    try {
+      const registry = new ToolRegistry();
+      registerExternalAppTools(registry);
+      const result = JSON.parse(await registry.execute('cad_generate_dxf', {
+        title: 'preview framing',
+        outputDirectory: dir,
+        width: 9600,
+        height: 10000,
+        unit: 'mm',
+        walls: [{ x1: 0, y1: 6000, x2: 9600, y2: 6000, thickness: 120 }],
+        doors: [{ hingeX: 800, hingeY: 0, width: 900, angle: 0 }],
+        dimensions: [{ x1: 0, y1: 0, x2: 9600, y2: 0, offset: -600, text: '9600' }],
+      }, {
+        allowLocalFileWrites: true,
+        actionIntent: 'Generate a local DXF and SVG preview.',
+      } as any));
+      const svg = fs.readFileSync(result.previewPath, 'utf8');
+      const viewBox = svg.match(/viewBox="([^"]+)"/)?.[1].split(/\s+/).map(Number) || [];
+
+      expect(viewBox).toHaveLength(4);
+      expect(viewBox[0]).toBeLessThanOrEqual(-1200);
+      expect(viewBox[1]).toBeLessThanOrEqual(-1200);
+      expect(viewBox[1] + viewBox[3]).toBeGreaterThanOrEqual(11600);
+      expect(svg).toContain('>9600</text>');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects image-grounded geometry without a verified receipt', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi_autocad_unverified_'));
     try {

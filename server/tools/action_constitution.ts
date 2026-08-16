@@ -23,6 +23,7 @@ const SOCIAL_CONTENT_COMMIT_PATTERN =
 const CONTENT_SUBMIT_PATTERN =
   /\bsubmit\b.{0,40}\b(?:comment|reply|message|post|video|content|draft|text)\b|\b(?:comment|reply|message|post|video|content|draft|text)\b.{0,40}\bsubmit\b|(?:\u63d0\u4ea4|\u53d1\u9001).{0,16}(?:\u8bc4\u8bba|\u56de\u590d|\u7559\u8a00|\u89c6\u9891|\u5185\u5bb9|\u6587\u6848)/i;
 const GENERIC_EXTERNAL_COMMIT_PATTERN = /\b(?:submit|confirm|approve|authorize|sign|file)\b|(?:\u63d0\u4ea4|\u786e\u8ba4|\u6388\u6743|\u7b7e\u7f72|\u7acb\u6848)/i;
+const NEGATED_EXTERNAL_COMMIT_PHRASE_RE = /(?:不|未|没有|无需|禁止|暂不|先不|不要|不允许|不需要|并不|并未).{0,10}(?:发送|发布|发表|评论|回复|分享|私信|留言|提交|确认|授权|签署|立案)|\b(?:do\s+not|don't|never|without|not\s+to)\b.{0,24}\b(?:send|post|publish|comment|reply|share|message|submit|confirm|approve|authorize|sign|file)\b/giu;
 const HIGH_CONSEQUENCE_EXTERNAL_PATTERN =
   /\b(?:purchase|buy|transfer|pay|payment|checkout|bank|wire|charge|refund|withdraw|deposit|ad\s*spend|ads?|inventory|price|legal\s*filing|court\s*filing|file\s+case|lawsuit|signature|contract\s*execute|place\s+(?:a\s+)?(?:trade|order)|submit\s+(?:a\s+)?(?:trade|order)|cancel\s+(?:a\s+)?order|buy\s+order|sell\s+order|real\s+(?:trade|trading|order)|brokerage\s+(?:trade|order)|trading\s+password)\b|(?:\u4ed8\u6b3e|\u652f\u4ed8|\u8f6c\u8d26|\u8d2d\u4e70|\u4e0b\u5355|\u7ed3\u8d26|\u94f6\u884c|\u8ba2\u5355|\u6295\u653e|\u5e7f\u544a\u8d39|\u6539\u4ef7|\u4ef7\u683c|\u5e93\u5b58|\u7acb\u6848|\u8d77\u8bc9|\u5ead\u5ba1|\u6cd5\u9662|\u7b7e\u7f72|\u5408\u540c\u751f\u6548|\u4e70\u5165|\u5356\u51fa|\u59d4\u6258|\u64a4\u5355|\u6210\u4ea4\u786e\u8ba4|\u4ea4\u6613\u5bc6\u7801|\u5238\u5546\u4ea4\u6613|\u94f6\u8bc1\u8f6c\u8d26|\u5b9e\u76d8|\u771f\u5b9e\u4e0b\u5355|\u80a1\u7968\u4e0b\u5355)/i;
 const ACCOUNT_SECURITY_PATTERN =
@@ -121,7 +122,7 @@ export function evaluateActionConstitution(
   }
 
   if (
-    GENERIC_EXTERNAL_COMMIT_PATTERN.test(actionText) &&
+    hasGenericExternalCommitIntent(actionText) &&
     !isSocialContentCommit(actionText, toolName) &&
     isExternalStateChangingDomain(domain)
   ) {
@@ -197,7 +198,7 @@ export function classifyActionRisk(
   if (isLowFrictionAuthorizedWebLoginAction(toolName, args)) return 'medium';
   if (isTrustedDesktopRunCommand(toolName, args) || isAutocadPlaybackAction(toolName, args)) return 'medium';
   if (externalStateChanging && isHighConsequenceExternalCommit(actionText, toolName)) return 'high';
-  if (externalStateChanging && GENERIC_EXTERNAL_COMMIT_PATTERN.test(actionText) && !isSocialContentCommit(actionText, toolName)) return 'high';
+  if (externalStateChanging && hasGenericExternalCommitIntent(actionText) && !isSocialContentCommit(actionText, toolName)) return 'high';
   if (externalStateChanging && isSocialContentCommit(actionText, toolName)) return 'medium';
   if (manifestRisk === 'critical' || manifestRisk === 'high') return 'high';
   if (manifestRisk === 'medium') return 'medium';
@@ -213,7 +214,7 @@ export function canAutoApproveAction(toolName: string, args: Record<string, any>
   const actionText = buildActionText(toolName, args, context);
   if (
     isExternalStateChangingDomain(domain)
-    && (isSocialContentCommit(actionText, toolName) || GENERIC_EXTERNAL_COMMIT_PATTERN.test(actionText))
+    && (isSocialContentCommit(actionText, toolName) || hasGenericExternalCommitIntent(actionText))
   ) return false;
   return !['system', 'destructive'].includes(domain);
 }
@@ -312,6 +313,14 @@ function buildActionText(toolName: string, args: Record<string, any> = {}, conte
   return `${toolName} ${JSON.stringify(args || {})} ${context?.actionIntent || ''}`.toLowerCase();
 }
 
+function externalCommitIntentText(actionText: string): string {
+  return String(actionText || '').replace(NEGATED_EXTERNAL_COMMIT_PHRASE_RE, ' ');
+}
+
+function hasGenericExternalCommitIntent(actionText: string): boolean {
+  return GENERIC_EXTERNAL_COMMIT_PATTERN.test(externalCommitIntentText(actionText));
+}
+
 function isExternalStateChangingDomain(domain: ActionDomain): boolean {
   return domain === 'messaging' || domain === 'external_app' || domain === 'desktop_control';
 }
@@ -358,12 +367,13 @@ function isLowFrictionAuthorizedWebLoginAction(toolName: string, args: Record<st
 
 function isSocialContentCommit(actionText: string, toolName = ''): boolean {
   if (isPreparationOnlyAction(toolName)) return false;
-  return SOCIAL_CONTENT_COMMIT_PATTERN.test(actionText) || CONTENT_SUBMIT_PATTERN.test(actionText);
+  const intentText = externalCommitIntentText(actionText);
+  return SOCIAL_CONTENT_COMMIT_PATTERN.test(intentText) || CONTENT_SUBMIT_PATTERN.test(intentText);
 }
 
 function isHighConsequenceExternalCommit(actionText: string, toolName = ''): boolean {
   if (HIGH_CONSEQUENCE_EXTERNAL_PATTERN.test(actionText) || ACCOUNT_SECURITY_PATTERN.test(actionText)) return true;
-  return GENERIC_EXTERNAL_COMMIT_PATTERN.test(actionText) && !isSocialContentCommit(actionText, toolName);
+  return hasGenericExternalCommitIntent(actionText) && !isSocialContentCommit(actionText, toolName);
 }
 
 function isPreparationOnlyAction(toolName: string): boolean {

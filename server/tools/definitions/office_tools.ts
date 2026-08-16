@@ -11,6 +11,7 @@ import { getGeneratedOutputDir } from '../../config/data_path';
 
 const execFileAsync = promisify(execFile);
 const OUTPUT_DIR = getGeneratedOutputDir();
+const PptxGenJSConstructor = ((PptxGenJS as any)?.default || PptxGenJS) as typeof PptxGenJS;
 
 let broadcastFn: ((event: string, data: any) => void) | null = null;
 
@@ -119,7 +120,7 @@ async function createPptHandler(args: Record<string, any>): Promise<string> {
 
   try {
     const resolvedTopImages = await Promise.all(topLevelImages.map(image => resolvePresentationImage(image, tmpDir, cache)));
-    const pptx = new PptxGenJS();
+    const pptx = new PptxGenJSConstructor();
     pptx.layout = 'LAYOUT_WIDE';
     pptx.author = 'Lumi';
     pptx.company = 'LumiOS';

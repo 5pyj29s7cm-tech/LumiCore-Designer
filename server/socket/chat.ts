@@ -20,6 +20,7 @@ import { getStoredOperationMode, saveStoredOperationMode } from "../cognition/op
 import { buildInteractionModeOverlay } from "../cognition/turn_flow";
 import { buildLumiCapabilitySelection } from "../cognition/capability_selection";
 import { buildLumiExecutionPipeline } from "../cognition/execution_pipeline";
+import { shouldAllowExplicitLocalFileWrite } from "../cognition/local_write_intent";
 import { shouldRunLegacyDirectExecution } from "../cognition/legacy_route_policy";
 import { bindCapabilityExecutionPlanTask } from "../cognition/capability_execution_plan";
 import { buildForegroundMessagingArguments, executeForegroundMessagingAction } from "../cognition/foreground_messaging_execution";
@@ -346,6 +347,7 @@ function buildStoredAttachmentSummary(userText: string, attachments: ChatIncomin
 function shouldAllowLocalFileWriteForTurn(userText: string, attachments: ChatIncomingAttachment[]): boolean {
   const clean = String(userText || '').trim();
   if (!clean) return false;
+  if (shouldAllowExplicitLocalFileWrite(clean)) return true;
   if (/(?:不要|别|不用|无需|先别|暂时别).{0,12}(?:生成|创建|写入|保存|导出|输出|做成|整理成)/iu.test(clean)) return false;
 
   const explicitDeliverable =

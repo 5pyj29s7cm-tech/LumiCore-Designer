@@ -673,7 +673,10 @@ function buildCadPreviewSvg(args: Record<string, any>, title: string): string {
   const wallThickness = asFiniteNumber(args.wallThickness, 0);
   const outerBoundary = normalizeCadBoundary(args);
   const sourceLineworkOwnsOutline = args?.sourceTopology?.traceMode === 'opencv_source_linework';
-  const margin = Math.max(width, height) * 0.05;
+  // Keep enough preview-only framing for outward door swings, dimension text,
+  // and the title above the drawing. Five percent clipped common 900 mm door
+  // arcs and negative-offset overall dimensions on residential millimetre plans.
+  const margin = Math.max(width, height) * 0.12;
   const titleBlockMargin = args.titleBlock === false ? 0 : Math.max(900, height * 0.12);
   const viewBox = `${-margin} ${-margin} ${width + margin * 2} ${height + margin * 2 + titleBlockMargin}`;
   const strokeWidth = Math.max(1, Math.min(width, height) / 260);
@@ -686,8 +689,10 @@ function buildCadPreviewSvg(args: Record<string, any>, title: string): string {
   const parts: string[] = [
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="960" height="640">`,
     '<rect x="-100000" y="-100000" width="200000" height="200000" fill="#08111f"/>',
-    svgText(0, -margin * 0.35, title, textSize, '#9fb7d8'),
   ];
+  if (args.titleBlock === false) {
+    parts.push(svgText(0, -margin * 0.55, title, textSize, '#9fb7d8'));
+  }
   if (outerBoundary.length >= 3 && !sourceLineworkOwnsOutline) {
     parts.push(`<polygon points="${pointAttr(outerBoundary)}" fill="none" stroke="#38bdf8" stroke-width="${strokeWidth * 1.4}"/>`);
   } else if (!isImageCadSource(args.sourcePath) && args.rectangularOutline !== false) {

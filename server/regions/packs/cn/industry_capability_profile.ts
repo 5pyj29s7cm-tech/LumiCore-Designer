@@ -132,6 +132,10 @@ function normalizeText(value: unknown): string {
   return String(value || '').toLowerCase().replace(/[\s\-_—–/\\]+/g, ' ').trim();
 }
 
+function normalizeCompactMatchText(value: unknown): string {
+  return normalizeText(value).replace(/\s+/g, '');
+}
+
 export function getCurrentIndustryCapabilityProfile(): IndustryCapabilityProfile | null {
   const productLine = currentProductLine();
   if (!productLine) return null;
@@ -164,6 +168,7 @@ export function getCurrentIndustryCapabilityProfile(): IndustryCapabilityProfile
 export function matchCurrentIndustryWorkflow(text: unknown): IndustryWorkflowMatch | null {
   const profile = getCurrentIndustryCapabilityProfile();
   const normalized = normalizeText(text);
+  const compactNormalized = normalizeCompactMatchText(text);
   if (!profile || !normalized) return null;
 
   const candidates = profile.entries.map(entry => {
@@ -171,7 +176,8 @@ export function matchCurrentIndustryWorkflow(text: unknown): IndustryWorkflowMat
     let score = 0;
     for (const rawTerm of entry.routingTerms) {
       const term = normalizeText(rawTerm);
-      if (!term || !normalized.includes(term)) continue;
+      const compactTerm = normalizeCompactMatchText(rawTerm);
+      if (!term || (!normalized.includes(term) && !compactNormalized.includes(compactTerm))) continue;
       matchedTerms.push(rawTerm);
       score += normalized === term ? 100 : 18 + Math.min(term.length, 16);
     }
@@ -192,6 +198,8 @@ export function matchCurrentIndustryWorkflow(text: unknown): IndustryWorkflowMat
 export function isCurrentIndustryWorkflowExecutionRequest(text: unknown): boolean {
   const normalized = String(text || '').trim();
   if (!matchCurrentIndustryWorkflow(normalized)) return false;
+  if (/(?:做完|完成|进度|状态|结果).{0,10}(?:吗|呢|如何|怎样|怎么|没有)|(?:是否|是不是).{0,20}(?:完成|做完)/u.test(normalized)) return false;
+  if (/(?:不要|不用|无需|不需要|禁止).{0,16}(?:执行|开始|创建|生成|调用|工具|新任务)/u.test(normalized)) return false;
   if (/(?:是什么|有哪些|能做什么|会做什么|怎么用|如何使用|介绍一下|支持吗|能不能|可不可以|可以吗|会不会|为什么|怎么回事|做完了吗|完成了吗|好了吗|进度|状态|结果呢|what\s+(?:is|are|can)|how\s+(?:to|do|does)|can\s+(?:you|it)|status|progress)[？?。.!！]*$/iu.test(normalized)) return false;
   return /(?:请|帮我|给我|替我|开始|启动|继续|执行|处理|整理|生成|制作|创建|输出|分析|汇总|核对|检查|审查|审核|检索|查找|查一下|查一查|预测|准备|导入|归档|做一|做个|做份|做一下|看一下|看一看|算一下|算一算|review|analy[sz]e|generate|create|prepare|start|run|check|audit|draft|build|produce|reconcile|forecast|file)/iu.test(normalized);
 }

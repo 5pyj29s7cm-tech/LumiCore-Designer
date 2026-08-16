@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseLegacyXmlToolCalls } from '../server/llm/providers';
+import { parseDeepSeekResponse, parseLegacyXmlToolCalls } from '../server/llm/providers';
 
 describe('legacy XML tool protocol compatibility', () => {
   const declarations = [
@@ -11,6 +11,10 @@ describe('legacy XML tool protocol compatibility', () => {
       type: 'function' as const,
       function: { name: 'client_get_state', description: '', parameters: {} },
     },
+    {
+      type: 'function' as const,
+      function: { name: 'industry_workflow_start', description: '', parameters: {} },
+    },
   ];
 
   it('converts declared XML invocations into structured calls', () => {
@@ -20,6 +24,32 @@ describe('legacy XML tool protocol compatibility', () => {
     )).toEqual([expect.objectContaining({
       name: 'set_client_mode',
       arguments: { mode: 'assistant' },
+    })]);
+  });
+
+  it('converts the DeepSeek full-width DSML variant into a declared structured call', () => {
+    expect(parseLegacyXmlToolCalls(
+      '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="industry_workflow_start"><｜｜DSML｜｜parameter name="entryId" string="true">visualization</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>',
+      declarations,
+    )).toEqual([expect.objectContaining({
+      name: 'industry_workflow_start',
+      arguments: { entryId: 'visualization' },
+    })]);
+  });
+
+  it('normalizes DSML in a non-streaming OpenAI-compatible response', () => {
+    const parsed = parseDeepSeekResponse({
+      choices: [{
+        message: {
+          content: '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="industry_workflow_start"><｜｜DSML｜｜parameter name="entryId" string="true">visualization</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>',
+        },
+      }],
+    }, declarations);
+
+    expect(parsed.text).toBeNull();
+    expect(parsed.toolCalls).toEqual([expect.objectContaining({
+      name: 'industry_workflow_start',
+      arguments: { entryId: 'visualization' },
     })]);
   });
 

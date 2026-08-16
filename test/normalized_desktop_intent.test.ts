@@ -18,6 +18,16 @@ describe('normalized desktop intent priority', () => {
     });
   });
 
+  it('maps the Chinese command-center label to the native Lumi surface', () => {
+    expect(normalizeActionIntent('打开 Lumi 指挥中心')).toMatchObject({
+      kind: 'client_navigation',
+      operation: 'navigate',
+      target: 'command-center',
+      sideEffectClass: 'none',
+      clientAction: 'open_command_center',
+    });
+  });
+
   it('keeps inbound semantic roles ahead of action-shaped words', () => {
     expect(normalizeActionIntent('张勇给我发了什么')).toMatchObject({
       kind: 'messaging_read',

@@ -7,6 +7,7 @@ import {
   evaluateActionConstitution,
 } from '../server/tools/action_constitution';
 import { ToolRegistry } from '../server/tools/registry';
+import { registerImageTools } from '../server/tools/definitions/image_tools';
 
 describe('global Memory Firewall', () => {
   it('tags ordinary personal memories as private long-term memories', () => {
@@ -48,6 +49,38 @@ describe('global Memory Firewall', () => {
 });
 
 describe('Action Constitution', () => {
+  it('allows explicitly requested internal image generation when external delivery is negated', () => {
+    const registry = new ToolRegistry();
+    registerImageTools(registry);
+    const capability = registry.getCapabilityManifestEntry('generate_image');
+    const decision = evaluateActionConstitution(
+      'generate_image',
+      { prompt: 'Interior visualization for internal review' },
+      'safe',
+      { actionIntent: '生成一张本地效果图，只做内部评审，不发送给客户。' } as any,
+      capability,
+    );
+
+    expect(decision.level).toBe('safe');
+    expect(decision.requiresUserConfirmation).toBe(false);
+  });
+
+  it('still requires confirmation when generated content will actually be sent', () => {
+    const registry = new ToolRegistry();
+    registerImageTools(registry);
+    const capability = registry.getCapabilityManifestEntry('generate_image');
+    const decision = evaluateActionConstitution(
+      'generate_image',
+      { prompt: 'Interior visualization' },
+      'safe',
+      { actionIntent: '生成效果图并发送给客户。' } as any,
+      capability,
+    );
+
+    expect(decision.level).toBe('confirm');
+    expect(decision.requiresUserConfirmation).toBe(true);
+  });
+
   it('uses CapabilityManifest semantics even when the implementation name carries no policy hints', () => {
     const registry = new ToolRegistry();
     registry.register({

@@ -16,6 +16,25 @@ function ensureOutputDir(): string {
   return OUTPUT_DIR;
 }
 
+async function persistGeneratedImage(url: string, provider: string, index: number): Promise<string> {
+  if (!/^https:\/\//i.test(url)) throw new Error(`Image provider returned an unsafe URL: ${url}`);
+  const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+  if (!response.ok) throw new Error(`Unable to persist generated image (${response.status}).`);
+  const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+  const extension = contentType.includes('jpeg') ? '.jpg'
+    : contentType.includes('webp') ? '.webp'
+      : contentType.includes('tiff') ? '.tif'
+        : '.png';
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.length < 16) throw new Error('Generated image download was empty.');
+  const outputPath = path.join(
+    ensureOutputDir(),
+    `generated_image_${provider}_${Date.now()}_${index + 1}${extension}`,
+  );
+  fs.writeFileSync(outputPath, buffer);
+  return outputPath;
+}
+
 // OpenAI image generation
 
 async function generateImageOpenAI(args: Record<string, any>, selectedModel: string): Promise<string> {
@@ -45,8 +64,10 @@ async function generateImageOpenAI(args: Record<string, any>, selectedModel: str
   const artifacts: Array<{ type: string; path?: string; url?: string }> = [];
   for (const [index, image] of response.data.entries()) {
     if ((image as any).url) {
-      images.push((image as any).url);
-      artifacts.push({ type: 'image_url', url: (image as any).url });
+      const remoteUrl = String((image as any).url);
+      const outputPath = await persistGeneratedImage(remoteUrl, 'openai', index);
+      images.push(outputPath);
+      artifacts.push({ type: 'image', path: outputPath, url: remoteUrl });
       continue;
     }
     if ((image as any).b64_json) {
@@ -119,13 +140,14 @@ async function generateImageDashScope(args: Record<string, any>, selectedModel: 
       const results = pollData.output.results || [];
       const urls = results.map((result: any) => result.url).filter(Boolean);
       if (urls.length === 0) throw new Error('Image generation completed but no URLs returned');
+      const images = await Promise.all(urls.map((url: string, index: number) => persistGeneratedImage(url, 'qwen', index)));
       return JSON.stringify({
         ok: true,
         status: 'generated',
         success: true,
         prompt,
-        images: urls,
-        artifacts: urls.map((url: string) => ({ type: 'image_url', url })),
+        images,
+        artifacts: images.map((imagePath: string, index: number) => ({ type: 'image', path: imagePath, url: urls[index] })),
         taskId,
         provider: 'qwen',
         model,
@@ -168,14 +190,15 @@ async function generateImageSiliconFlow(args: Record<string, any>, selectedModel
   }
   const urls = (data.data || []).map((image: any) => image.url).filter(Boolean);
   if (urls.length === 0) throw new Error('SiliconFlow image generation returned no image URLs');
+  const images = await Promise.all(urls.map((url: string, index: number) => persistGeneratedImage(url, 'siliconflow', index)));
 
   return JSON.stringify({
     ok: true,
     status: 'generated',
     success: true,
     prompt,
-    images: urls,
-    artifacts: urls.map((url: string) => ({ type: 'image_url', url })),
+    images,
+    artifacts: images.map((imagePath: string, index: number) => ({ type: 'image', path: imagePath, url: urls[index] })),
     provider: 'siliconflow',
     model,
     remainingCredits: data.credits,

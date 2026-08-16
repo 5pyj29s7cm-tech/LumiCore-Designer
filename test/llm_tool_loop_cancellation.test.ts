@@ -41,7 +41,7 @@ const getters = [
 ] as const;
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  mocks.makeLLMCall.mockReset();
 });
 
 describe('LLM tool loop cancellation boundary', () => {
@@ -102,5 +102,183 @@ describe('LLM tool loop cancellation boundary', () => {
     expect(second).not.toHaveBeenCalled();
     expect(result.toolCalls).toHaveLength(1);
     expect(result.text).toMatch(/cancelled before the remaining tool calls/i);
+  });
+
+  it('stops a model from repeatedly calling the same failing tool with changing arguments', async () => {
+    const registry = new ToolRegistry();
+    const failing = vi.fn(async () => { throw new Error('missing exact source path'); });
+    registry.register({
+      name: 'bounded_read',
+      description: 'Read one exact source path.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+        required: ['path'],
+      },
+      permission: 'public',
+      securityLevel: 'safe',
+      handler: failing,
+    });
+    let iteration = 0;
+    mocks.makeLLMCall.mockImplementation(async () => ({
+      text: '',
+      toolCalls: [{ id: `read-${iteration}`, name: 'bounded_read', arguments: { path: `missing-${iteration++}.txt` } }],
+    }));
+
+    const result = await runWithTools(
+      [{ role: 'user', content: 'Read the exact source and continue.' }],
+      registry,
+      { provider: 'deepseek', model: 'test-model' },
+      undefined,
+      10,
+      ...getters,
+    );
+
+    expect(failing).toHaveBeenCalledTimes(3);
+    expect(result.toolCalls).toHaveLength(3);
+    expect(result.text).toMatch(/failed three times/i);
+  });
+
+  it('reserves a tool-free final answer after a verified design project status read', async () => {
+    const registry = new ToolRegistry();
+    const statusHandler = vi.fn(async () => JSON.stringify({
+      ok: true,
+      status: 'observed',
+      persisted: true,
+      project: { id: 'project-1' },
+      workflow: { completedStages: ['project'], nextStage: 'cad', stages: {} },
+    }));
+    registry.register({
+      name: 'interior_design_project_status',
+      description: 'Read durable project status.',
+      parameters: { type: 'object', properties: {}, required: [] },
+      permission: 'public',
+      securityLevel: 'safe',
+      handler: statusHandler,
+    });
+    mocks.makeLLMCall
+      .mockResolvedValueOnce({
+        text: '',
+        toolCalls: [{ id: 'status-read', name: 'interior_design_project_status', arguments: {} }],
+      })
+      .mockResolvedValueOnce({
+        text: 'The project brief is complete and CAD is next.',
+        toolCalls: [],
+      });
+
+    const result = await runWithTools(
+      [{ role: 'user', content: 'What is the current status of the design project?' }],
+      registry,
+      { provider: 'deepseek', model: 'test-model' },
+      undefined,
+      1,
+      ...getters,
+    );
+
+    expect(statusHandler).toHaveBeenCalledTimes(1);
+    expect(mocks.makeLLMCall).toHaveBeenCalledTimes(2);
+    expect(result.text).toBe('The project brief is complete and CAD is next.');
+  });
+
+  it('does not end a creation workflow merely because it read the project status first', async () => {
+    const registry = new ToolRegistry();
+    const statusHandler = vi.fn(async () => JSON.stringify({
+      ok: true,
+      status: 'observed',
+      project: { id: 'project-1' },
+      workflow: { completedStages: ['project', 'cad'], nextStage: 'visualization' },
+    }));
+    const startHandler = vi.fn(async () => JSON.stringify({
+      ok: true,
+      status: 'started',
+      task: { id: 'visualization-task' },
+    }));
+    for (const [name, handler] of [
+      ['interior_design_project_status', statusHandler],
+      ['industry_workflow_start', startHandler],
+    ] as const) {
+      registry.register({
+        name,
+        description: name,
+        parameters: { type: 'object', properties: {}, required: [] },
+        permission: 'public',
+        securityLevel: 'safe',
+        handler,
+      });
+    }
+    mocks.makeLLMCall
+      .mockResolvedValueOnce({
+        text: '',
+        toolCalls: [{ id: 'status-read', name: 'interior_design_project_status', arguments: {} }],
+      })
+      .mockResolvedValueOnce({
+        text: '',
+        toolCalls: [{ id: 'stage-start', name: 'industry_workflow_start', arguments: { entryId: 'visualization' } }],
+      })
+      .mockResolvedValueOnce({ text: 'The visualization task is now ready to continue.', toolCalls: [] });
+
+    const result = await runWithTools(
+      [{ role: 'user', content: '矩衡验收户型A进入效果图阶段，先读取项目事实再开始生成。' }],
+      registry,
+      { provider: 'deepseek', model: 'test-model' },
+      undefined,
+      3,
+      ...getters,
+    );
+
+    expect(statusHandler).toHaveBeenCalledTimes(1);
+    expect(startHandler).toHaveBeenCalledTimes(1);
+    expect(result.toolCalls.map(record => record.name)).toEqual([
+      'interior_design_project_status',
+      'industry_workflow_start',
+    ]);
+  });
+
+  it('requires the first professional receipt tool before an industry blocker answer', async () => {
+    const registry = new ToolRegistry();
+    const assessment = vi.fn(async () => JSON.stringify({
+      status: 'not_ready',
+      geometryReady: false,
+      missing: ['measured plan', 'wall coordinates'],
+    }));
+    registry.register({
+      name: 'industry_source_assessment',
+      description: 'Assess whether the bound source can support creation.',
+      parameters: { type: 'object', properties: {}, required: [] },
+      permission: 'public',
+      securityLevel: 'safe',
+      handler: assessment,
+    });
+    mocks.makeLLMCall
+      .mockResolvedValueOnce({ text: 'The source looks incomplete.', toolCalls: [] })
+      .mockResolvedValueOnce({
+        text: '',
+        toolCalls: [{ id: 'assessment', name: 'industry_source_assessment', arguments: {} }],
+      })
+      .mockResolvedValueOnce({ text: 'The source is missing measured geometry, so creation stopped.', toolCalls: [] });
+
+    const result = await runWithTools(
+      [{ role: 'user', content: 'Check whether this source is sufficient.' }],
+      registry,
+      { provider: 'deepseek', model: 'test-model' },
+      undefined,
+      1,
+      ...getters,
+      undefined,
+      {
+        industryWorkflowTaskId: 'wt_task_bound',
+        industryWorkflowRequiredToolReceipts: ['industry_source_assessment', 'industry_output_create'],
+        toolPolicy: {
+          allowedTools: ['industry_source_assessment'],
+          requireConfirmation: [],
+          forbiddenTools: [],
+          maxIterations: 1,
+        },
+      },
+    );
+
+    expect(assessment).toHaveBeenCalledTimes(1);
+    expect(result.toolCalls.map(record => record.name)).toEqual(['industry_source_assessment']);
+    expect(result.text).toMatch(/creation stopped/i);
   });
 });

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildActionContract,
   hasCoreActionEvidence,
+  requiresCurrentAppUiMutation,
   requestsBlankAutoCadDocument,
 } from '../server/cognition/action_contract';
 import { finalizeLumiResponse } from '../server/cognition/result_finalizer';
@@ -39,6 +40,7 @@ describe('voice work queue and blank AutoCAD document regression', () => {
   it('routes a blank CAD canvas to document creation without geometry synthesis', () => {
     const text = '在新 CAD 里新建一个空白画布。';
     expect(requestsBlankAutoCadDocument(text)).toBe(true);
+    expect(requiresCurrentAppUiMutation(text)).toBe(false);
     const contract = buildActionContract(text);
     expect(contract.kind).toBe('cad_document');
     expect(contract.preferredTools).toEqual(['mcp_cad-drafting_autocad_new_document']);

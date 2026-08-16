@@ -83,6 +83,74 @@ describe('completion guard desktop action handling', () => {
   });
 });
 
+describe('design project status completion evidence', () => {
+  it('allows a persisted project-creation receipt even when the request also saves fixed conditions', () => {
+    const response = '“矩衡验收户型”已创建，并保存了 9600mm × 10000mm 与层高 2800mm 的固定条件。';
+    const result = guardCompletionClaims({
+      task: '新建一个室内设计项目，名称“矩衡验收户型”；先只建立项目和保存这些固定条件，不生成图纸。\n\n任务中心 工作接管 状态 进度 结果 验证',
+      response,
+      toolCalls: [{
+        id: 'design-create',
+        name: 'interior_design_project_create',
+        arguments: { name: '矩衡验收户型' },
+        result: JSON.stringify({
+          ok: true,
+          status: 'created',
+          persisted: true,
+          active: true,
+          project: { id: 'project-controlled', name: '矩衡验收户型' },
+        }),
+        terminalVerification: { status: 'verified', strategy: 'terminal_receipt', reason: 'durable project returned' },
+      }],
+    });
+
+    expect(result.blocked).toBe(false);
+    expect(result.text).toBe(response);
+  });
+
+  it('allows a project-name progress answer from the verified durable status receipt', () => {
+    const response = '澄境样板间的项目方案已经完成，CAD、效果图、PPT 和交付阶段尚未开始。';
+    const result = guardCompletionClaims({
+      task: '澄境样板间现在进行到哪一步？',
+      response,
+      toolCalls: [{
+        id: 'design-status',
+        name: 'interior_design_project_status',
+        arguments: {},
+        result: JSON.stringify({
+          ok: true,
+          status: 'observed',
+          persisted: true,
+          project: { id: 'project-1', name: '澄境样板间' },
+          workflow: { stages: { project: { status: 'completed' }, cad: { status: 'not_started' } } },
+        }),
+        terminalVerification: { status: 'verified', strategy: 'measured', reason: 'durable status read' },
+      }],
+    });
+
+    expect(result.blocked).toBe(false);
+    expect(result.text).toBe(response);
+  });
+
+  it('allows an honest CAD source blocker after the dedicated drawing QA receipt', () => {
+    const response = '已完成 CAD 资料质检：没有实测平面图和墙体坐标，资料不足，已停止生成且没有猜测尺寸。';
+    const result = guardCompletionClaims({
+      task: '请用专用资料质检检查这个 CAD 任务，资料不足就停止。',
+      response,
+      toolCalls: [{
+        id: 'drawing-qa',
+        name: 'mcp_design-studio-pack_drawing_ingest_qa',
+        arguments: { projectName: '澄境样板间', sources: 'none' },
+        result: JSON.stringify({ geometryReady: false, missing: ['measured plan', 'wall coordinates'] }),
+        terminalVerification: { status: 'verified', strategy: 'terminal_receipt', reason: 'structured drawing QA' },
+      }],
+    });
+
+    expect(result.blocked).toBe(false);
+    expect(result.text).toBe(response);
+  });
+});
+
 describe('completion guard generic execution claims', () => {
   const stateDiffCapability = {
     capabilityId: 'desktop.open',
