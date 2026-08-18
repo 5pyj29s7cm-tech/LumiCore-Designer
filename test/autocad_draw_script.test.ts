@@ -241,6 +241,7 @@ describe('AutoCAD MCP operation preparation', () => {
         height: 10000,
         unit: 'mm',
         walls: [{ x1: 0, y1: 6000, x2: 9600, y2: 6000, thickness: 120 }],
+        polylines: [{ points: [{ x: 6200, y: 0 }, { x: 6200, y: 10000 }], layer: '分区' }],
         doors: [{ hingeX: 800, hingeY: 0, width: 900, angle: 0 }],
         dimensions: [{ x1: 0, y1: 0, x2: 9600, y2: 0, offset: -600, text: '9600' }],
       }, {
@@ -255,6 +256,10 @@ describe('AutoCAD MCP operation preparation', () => {
       expect(viewBox[1]).toBeLessThanOrEqual(-1200);
       expect(viewBox[1] + viewBox[3]).toBeGreaterThanOrEqual(11600);
       expect(svg).toContain('>9600</text>');
+      expect(result.layers).toContain('ZONE');
+      expect(result.layerCounts.ZONE).toBeGreaterThan(0);
+      expect(fs.readFileSync(result.path, 'utf8')).toContain('\n8\nZONE\n');
+      expect(fs.readFileSync(result.path, 'utf8')).not.toContain('\n8\n_\n');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

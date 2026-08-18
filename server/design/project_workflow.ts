@@ -185,7 +185,27 @@ export function getCompletedInteriorProjectStageIds(
   const end = beforeEntryId ? INTERIOR_DESIGN_STAGE_IDS.indexOf(beforeEntryId) : INTERIOR_DESIGN_STAGE_IDS.length;
   return INTERIOR_DESIGN_STAGE_IDS
     .slice(0, end < 0 ? INTERIOR_DESIGN_STAGE_IDS.length : end)
-    .filter(entryId => workflow.stages[entryId].status === 'completed');
+    .filter(entryId => hasVerifiedInteriorProjectStage(workflow.stages[entryId]));
+}
+
+export function hasVerifiedInteriorProjectStage(stage: InteriorProjectWorkflowStageState): boolean {
+  if (stage.status === 'completed') return true;
+  if (String(stage.verificationStatus || '').toLowerCase() !== 'passed') return false;
+  if (!stage.verificationId || stage.receiptIds.length === 0) return false;
+  return stage.artifacts.some(artifact => (
+    Boolean(artifact.taskId)
+    && artifact.status === 'delivered'
+    && /verification receipt/i.test(artifact.label)
+  ));
+}
+
+function verifiedInteriorProjectStageTaskId(stage: InteriorProjectWorkflowStageState): string {
+  if (stage.status === 'completed') return stage.currentTaskId;
+  return [...stage.artifacts].reverse().find(artifact => (
+    Boolean(artifact.taskId)
+    && artifact.status === 'delivered'
+    && /verification receipt/i.test(artifact.label)
+  ))?.taskId || '';
 }
 
 export function getMissingInteriorProjectPrerequisites(
@@ -196,7 +216,7 @@ export function getMissingInteriorProjectPrerequisites(
   if (stageIndex <= 0) return [];
   return INTERIOR_DESIGN_STAGE_IDS
     .slice(0, stageIndex)
-    .filter(stageId => workflow.stages[stageId].status !== 'completed');
+    .filter(stageId => !hasVerifiedInteriorProjectStage(workflow.stages[stageId]));
 }
 
 export function linkInteriorProjectWorkflowStage(input: {
@@ -215,7 +235,7 @@ export function linkInteriorProjectWorkflowStage(input: {
   const workflow = normalizeWorkflow(project.workflow);
   const stage = workflow.stages[input.entryId];
   const sourceTaskIds = getCompletedInteriorProjectStageIds(workflow, input.entryId)
-    .map(stageId => workflow.stages[stageId].currentTaskId)
+    .map(stageId => verifiedInteriorProjectStageTaskId(workflow.stages[stageId]))
     .filter(Boolean);
   workflow.rootConversationId = input.rootConversationId;
   workflow.rootTaskId = input.rootTaskId;

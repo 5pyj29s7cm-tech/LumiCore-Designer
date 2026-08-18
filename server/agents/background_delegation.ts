@@ -1,5 +1,6 @@
 import type { TaskComplexity } from './orchestrator';
 import { CN_BACKGROUND_DELEGATION_MESSAGES } from '../regions/packs/cn/background_delegation_messages';
+import { classifyRuntimeWorkIntent } from '../cognition/runtime_work_intent';
 
 export interface BackgroundDelegationDecisionInput {
   text: string;
@@ -49,7 +50,7 @@ const EXPLICIT_FOREGROUND_ONLY_RE =
   /(?:\u4e0d\u8981|\u522b|\u65e0\u9700|\u4e0d\u7528|\u4e0d\u9700\u8981).{0,12}(?:\u65b0\u5efa|\u521b\u5efa|\u5efa\u7acb|\u542f\u52a8|\u5f00\u542f).{0,8}(?:\u65b0)?\u4efb\u52a1/iu;
 
 const FOREGROUND_STATUS_OR_RECALL_RE =
-  /(?:\u786e\u8ba4|\u544a\u8bc9\u6211|\u56de\u7b54|\u67e5\u8be2|\u67e5\u770b|\u8fd8\u8bb0\u5f97|\u56de\u5fc6|\u6838\u5bf9).{0,96}(?:\u72b6\u6001|\u8fdb\u5ea6|\u56de\u6267|\u4efb\u52a1\u53f7|\u6848\u4ef6\s*id|\u4e89\u8bae\u91d1\u989d|\u5df2\u77e5\u4e8b\u5b9e|\u5f53\u524d\u6848\u4ef6)|(?:\u5f53\u524d|\u521a\u624d|\u521a\u521a|\u4e4b\u524d|\u4e0a\u4e00\u4e2a).{0,72}(?:\u6848\u4ef6|\u4efb\u52a1|\u8349\u7a3f|\u5de5\u4f5c\u6d41).{0,32}(?:\u72b6\u6001|\u8fdb\u5ea6|\u56de\u6267|id|\u91d1\u989d|\u4e8b\u5b9e|\u7ed3\u679c)/iu;
+  /(?:\u786e\u8ba4|\u544a\u8bc9\u6211|\u56de\u7b54|\u67e5\u8be2|\u67e5\u770b|\u8fd8\u8bb0\u5f97|\u56de\u5fc6|\u6838\u5bf9).{0,96}(?:\u72b6\u6001|\u8fdb\u5ea6|\u56de\u6267|\u4efb\u52a1(?:\u53f7|\u7f16\u53f7)|\u6848\u4ef6\s*id|\u4e89\u8bae\u91d1\u989d|\u5df2\u77e5\u4e8b\u5b9e|\u5f53\u524d\u6848\u4ef6)|(?:\u5f53\u524d|\u521a\u624d|\u521a\u521a|\u4e4b\u524d|\u4e0a\u4e00\u4e2a).{0,72}(?:\u6848\u4ef6|\u4efb\u52a1|\u8349\u7a3f|\u5de5\u4f5c\u6d41).{0,32}(?:\u72b6\u6001|\u8fdb\u5ea6|\u56de\u6267|id|\u7f16\u53f7|\u91d1\u989d|\u4e8b\u5b9e|\u7ed3\u679c)/iu;
 
 const WORK_CATEGORY_ALLOWLIST = new Set(['command', 'code', 'question', 'analysis']);
 
@@ -101,6 +102,7 @@ export function shouldDelegateWorkInBackground(input: BackgroundDelegationDecisi
   if (input.prefersSequentialWorkflow) return { shouldDelegate: false, reason: 'artifact_first_sequential_workflow' };
   if (isBackgroundMetaInquiry(input.text)) return { shouldDelegate: false, reason: 'background_meta_inquiry' };
   if (isBackgroundAppInspection(input.text)) return { shouldDelegate: false, reason: 'background_app_inspection' };
+  if (classifyRuntimeWorkIntent(input.text) !== 'none') return { shouldDelegate: false, reason: 'runtime_work_control' };
   if (input.availableAgentCount < 1) return { shouldDelegate: false, reason: 'no_available_workers' };
   if (isForegroundMessagingRead(input.text)) return { shouldDelegate: false, reason: 'foreground_messaging_read' };
   if (isForegroundMessagingSend(input.text)) return { shouldDelegate: false, reason: 'foreground_messaging_send' };

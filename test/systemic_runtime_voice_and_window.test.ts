@@ -11,7 +11,7 @@ import {
   type ConversationActionContinuationState,
 } from '../server/cognition/action_continuation';
 import { guardCurrentAppToolCall, isRecoveredWpsCreateTask } from '../server/cognition/current_app_execution';
-import { matchQuickCommand } from '../server/cognition/quick_commands';
+import { buildDeterministicRuntimeWorkCommand, matchQuickCommand } from '../server/cognition/quick_commands';
 import { routeToolsForTurn } from '../server/cognition/tool_router';
 import { finalizeLumiResponse } from '../server/cognition/result_finalizer';
 import { registerBackgroundTask, resetBackgroundTasksForTest } from '../server/agents/background_tasks';
@@ -47,6 +47,33 @@ describe('systemic runtime work control', () => {
     expect(buildActionContract('\u540e\u53f0\u4efb\u52a1\u8fdb\u5ea6\u600e\u4e48\u6837').kind).toBe('task_control');
     expect(routeToolsForTurn('\u540e\u53f0\u4efb\u52a1\u8fdb\u5ea6\u600e\u4e48\u6837', tools).toolNames).toContain('runtime_work_status');
     expect(routeToolsForTurn('\u505c\u6b62\u540e\u53f0\u4efb\u52a1', tools).toolNames).toContain('runtime_work_cancel');
+  });
+
+  it('executes exact background task control without delegating it as new work', () => {
+    const cancel = buildDeterministicRuntimeWorkCommand('\u505c\u6b62\u540e\u53f0\u4efb\u52a1 bg_1787047896265_le8w7');
+    expect(cancel?.toolCall).toEqual({
+      name: 'runtime_work_cancel',
+      arguments: { taskId: 'bg_1787047896265_le8w7' },
+    });
+
+    const status = buildDeterministicRuntimeWorkCommand('\u540e\u53f0\u4efb\u52a1\u8fdb\u5ea6\u600e\u4e48\u6837');
+    const reply = status?.formatToolResult?.(JSON.stringify({
+      status: 'active',
+      activeCount: 1,
+      items: [{ id: 'bg_exact', title: '\u8bbe\u8ba1\u9879\u76ee\u6838\u9a8c', status: 'running', running: true }],
+    }));
+    expect(reply).toContain('bg_exact');
+  });
+
+  it('does not describe blocked durable tasks as currently running', () => {
+    const status = buildDeterministicRuntimeWorkCommand('\u540e\u53f0\u4efb\u52a1\u8fdb\u5ea6\u600e\u4e48\u6837');
+    const reply = status?.formatToolResult?.(JSON.stringify({
+      status: 'paused',
+      activeCount: 0,
+      items: [{ id: 'wt_task_blocked', title: 'Blocked project', status: 'blocked', running: false }],
+    }));
+    expect(reply).toBe('\u5f53\u524d\u6ca1\u6709\u6b63\u5728\u8fd0\u884c\u7684\u5de5\u4f5c\u3002');
+    expect(reply).not.toContain('wt_task_blocked');
   });
 
   it('only accepts an exact runtime receipt as cancellation evidence', () => {

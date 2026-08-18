@@ -689,7 +689,13 @@ export function buildConversationActionContinuationState(
     status,
     policySnapshot: snapshotTaskPolicy(input.toolPolicy) || (inheritsPrevious ? previous?.policySnapshot : undefined),
     receipts,
-    activeRequestId: input.requestId || (inheritsPrevious ? previous?.activeRequestId : undefined),
+    // A terminal assistant turn no longer owns a foreground execution lease.
+    // Keeping the request id after verified completion leaves the native task
+    // dashboard showing a ghost "executing" item even though the receipts are
+    // already terminal.
+    activeRequestId: ['completed', 'cancelled'].includes(status)
+      ? undefined
+      : input.requestId || (inheritsPrevious ? previous?.activeRequestId : undefined),
     supersededTaskId: !inheritsPrevious && previous?.unfinished ? previous.taskId : undefined,
     revision: (inheritsPrevious ? previous?.revision || 0 : 0) + 1,
     goal,

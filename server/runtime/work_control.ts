@@ -26,6 +26,7 @@ export interface RuntimeWorkItem {
   kind: RuntimeWorkKind;
   title: string;
   status: string;
+  running: boolean;
   updatedAt: string;
   cancellationRequested: boolean;
 }
@@ -54,6 +55,7 @@ function delegationItem(task: BackgroundDelegationTask): RuntimeWorkItem {
     kind: 'delegation',
     title: task.title,
     status: task.status,
+    running: task.status !== 'paused',
     updatedAt: task.updatedAt,
     cancellationRequested: task.cancelRequested,
   };
@@ -65,6 +67,7 @@ function autonomyItem(task: AutonomousTask): RuntimeWorkItem {
     kind: 'autonomy',
     title: task.title,
     status: task.status,
+    running: task.status !== 'paused',
     updatedAt: task.updatedAt || task.startedAt || task.createdAt,
     cancellationRequested: Boolean(task.cancelRequestedAt),
   };
@@ -76,6 +79,9 @@ function takeoverItem(task: WorkTakeoverTask): RuntimeWorkItem {
     kind: 'takeover',
     title: task.title,
     status: task.status,
+    // A blocked or confirmation-gated takeover remains in the durable task
+    // center, but no executor is currently running it.
+    running: task.status === 'queued' || task.status === 'in_progress',
     updatedAt: task.updatedAt,
     cancellationRequested: false,
   };
@@ -105,7 +111,7 @@ export function getRuntimeWorkSnapshot(userId: string, kinds?: RuntimeWorkKind[]
     } catch {}
   }
   items.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-  const activeCount = items.filter(item => item.status !== 'paused').length;
+  const activeCount = items.filter(item => item.running).length;
   return {
     ok: true,
     status: activeCount > 0 ? 'active' : items.length > 0 ? 'paused' : 'idle',

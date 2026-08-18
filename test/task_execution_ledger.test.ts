@@ -46,6 +46,30 @@ describe('durable conversation task execution ledger', () => {
     })).toBe(false);
   });
 
+  it('does not treat an intentionally unopened generated artifact as a failed operation', () => {
+    expect(toolRecordSucceeded({
+      name: 'cad_generate_dxf',
+      arguments: {},
+      result: JSON.stringify({
+        ok: true,
+        status: 'verified',
+        path: 'C:\\Lumi\\plan.dxf',
+        previewPath: 'C:\\Lumi\\plan.svg',
+        exists: true,
+        size: 128,
+        previewExists: true,
+        previewSize: 128,
+        opened: false,
+      }),
+      terminalVerification: { status: 'verified', strategy: 'artifact', reason: 'files exist' },
+    })).toBe(true);
+    expect(toolRecordSucceeded({
+      name: 'desktop_open',
+      arguments: { target: 'C:\\Lumi\\plan.dxf' },
+      result: JSON.stringify({ ok: true, status: 'verified', opened: false }),
+    })).toBe(false);
+  });
+
   it('lets a successful retry supersede the same failed step without deleting valid pre/post observations', () => {
     const records = coalesceToolExecutionRecords([
       { name: 'desktop_keyboard_press', arguments: { keys: ['CTRL', 'N'] }, result: '', error: 'snapshot required' },

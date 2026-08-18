@@ -68,6 +68,60 @@ describe('Lumi result finalizer', () => {
     expect(result.text).not.toContain('industry_workflow_start');
   });
 
+  it('preserves a verified CAD workflow completion when the final model leaks tool protocol', async () => {
+    const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
+    const result = finalizeLumiResponse({
+      taskText: '请为“暮蓝-26验收住宅”生成并核验 DXF 和 SVG 预览，不打开外部软件，不客户外发。',
+      responseText: '[tool] industry_workflow_complete({"taskId":"wt_task_cad"})',
+      toolRecords: [{
+        name: 'cad_generate_dxf',
+        arguments: {},
+        result: JSON.stringify({
+          title: '暮蓝-26验收住宅_CAD方案',
+          path: 'C:\\Lumi\\暮蓝-26验收住宅_CAD方案.dxf',
+          previewPath: 'C:\\Lumi\\暮蓝-26验收住宅_CAD方案.svg',
+          unit: 'mm',
+          width: 11000,
+          height: 8000,
+          sourcePath: '用户内联几何事实',
+          missingForPrecision: ['墙厚', '机电点位'],
+          layers: ['OUTLINE', 'ZONE', 'DOOR', 'DIM', 'TEXT'],
+          geometryVerified: true,
+          geometryValidation: { passed: true },
+          exists: true,
+          previewExists: true,
+          opened: false,
+        }),
+        terminalVerification: { status: 'verified', strategy: 'artifact', reason: 'files exist' },
+      }, {
+        name: 'industry_workflow_complete',
+        arguments: { taskId: 'wt_task_cad' },
+        result: JSON.stringify({
+          ok: true,
+          status: 'verified',
+          persisted: true,
+          task: { id: 'wt_task_cad', title: 'CAD scheme', status: 'delivered' },
+          verification: { verificationId: 'wt_verify_cad', passed: true, status: 'passed' },
+          archivedFilePaths: [
+            'C:\\Lumi\\暮蓝-26验收住宅_CAD方案.dxf',
+            'C:\\Lumi\\暮蓝-26验收住宅_CAD方案.svg',
+          ],
+        }),
+        terminalVerification: { status: 'verified', strategy: 'terminal_receipt', reason: 'passed' },
+      }],
+      source: 'chat',
+    });
+
+    expect(result.blocked).toBe(false);
+    expect(result.text).toContain('CAD 方案已生成');
+    expect(result.text).toContain('OUTLINE、ZONE、DOOR、DIM、TEXT');
+    expect(result.text).toContain('wt_task_cad');
+    expect(result.text).toContain('wt_verify_cad');
+    expect(result.text).toContain('未打开');
+    expect(result.text).not.toContain('工具请求没有被执行');
+    expect(result.text).not.toContain('industry_workflow_complete');
+  });
+
   it('blocks a fabricated prior self-check explanation without diagnostic receipts', async () => {
     const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
 

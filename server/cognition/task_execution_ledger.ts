@@ -257,7 +257,10 @@ export function toolRecordSucceeded(record: ToolExecutionRecord): boolean {
         || verification.status,
       80,
     ).toLowerCase();
-    const explicitlyFailedOutcome = SEMANTIC_FALSE_FIELDS.some(field => payload[field] === false);
+    const explicitlyFailedOutcome = SEMANTIC_FALSE_FIELDS.some(field => {
+      if (field === 'opened' && !/(?:^|_)(?:open|launch|activate)(?:_|$)/i.test(record.name)) return false;
+      return payload[field] === false;
+    });
     if (
       payload.ok === false
       || payload.success === false
@@ -484,9 +487,27 @@ export function taskCompletionFromReceipts(
   const legacyVerifiedWpsCreate = records.some(record => (
     record.name === 'wps_create_document' && toolRecordSucceeded(record)
   ));
-  const complete = contract.applies
+  // This server-side verifier only returns `verified` after it has archived
+  // same-loop domain receipts and persisted a passing work-takeover
+  // verification. Once the receipt is bound to this conversation task, it is
+  // the canonical terminal evidence for the whole industry workflow.
+  const verifiedIndustryWorkflowCompletion = records.some(record => {
+    if (record.name !== 'industry_workflow_complete' || !toolRecordVerifiedForCompletion(record)) return false;
+    const structuredPayload = structuredRecordPayload(record);
+    if (!structuredPayload || Array.isArray(structuredPayload)) return false;
+    const payload = structuredPayload as Record<string, any>;
+    const verification = payload.verification && typeof payload.verification === 'object'
+      ? payload.verification as Record<string, any>
+      : {};
+    return payload.ok === true
+      && payload.persisted === true
+      && compact(payload.status, 80).toLowerCase() === 'verified'
+      && verification.passed === true
+      && /^wt_task_[a-z0-9_-]+$/i.test(compact(payload.task?.id, 180));
+  });
+  const complete = verifiedIndustryWorkflowCompletion || (contract.applies
     ? hasCoreActionEvidence(contract, records, goal) || legacyVerifiedWpsCreate
-    : records.some(toolRecordVerifiedForCompletion);
+    : records.some(toolRecordVerifiedForCompletion));
   const failures = [...records].reverse().filter(record => !toolRecordSucceeded(record));
   // A later policy/routing rejection is useful diagnostic evidence, but it
   // must not replace the domain failure that actually stopped the task. Keep

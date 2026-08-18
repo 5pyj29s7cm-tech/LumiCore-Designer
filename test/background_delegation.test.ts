@@ -100,6 +100,19 @@ describe('background delegation', () => {
     }).shouldDelegate).toBe(false);
   });
 
+  it.each([
+    '\u505c\u6b62\u540e\u53f0\u4efb\u52a1 bg_1787047896265_le8w7',
+    '\u540e\u53f0\u4efb\u52a1\u8fdb\u5ea6\u600e\u4e48\u6837',
+  ])('never delegates runtime work control as a new background task: %s', (text) => {
+    const decision = shouldDelegateWorkInBackground({
+      ...BASE,
+      text,
+      complexity: 'moderate',
+    });
+    expect(decision.shouldDelegate).toBe(false);
+    expect(['runtime_work_control', 'background_meta_inquiry']).toContain(decision.reason);
+  });
+
   it('keeps foreground WeChat sends out of background delegation', () => {
     const send = shouldDelegateWorkInBackground({
       ...BASE,

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { buildDeterministicDesignProjectCreateCommand } from '../server/cognition/quick_commands';
+import {
+  buildDeterministicDesignProjectCreateCommand,
+  isDesignProjectCreateAndSchemeRequest,
+} from '../server/cognition/quick_commands';
 
 describe('designer project creation quick route', () => {
   it('binds an explicit named brief to the durable project creation tool', () => {
@@ -20,6 +23,27 @@ describe('designer project creation quick route', () => {
         constraints: '承重结构未知',
       }),
     });
+  });
+
+  it('parses a quoted project name and equals-delimited inline brief fields', () => {
+    const request = '新建并激活室内设计项目“暮蓝-26验收住宅”；类型=住宅；地点=上海；面积=88㎡；居住者=2成人1儿童；预算=32万元；风格=侘寂+原木；需求=两室一厅、儿童学习区、充足收纳；约束=不改承重结构、不猜测现场尺寸。请创建持久项目并生成可审核的项目方案。';
+    const command = buildDeterministicDesignProjectCreateCommand(request);
+
+    expect(command?.toolCall).toEqual({
+      name: 'interior_design_project_create',
+      arguments: expect.objectContaining({
+        name: '暮蓝-26验收住宅',
+        projectType: 'residential',
+        location: '上海',
+        area: '88㎡',
+        occupants: '2成人1儿童',
+        budget: '32万元',
+        style: '侘寂+原木',
+        requirements: '两室一厅、儿童学习区、充足收纳',
+        constraints: '不改承重结构、不猜测现场尺寸',
+      }),
+    });
+    expect(isDesignProjectCreateAndSchemeRequest(request)).toBe(true);
   });
 
   it('does not create a project when the name is missing', () => {

@@ -112,6 +112,82 @@ describe('conversation action continuation state', () => {
       });
   });
 
+  it('settles a durable CAD task when industry receipts use the canonical conversation task id', () => {
+    const userId = `conversation-industry-canonical-task-${Date.now()}-${Math.random()}`;
+    const conversation = getOrCreateActiveConversation(userId, 'lumi', 'personal', '');
+    const instruction = '为暮蓝住宅生成并核验 DXF 和 SVG 预览。';
+    const requestId = 'request-cad-canonical';
+    const prepared = prepareConversationActionExecution({
+      conversationId: conversation.id,
+      userId,
+      userText: instruction,
+      requestId,
+      toolPolicy: {
+        allowedTools: ['cad_generate_dxf', 'industry_workflow_complete'],
+        requireConfirmation: [],
+        forbiddenTools: [],
+        maxIterations: 8,
+      },
+      forceTask: true,
+    });
+    const taskId = prepared.state?.taskId || '';
+    expect(taskId).toBeTruthy();
+
+    addMessage({
+      userId,
+      agentId: 'lumi',
+      conversationId: conversation.id,
+      role: 'user',
+      content: instruction,
+      domain: 'personal',
+      requestId,
+      deferActionPreparation: true,
+    });
+    addMessage({
+      userId,
+      agentId: 'lumi',
+      conversationId: conversation.id,
+      role: 'assistant',
+      content: 'CAD 方案已生成并通过核验。',
+      domain: 'personal',
+      requestId,
+      toolCalls: [{
+        taskId,
+        requestId,
+        name: 'cad_generate_dxf',
+        arguments: {},
+        result: JSON.stringify({
+          path: 'C:\\Lumi\\plan.dxf',
+          previewPath: 'C:\\Lumi\\plan.svg',
+          exists: true,
+          size: 128,
+          previewExists: true,
+          previewSize: 128,
+        }),
+        terminalVerification: { status: 'verified', strategy: 'artifact', reason: 'files exist' },
+      }, {
+        taskId,
+        requestId,
+        name: 'industry_workflow_complete',
+        arguments: { taskId: 'wt_task_cad' },
+        result: JSON.stringify({
+          ok: true,
+          status: 'verified',
+          persisted: true,
+          task: { id: 'wt_task_cad', status: 'delivered' },
+          verification: { verificationId: 'wt_verify_cad', passed: true, status: 'passed' },
+          archivedFilePaths: ['C:\\Lumi\\plan.dxf', 'C:\\Lumi\\plan.svg'],
+        }),
+        terminalVerification: { status: 'verified', strategy: 'terminal_receipt', reason: 'passed' },
+      }],
+    });
+
+    expect(getOrCreateActiveConversation(userId, 'lumi', 'personal', '').actionContinuationState)
+      .toMatchObject({ taskId, status: 'completed', unfinished: false, activeRequestId: undefined });
+    expect((readDB().conversationActionTasks || []).find((task: any) => task.id === taskId))
+      .toMatchObject({ status: 'completed', activeRequestId: '', completionSource: 'tool_receipt' });
+  });
+
   it('does not let an unrelated proactive message consume an in-flight task pointer', () => {
     const userId = `conversation-action-proactive-${Date.now()}-${Math.random()}`;
     const conversation = getOrCreateActiveConversation(userId, 'lumi', 'personal', '');

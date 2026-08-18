@@ -131,6 +131,61 @@ export function parseLegacyXmlToolCalls(
   return calls.length > 0 ? calls : null;
 }
 
+function parseLegacyBracketArguments(value: string): Record<string, any> {
+  const raw = String(value || '').trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, any>
+      : {};
+  } catch {
+    const args: Record<string, any> = {};
+    for (const part of raw.split(/\s*,\s*/g)) {
+      const match = part.match(/^([A-Za-z][A-Za-z0-9_.:-]*)\s*(?:=|:)\s*([\s\S]+)$/);
+      if (!match) continue;
+      args[match[1]] = parseLegacyParameterValue(match[2]);
+    }
+    return args;
+  }
+}
+
+/**
+ * DeepSeek-compatible endpoints may print a compact bracket protocol instead
+ * of structured tool_calls. Promote only declared names and only parse a JSON
+ * object or flat key=value arguments; arbitrary bracketed model text remains
+ * ordinary text and is never executable.
+ */
+export function parseLegacyBracketToolCalls(
+  text: string | null,
+  toolDeclarations: ToolDeclaration[],
+): ParsedToolCall[] | null {
+  const raw = String(text || '').trim();
+  const allowed = new Set(toolDeclarations.map(declaration => declaration.function.name));
+  if (!raw || allowed.size === 0) return null;
+
+  const candidates: Array<{ name: string; args: string }> = [];
+  const suffixCallRe = /\[(?:[^\]\r\n]{1,48})\]\s*([A-Za-z][A-Za-z0-9_.:-]{1,127})\s*\(([\s\S]*?)\)/giu;
+  for (const match of raw.matchAll(suffixCallRe)) {
+    candidates.push({ name: match[1], args: match[2] || '' });
+  }
+  const namedBracketRe = /\[(?:调用|call(?:ing)?|tool)\s+([A-Za-z][A-Za-z0-9_.:-]{1,127})\]\s*(\{[\s\S]*?\})?/giu;
+  for (const match of raw.matchAll(namedBracketRe)) {
+    candidates.push({ name: match[1], args: match[2] || '' });
+  }
+
+  const calls: ParsedToolCall[] = [];
+  for (const candidate of candidates) {
+    if (!allowed.has(candidate.name)) continue;
+    calls.push({
+      id: `legacy-bracket-${calls.length}-${candidate.name}`,
+      name: candidate.name,
+      arguments: parseLegacyBracketArguments(candidate.args),
+    });
+  }
+  return calls.length > 0 ? calls : null;
+}
+
 function createLegacyProtocolChunkFilter(onChunk: (chunk: string) => void) {
   let state: 'pending' | 'normal' | 'suppressed' = 'pending';
   let pending = '';
@@ -489,6 +544,11 @@ export function parseDeepSeekResponse(
   const legacyToolCalls = parseLegacyXmlToolCalls(text, toolDeclarations);
   if (legacyToolCalls) {
     return { text: null, toolCalls: legacyToolCalls, reasoningContent, usage };
+  }
+
+  const bracketToolCalls = parseLegacyBracketToolCalls(text, toolDeclarations);
+  if (bracketToolCalls) {
+    return { text: null, toolCalls: bracketToolCalls, reasoningContent, usage };
   }
 
   return { text, toolCalls: null, reasoningContent, usage };

@@ -50,14 +50,56 @@ export interface QuickCommandOptions {
   currentAppTarget?: string;
 }
 
+export function buildDeterministicRuntimeWorkCommand(text: string): QuickCommandResult | null {
+  const intent = classifyRuntimeWorkIntent(text);
+  if (intent === 'none') return null;
+  const cancelling = intent === 'cancel';
+  const taskId = String(text || '').match(/\b(?:bg|wt_task)_[a-zA-Z0-9_-]+\b/)?.[0] || '';
+  return {
+    responseText: CN_VOICE_QUICK_WORK_MESSAGES.readingRuntimeWork(cancelling),
+    matched: true,
+    toolCall: {
+      name: cancelling ? 'runtime_work_cancel' : 'runtime_work_status',
+      arguments: cancelling && taskId ? { taskId } : {},
+    },
+    formatToolResult: (raw, error) => {
+      if (error) return CN_VOICE_QUICK_WORK_MESSAGES.runtimeReadFailed;
+      try {
+        const payload = JSON.parse(raw || '{}');
+        if (cancelling) {
+          if (payload.status === 'idle' || Number(payload.matchedCount || 0) === 0) return CN_VOICE_QUICK_WORK_MESSAGES.noActiveWork;
+          if (payload.status === 'cancelling') return CN_VOICE_QUICK_WORK_MESSAGES.workCancelling(Number(payload.cancellingCount || 0));
+          return CN_VOICE_QUICK_WORK_MESSAGES.workCancelled(Number(payload.cancelledCount || payload.matchedCount || 0));
+        }
+        if (payload.status === 'idle' || Number(payload.activeCount || 0) === 0) return CN_VOICE_QUICK_WORK_MESSAGES.noActiveWork;
+        const titles = Array.isArray(payload.items)
+          ? payload.items.filter((item: any) => {
+              if (typeof item?.running === 'boolean') return item.running;
+              return !['paused', 'blocked', 'waiting_confirmation', 'cancelled', 'delivered', 'completed', 'failed']
+                .includes(String(item?.status || '').toLowerCase());
+            }).slice(0, 3).map((item: any) => {
+              const id = String(item.id || '').trim();
+              const title = String(item.title || '').trim();
+              return title && id ? `${title} (${id})` : title || id;
+            }).filter(Boolean)
+          : [];
+        return CN_VOICE_QUICK_WORK_MESSAGES.activeWork(Number(payload.activeCount || titles.length), titles);
+      } catch {
+        return CN_VOICE_QUICK_WORK_MESSAGES.runtimeReceiptInvalid;
+      }
+    },
+  };
+}
+
 function captureChineseField(text: string, pattern: RegExp): string {
   return String(text.match(pattern)?.[1] || '').replace(/^[“”"'\s]+|[“”"'\s]+$/g, '').trim();
 }
 
-export function buildDeterministicDesignProjectCreateCommand(text: string): QuickCommandResult | null {
+export function parseDeterministicDesignProjectCreateArguments(text: string): Record<string, string> | null {
   const clean = String(text || '').replace(/\s+/g, ' ').trim();
   if (!isDesignProjectCreationRequest(clean)) return null;
-  const name = captureChineseField(clean, /(?:\u540d\u79f0|\u9879\u76ee\u540d(?:\u79f0)?)(?:\u4e3a|\u662f|\u53eb)?\s*[“"']?([^”"'\uff0c\u3002\uff1b;]{2,80})/u);
+  const name = captureChineseField(clean, /(?:\u540d\u79f0|\u9879\u76ee\u540d(?:\u79f0)?)(?:\u4e3a|\u662f|\u53eb|[:\uff1a=])?\s*[“"']?([^”"'\uff0c\u3002\uff1b;]{2,80})/u)
+    || captureChineseField(clean, /(?:\u5ba4\u5185|\u88c5\u4fee|\u8bbe\u8ba1)?\u9879\u76ee\s*[\u201c\u201d"']([^\u201c\u201d"'\uff0c\u3002\uff1b;]{2,80})[\u201c\u201d"']/u);
   if (!name) return null;
   const projectType = /(?:\u4f4f\u5b85|\u5bb6\u88c5)/u.test(clean)
     ? 'residential'
@@ -68,17 +110,30 @@ export function buildDeterministicDesignProjectCreateCommand(text: string): Quic
         : /(?:\u9152\u5e97|\u6c11\u5bbf|\u9910\u996e)/u.test(clean)
           ? 'hospitality'
           : 'other';
-  const location = captureChineseField(clean, /(?:\u5730\u70b9|\u4f4d\u7f6e|\u9879\u76ee\u5730\u5740)(?:\u4e3a|\u662f)?\s*([^\uff0c\u3002\uff1b;]{2,80})/u);
-  const area = captureChineseField(clean, /(?:\u5efa\u7b51\u9762\u79ef|\u5957\u5185\u9762\u79ef|\u9762\u79ef)(?:\u4e3a|\u662f)?\s*([0-9.]+\s*(?:\u5e73\u65b9\u7c73|\u5e73\u7c73|\u33a1))/u);
-  const occupants = captureChineseField(clean, /(?:\u5c45\u4f4f\u8005|\u4f7f\u7528\u8005|\u5bb6\u5ead\u6210\u5458)(?:\u4e3a|\u662f)?\s*([^\uff0c\u3002\uff1b;]{2,120})/u);
-  const budget = captureChineseField(clean, /(?:[^\uff0c\u3002\uff1b;]{0,16})?\u9884\u7b97(?:\u4e3a|\u662f)?\s*([0-9.]+\s*(?:\u4e07\u5143|\u5143|CNY|RMB))/iu);
-  const style = captureChineseField(clean, /(?:\u504f\u597d|\u98ce\u683c(?:\u4e3a|\u662f)?|\u559c\u6b22)\s*([^\uff0c\u3002\uff1b;]{2,80})/u);
-  const requirements = captureChineseField(clean, /\u9700\u6c42\s*[\uff1a:]\s*([\s\S]*?)(?=[\uff1b;]\s*\u7ea6\u675f\s*[\uff1a:]|\u3002\s*\u8bf7|$)/u);
-  const constraints = captureChineseField(clean, /\u7ea6\u675f\s*[\uff1a:]\s*([\s\S]*?)(?=\u3002\s*\u8bf7|$)/u);
+  const location = captureChineseField(clean, /(?:\u5730\u70b9|\u4f4d\u7f6e|\u9879\u76ee\u5730\u5740)(?:\u4e3a|\u662f|[:\uff1a=])?\s*([^\uff0c\u3002\uff1b;]{2,80})/u);
+  const area = captureChineseField(clean, /(?:\u5efa\u7b51\u9762\u79ef|\u5957\u5185\u9762\u79ef|\u9762\u79ef)(?:\u4e3a|\u662f|[:\uff1a=])?\s*([0-9.]+\s*(?:\u5e73\u65b9\u7c73|\u5e73\u7c73|\u33a1))/u);
+  const occupants = captureChineseField(clean, /(?:\u5c45\u4f4f\u8005|\u4f7f\u7528\u8005|\u5bb6\u5ead\u6210\u5458)(?:\u4e3a|\u662f|[:\uff1a=])?\s*([^\uff0c\u3002\uff1b;]{2,120})/u);
+  const budget = captureChineseField(clean, /(?:[^\uff0c\u3002\uff1b;]{0,16})?\u9884\u7b97(?:\u4e3a|\u662f|[:\uff1a=])?\s*([0-9.]+\s*(?:\u4e07\u5143|\u5143|CNY|RMB))/iu);
+  const style = captureChineseField(clean, /(?:\u504f\u597d|\u98ce\u683c)(?:\u4e3a|\u662f|[:\uff1a=])?\s*([^\uff0c\u3002\uff1b;]{2,80})/u)
+    || captureChineseField(clean, /\u559c\u6b22\s*([^\uff0c\u3002\uff1b;]{2,80})/u);
+  const requirements = captureChineseField(clean, /\u9700\u6c42\s*[:\uff1a=]\s*([\s\S]*?)(?=[\uff1b;]\s*\u7ea6\u675f\s*[:\uff1a=]|\u3002\s*\u8bf7|$)/u);
+  const constraints = captureChineseField(clean, /\u7ea6\u675f\s*[:\uff1a=]\s*([\s\S]*?)(?=\u3002(?:\s*\u8bf7|$)|$)/u);
   const args: Record<string, string> = { name, projectType };
   for (const [key, value] of Object.entries({ location, area, occupants, budget, style, requirements, constraints })) {
     if (value) args[key] = value;
   }
+  return args;
+}
+
+export function isDesignProjectCreateAndSchemeRequest(text: string): boolean {
+  const clean = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!isDesignProjectCreationRequest(clean)) return false;
+  return /(?:\u751f\u6210|\u5f62\u6210|\u5236\u4f5c|\u8f93\u51fa|\u5f52\u6863|generate|create|build|produce).{0,36}(?:\u9879\u76ee\u65b9\u6848|\u8bbe\u8ba1\u65b9\u6848|project\s+scheme)/iu.test(clean);
+}
+
+export function buildDeterministicDesignProjectCreateCommand(text: string): QuickCommandResult | null {
+  const args = parseDeterministicDesignProjectCreateArguments(text);
+  if (!args) return null;
   return {
     matched: true,
     responseText: '\u6b63\u5728\u521b\u5efa\u5e76\u6fc0\u6d3b\u5ba4\u5185\u8bbe\u8ba1\u9879\u76ee\u3002',
@@ -259,34 +314,8 @@ const patterns: QuickPattern[] = [
   },
   {
     patterns: [/[\s\S]+/u],
-    handler: (match) => {
-      const intent = classifyRuntimeWorkIntent(match[0]);
-      if (intent === 'none') return { responseText: '', matched: false };
-      const cancelling = intent === 'cancel';
-      return {
-        responseText: CN_VOICE_QUICK_WORK_MESSAGES.readingRuntimeWork(cancelling),
-        matched: true,
-        toolCall: { name: cancelling ? 'runtime_work_cancel' : 'runtime_work_status', arguments: {} },
-        formatToolResult: (raw, error) => {
-          if (error) return CN_VOICE_QUICK_WORK_MESSAGES.runtimeReadFailed;
-          try {
-            const payload = JSON.parse(raw || '{}');
-            if (cancelling) {
-              if (payload.status === 'idle' || Number(payload.matchedCount || 0) === 0) return CN_VOICE_QUICK_WORK_MESSAGES.noActiveWork;
-              if (payload.status === 'cancelling') return CN_VOICE_QUICK_WORK_MESSAGES.workCancelling(Number(payload.cancellingCount || 0));
-              return CN_VOICE_QUICK_WORK_MESSAGES.workCancelled(Number(payload.cancelledCount || payload.matchedCount || 0));
-            }
-            if (payload.status === 'idle' || Number(payload.activeCount || 0) === 0) return CN_VOICE_QUICK_WORK_MESSAGES.noActiveWork;
-            const titles = Array.isArray(payload.items)
-              ? payload.items.slice(0, 3).map((item: any) => String(item.title || item.id || '')).filter(Boolean)
-              : [];
-            return CN_VOICE_QUICK_WORK_MESSAGES.activeWork(Number(payload.activeCount || titles.length), titles);
-          } catch {
-            return CN_VOICE_QUICK_WORK_MESSAGES.runtimeReceiptInvalid;
-          }
-        },
-      };
-    },
+    handler: (match) => buildDeterministicRuntimeWorkCommand(match[0])
+      || { responseText: '', matched: false },
   },
   {
     patterns: [/[\s\S]+/u],

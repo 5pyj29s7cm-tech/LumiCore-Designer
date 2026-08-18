@@ -114,6 +114,136 @@ function leakedLegacyToolProtocol(input: LumiResultFinalizerInput): LumiResultFi
   };
 }
 
+function parseToolRecordResult(record: ToolExecutionRecord | undefined): Record<string, any> {
+  if (!record || record.error) return {};
+  try {
+    const parsed = JSON.parse(String(record.result || ''));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, any>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The canonical industry completion receipt is stronger than a model's final
+ * narration. If the final model turn leaks another internal protocol request,
+ * preserve the already verified deliverable and report only receipt-backed
+ * facts instead of replacing success with a false "not executed" message.
+ */
+function formatGroundedIndustryWorkflowCompletionResult(
+  input: LumiResultFinalizerInput,
+): LumiResultFinalizerResult | null {
+  const records = input.toolRecords || [];
+  const completionRecord = [...records].reverse().find(record => (
+    record.name === 'industry_workflow_complete'
+    && recordHasTerminalSuccess(record)
+  ));
+  const completion = parseToolRecordResult(completionRecord);
+  if (
+    completion.ok !== true
+    || completion.persisted !== true
+    || String(completion.status || '').toLowerCase() !== 'verified'
+    || completion?.verification?.passed !== true
+  ) return null;
+
+  const task = completion.task && typeof completion.task === 'object' ? completion.task : {};
+  const verification = completion.verification && typeof completion.verification === 'object'
+    ? completion.verification
+    : {};
+  const archivedPaths = Array.isArray(completion.archivedFilePaths)
+    ? completion.archivedFilePaths.map(String).filter(Boolean)
+    : [];
+  const cadRecord = [...records].reverse().find(record => (
+    record.name === 'cad_generate_dxf'
+    && recordHasTerminalSuccess(record)
+  ));
+  const cad = parseToolRecordResult(cadRecord);
+  const zh = isChineseText(resultTaskText(input));
+
+  if (cad.path && cad.previewPath && cad.exists === true && cad.previewExists === true) {
+    const layerCounts = cad.layerCounts && typeof cad.layerCounts === 'object'
+      ? cad.layerCounts as Record<string, unknown>
+      : {};
+    const layers = Array.isArray(cad.layers)
+      ? cad.layers.map(String).filter(Boolean)
+      : Object.keys(layerCounts).filter(Boolean);
+    const missing = Array.isArray(cad.missingForPrecision)
+      ? cad.missingForPrecision.map(String).filter(Boolean)
+      : [];
+    const dimensions = Number(cad.width) > 0 && Number(cad.height) > 0
+      ? `${Number(cad.width)} × ${Number(cad.height)} ${String(cad.unit || '').trim()}`.trim()
+      : '';
+    const geometryPassed = cad.geometryVerified === true
+      && cad?.geometryValidation?.passed === true;
+    const title = String(cad.title || task.title || '').trim();
+    const source = String(cad.sourcePath || '').trim();
+    const lines = zh
+      ? [
+          'CAD 方案已生成，并通过持久工作流核验。',
+          title ? `项目/图纸：${title}` : '',
+          dimensions ? `单位与外轮廓：${dimensions}` : '',
+          layers.length ? `图层：${layers.join('、')}` : '',
+          `几何校验：${geometryPassed ? '通过' : '回执未确认'}`,
+          source ? `已知边界来源：${source}` : '',
+          missing.length ? `未知/待复核边界：${missing.join('、')}` : '',
+          `DXF：${String(cad.path)}`,
+          `SVG 预览：${String(cad.previewPath)}`,
+          task.id ? `持久任务编号：${String(task.id)}` : '',
+          verification.verificationId
+            ? `验证回执：${String(verification.verificationId)}（${String(verification.status || 'passed')}）`
+            : '',
+          cad.opened === false ? '外部软件：未打开；客户外发：未执行。' : '',
+        ]
+      : [
+          'The CAD scheme was generated and passed the durable workflow verifier.',
+          title ? `Project/drawing: ${title}` : '',
+          dimensions ? `Unit and outer boundary: ${dimensions}` : '',
+          layers.length ? `Layers: ${layers.join(', ')}` : '',
+          `Geometry verification: ${geometryPassed ? 'passed' : 'not confirmed by the receipt'}`,
+          source ? `Known-boundary source: ${source}` : '',
+          missing.length ? `Unknown/review boundaries: ${missing.join(', ')}` : '',
+          `DXF: ${String(cad.path)}`,
+          `SVG preview: ${String(cad.previewPath)}`,
+          task.id ? `Durable task: ${String(task.id)}` : '',
+          verification.verificationId
+            ? `Verification receipt: ${String(verification.verificationId)} (${String(verification.status || 'passed')})`
+            : '',
+          cad.opened === false ? 'No external application was opened and no client delivery was performed.' : '',
+        ];
+    return {
+      text: lines.filter(Boolean).join('\n'),
+      blocked: false,
+      reason: 'Grounded industry workflow completion from verified CAD and archival receipts.',
+    };
+  }
+
+  const summary = String(verification.summary || '').trim();
+  const lines = zh
+    ? [
+        '行业工作流已完成并通过持久回执核验。',
+        task.title ? `任务：${String(task.title)}` : '',
+        task.id ? `持久任务编号：${String(task.id)}` : '',
+        verification.verificationId ? `验证回执：${String(verification.verificationId)}` : '',
+        summary ? `核验摘要：${summary}` : '',
+        ...archivedPaths.map(path => `交付文件：${path}`),
+      ]
+    : [
+        'The industry workflow completed and passed its durable verifier.',
+        task.title ? `Task: ${String(task.title)}` : '',
+        task.id ? `Durable task: ${String(task.id)}` : '',
+        verification.verificationId ? `Verification receipt: ${String(verification.verificationId)}` : '',
+        summary ? `Verification summary: ${summary}` : '',
+        ...archivedPaths.map(path => `Deliverable: ${path}`),
+      ];
+  return {
+    text: lines.filter(Boolean).join('\n'),
+    blocked: false,
+    reason: 'Grounded industry workflow completion from the canonical verification receipt.',
+  };
+}
+
 function claimedExecutedToolNames(text: string): { asserted: boolean; toolNames: string[] } {
   const raw = String(text || '');
   const clauses: string[] = [];
@@ -489,7 +619,8 @@ function recordHasTerminalSuccess(record: ToolExecutionRecord): boolean {
   try {
     const parsed = JSON.parse(raw);
     const status = String(parsed?.status || parsed?.verification?.status || '').trim().toLowerCase();
-    if (parsed?.ok === false || parsed?.success === false || parsed?.opened === false) return false;
+    const openOperation = /(?:^|_)(?:open|launch|activate)(?:_|$)/i.test(record.name);
+    if (parsed?.ok === false || parsed?.success === false || (openOperation && parsed?.opened === false)) return false;
     if (/^(?:failed|error|blocked|denied|forbidden|timeout|timed_out|cancelled|canceled|not_found)$/.test(status)) return false;
   } catch {}
   return !/(?:^|\b)(?:failed|error|blocked|not found|timed out|permission denied)(?:\b|:)/i.test(raw);
@@ -1369,6 +1500,10 @@ export function finalizeLumiResponse(input: LumiResultFinalizerInput): LumiResul
     toolRecords: coalesceToolExecutionRecords(input.toolRecords || []),
   };
   const actionText = resultTaskText(input);
+  const groundedIndustryCompletion = formatGroundedIndustryWorkflowCompletionResult(input);
+  if (groundedIndustryCompletion) return groundedIndustryCompletion;
+  const earlyGroundedCadRun = formatGroundedCadRunResult(input);
+  if (earlyGroundedCadRun) return earlyGroundedCadRun;
   const protocolLeak = leakedLegacyToolProtocol(input);
   if (protocolLeak) return protocolLeak;
   const safeResponseText = sanitizeInternalExecutionText(
@@ -1381,8 +1516,6 @@ export function finalizeLumiResponse(input: LumiResultFinalizerInput): LumiResul
   // A CAD workflow receipt owns both its execution truth and its user-facing
   // terminal state. Do not let model narration or a later generic guard hide
   // a verified completion or a concrete workflow blocker.
-  const earlyGroundedCadRun = formatGroundedCadRunResult(input);
-  if (earlyGroundedCadRun) return earlyGroundedCadRun;
   const modeSafeResponseText = sanitizeContradictoryOperationModeText(input);
   if (modeSafeResponseText !== input.responseText) {
     input = { ...input, responseText: modeSafeResponseText };

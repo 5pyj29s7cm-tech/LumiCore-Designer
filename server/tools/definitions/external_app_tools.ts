@@ -275,9 +275,21 @@ function safeFileName(value: string): string {
 }
 
 function safeLayer(value: any, fallback: string): string {
-  return String(value || fallback)
+  const raw = String(value || '').trim();
+  const mapped = /(?:外轮廓|轮廓|边界)/u.test(raw) ? 'OUTLINE'
+    : /(?:分区|区域)/u.test(raw) ? 'ZONE'
+    : /(?:墙|隔断)/u.test(raw) ? 'WALL'
+    : /(?:门)/u.test(raw) ? 'DOOR'
+    : /(?:窗)/u.test(raw) ? 'WINDOW'
+    : /(?:尺寸)/u.test(raw) ? 'DIM'
+    : /(?:标注|文字|文本)/u.test(raw) ? 'TEXT'
+    : /(?:标题)/u.test(raw) ? 'TITLE'
+    : raw;
+  const ascii = String(mapped || fallback)
     .replace(/[^a-zA-Z0-9_$-]+/g, '_')
-    .slice(0, 31) || fallback;
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 31);
+  return ascii || fallback;
 }
 
 function dxfLine(x1: number, y1: number, x2: number, y2: number, layer = 'CUT'): string[] {
@@ -2476,6 +2488,10 @@ export function registerExternalAppTools(registry: ToolRegistry): void {
       fs.writeFileSync(previewPath, previewSvg, 'utf-8');
       const stat = fs.statSync(outPath);
       const previewStat = fs.statSync(previewPath);
+      const layerCounts = collectAutocadDrawOperations(draftArgs).reduce((counts: Record<string, number>, operation) => {
+        counts[operation.layer] = (counts[operation.layer] || 0) + 1;
+        return counts;
+      }, {});
 
       let openResult: string | undefined;
       if (draftArgs.openPreview) {
@@ -2512,6 +2528,8 @@ export function registerExternalAppTools(registry: ToolRegistry): void {
           { type: 'dxf', path: outPath },
           { type: 'svg_preview', path: previewPath },
         ],
+        layers: Object.keys(layerCounts),
+        layerCounts,
         walls: Array.isArray(draftArgs.walls) ? draftArgs.walls.length : Array.isArray(draftArgs.lines) ? draftArgs.lines.length : 0,
         rooms: Array.isArray(draftArgs.rooms) ? draftArgs.rooms.length : 0,
         doors: Array.isArray(draftArgs.doors) ? draftArgs.doors.length : 0,

@@ -36,6 +36,18 @@ describe('designer stage intent', () => {
     expect(isDesignProjectStatusRequest('\u5f53\u524d\u8bbe\u8ba1\u9879\u76ee\u8fdb\u5ea6\u5230\u54ea\u4e00\u6b65\u4e86\uff1f')).toBe(true);
   });
 
+  it('does not turn a create-and-scheme request into a status query', () => {
+    const request = '\u8bbe\u8ba1\u9879\u76ee\u5b9e\u673a\u9a8c\u6536\uff1a\u65b0\u5efa\u5e76\u6fc0\u6d3b\u5ba4\u5185\u8bbe\u8ba1\u9879\u76ee\u201c\u66ae\u84dd-26\u9a8c\u6536\u4f4f\u5b85\u201d\uff1b\u8bf7\u521b\u5efa\u6301\u4e45\u9879\u76ee\u5e76\u751f\u6210\u53ef\u5ba1\u6838\u7684\u9879\u76ee\u65b9\u6848\uff0c\u5305\u542b\u5b9e\u65bd\u9636\u6bb5\u548c\u9879\u76ee\u7f16\u53f7\u3002';
+    expect(isDesignProjectCreationRequest(request)).toBe(true);
+    expect(isDesignProjectStatusRequest(request)).toBe(false);
+  });
+
+  it('does not turn an explicit CAD generation and verification request into a status query', () => {
+    const request = 'CAD \u65b9\u6848\u5b9e\u673a\u9a8c\u6536\uff1a\u7ee7\u7eed\u5f53\u524d\u5df2\u6fc0\u6d3b\u9879\u76ee\u201c\u66ae\u84dd-26\u9a8c\u6536\u4f4f\u5b85\u201d\uff0c\u4ec5\u4f7f\u7528\u660e\u786e\u51e0\u4f55\u4e8b\u5b9e\u3002\u8bf7\u751f\u6210\u5e76\u6838\u9a8c\u4e00\u4efd\u53ef\u5ba1\u6838\u7684 DXF \u548c SVG \u9884\u89c8\uff0c\u6807\u6ce8\u6587\u4ef6\u8def\u5f84\u3001\u6301\u4e45\u4efb\u52a1\u7f16\u53f7\u548c\u9a8c\u8bc1\u56de\u6267\uff1b\u4e0d\u6253\u5f00\u5916\u90e8\u8f6f\u4ef6\u3002';
+    expect(matchCurrentIndustryWorkflow(request)?.entry.entryId).toBe('cad');
+    expect(isDesignProjectStatusRequest(request)).toBe(false);
+  });
+
   it('does not collapse a five-workspace receipt summary into the active project status reader', () => {
     const multiWorkspaceQuery = '设计师版文字验收：请只根据已经存在的行业任务账本和最终回执，分别列出“设计项目、CAD 方案、效果图、提案 PPT、交付中心”的最近任务状态、关键结果、交付物和确认边界；不要重新执行工作流。';
     expect(isDesignProjectStatusRequest(multiWorkspaceQuery)).toBe(false);

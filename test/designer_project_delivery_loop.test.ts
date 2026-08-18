@@ -13,7 +13,11 @@ import {
   setActiveInteriorProject,
   updateInteriorProject,
 } from '../server/design/projects';
-import { getInteriorProjectWorkflow } from '../server/design/project_workflow';
+import {
+  getInteriorProjectWorkflow,
+  getMissingInteriorProjectPrerequisites,
+  linkInteriorProjectWorkflowStage,
+} from '../server/design/project_workflow';
 import {
   recordIndustryWorkflowExecution,
   startIndustryWorkflow,
@@ -80,6 +84,49 @@ function stageToolRecords(entryId: string): any[] {
 }
 
 describe('designer project delivery loop', () => {
+  it('keeps a previously verified project stage valid while a later replay is interrupted', () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_verified_replay_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, { name: 'Verified replay project' });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const scope = { userId, domain: 'personal' as const, orgId: '' };
+    const first = startIndustryWorkflow({ ...scope, entryId: 'project', source: 'chat' });
+    const delivered = recordIndustryWorkflowExecution({
+      ...scope,
+      taskId: first.task.id,
+      resultText: stageResult('project'),
+      toolRecords: stageToolRecords('project'),
+    });
+    expect(delivered.verification.passed).toBe(true);
+
+    linkInteriorProjectWorkflowStage({
+      orgId: scopeId,
+      projectId: project.id,
+      entryId: 'project',
+      taskId: `wt_task_interrupted_${suffix}`,
+      conversationTaskId: `conversation_task_${suffix}`,
+      rootConversationId: `conversation_${suffix}`,
+      rootTaskId: `root_${suffix}`,
+    });
+    const workflow = getInteriorProjectWorkflow(scopeId, project.id)!;
+    expect(workflow.stages.project.status).toBe('in_progress');
+    expect(workflow.stages.project.verificationStatus).toBe('passed');
+    expect(getMissingInteriorProjectPrerequisites(workflow, 'cad')).toEqual([]);
+
+    const cad = linkInteriorProjectWorkflowStage({
+      orgId: scopeId,
+      projectId: project.id,
+      entryId: 'cad',
+      taskId: `wt_task_cad_${suffix}`,
+      conversationTaskId: `conversation_task_cad_${suffix}`,
+      rootConversationId: `conversation_${suffix}`,
+      rootTaskId: `root_${suffix}`,
+    });
+    expect(cad.stages.cad.sourceTaskIds).toContain(first.task.id);
+    expect(cad.stages.cad.sourceTaskIds).not.toContain(`wt_task_interrupted_${suffix}`);
+  });
+
   it('persists an active project binding per user for voice and chat inheritance', () => {
     const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const owner = `design_active_owner_${suffix}`;

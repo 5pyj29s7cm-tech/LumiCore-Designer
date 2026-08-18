@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseDeepSeekResponse, parseLegacyXmlToolCalls } from '../server/llm/providers';
+import { parseDeepSeekResponse, parseLegacyBracketToolCalls, parseLegacyXmlToolCalls } from '../server/llm/providers';
 
 describe('legacy XML tool protocol compatibility', () => {
   const declarations = [
@@ -51,6 +51,39 @@ describe('legacy XML tool protocol compatibility', () => {
       name: 'industry_workflow_start',
       arguments: { entryId: 'visualization' },
     })]);
+  });
+
+  it('converts a declared DeepSeek bracket call into a structured call', () => {
+    expect(parseLegacyBracketToolCalls(
+      '[tool] industry_workflow_start({"entryId":"cad"})',
+      declarations,
+    )).toEqual([expect.objectContaining({
+      name: 'industry_workflow_start',
+      arguments: { entryId: 'cad' },
+    })]);
+  });
+
+  it('normalizes a named Chinese bracket call in a non-streaming response', () => {
+    const parsed = parseDeepSeekResponse({
+      choices: [{
+        message: {
+          content: '[调用 industry_workflow_start] {"entryId":"cad"}',
+        },
+      }],
+    }, declarations);
+
+    expect(parsed.text).toBeNull();
+    expect(parsed.toolCalls).toEqual([expect.objectContaining({
+      name: 'industry_workflow_start',
+      arguments: { entryId: 'cad' },
+    })]);
+  });
+
+  it('does not execute undeclared bracket tool names', () => {
+    expect(parseLegacyBracketToolCalls(
+      '[tool] desktop_run_command({"command":"whoami"})',
+      declarations,
+    )).toBeNull();
   });
 
   it('does not execute undeclared XML tool names', () => {

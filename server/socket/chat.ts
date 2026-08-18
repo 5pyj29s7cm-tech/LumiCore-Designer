@@ -120,8 +120,11 @@ import { summarizeToolRecordForPersistence } from "../cognition/tool_record_stat
 import {
   buildDeterministicClientNavigationCommand,
   buildDeterministicDesignProjectCreateCommand,
+  buildDeterministicRuntimeWorkCommand,
   buildQuickCommandToolPolicy,
+  isDesignProjectCreateAndSchemeRequest,
   matchQuickCommand,
+  parseDeterministicDesignProjectCreateArguments,
 } from "../cognition/quick_commands";
 import { recordTokenUsage } from "../llm/token_tracker";
 import {
@@ -1619,10 +1622,16 @@ export function registerChatHandler(
         visibleUserText,
         conversation?.actionContinuationState,
       );
+      // Runtime task-control questions must read the unified live ledger. A
+      // generic conversation follow-up can also classify the same wording as
+      // "status"; letting that older branch win can return an empty/stale
+      // conversation snapshot instead of executing runtime_work_status.
+      const deterministicRuntimeWork = buildDeterministicRuntimeWorkCommand(visibleUserText);
       const explicitMultiIndustryLedgerStatus = isCurrentIndustryMultiWorkspaceLedgerStatusRequest(visibleUserText);
       if (
         conversationId
         && (actionFollowupIntent === 'status' || explicitMultiIndustryLedgerStatus)
+        && !deterministicRuntimeWork
         && !isDesignProjectStatusRequest(visibleUserText)
       ) {
         const statusText = getConversationActionStatus(conversationId, uid, visibleUserText, conversation?.actionContinuationState);
@@ -1987,10 +1996,57 @@ export function registerChatHandler(
           })
         : { state: null, kind: 'conversation' as const };
       let chatIndustryWorkflowTask: ReturnType<typeof startIndustryWorkflow>['task'] | null = null;
+      let chatIndustryConversationTaskId = '';
       let chatIndustryPrerequisite: ReturnType<typeof getIndustryWorkflowPrerequisiteStatus> = null;
+      let precreatedDesignProjectRecord: ToolExecutionRecord | null = null;
+      const createAndSchemeDesignProject = turnFlow.industryWorkflowEntryId === 'project'
+        && isDesignProjectCreateAndSchemeRequest(visibleUserText);
+      if (createAndSchemeDesignProject) {
+        const createArgs = parseDeterministicDesignProjectCreateArguments(visibleUserText);
+        if (createArgs) {
+          const correlationId = `design-project-create-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          emitToolLifecycle({ correlationId, name: 'interior_design_project_create', arguments: createArgs });
+          precreatedDesignProjectRecord = await executeToolCall({
+            registry: toolRegistry,
+            id: correlationId,
+            name: 'interior_design_project_create',
+            arguments: createArgs,
+            context: {
+              userId: uid,
+              taskId: actionTaskExecution.state?.taskId || requestId,
+              conversationId,
+              turnId: requestId,
+              requestId,
+              domain: resolvedDomain,
+              orgId: resolvedOrgId,
+              desktopRelay,
+              llmGetters,
+              source: 'chat_design_project_create_and_scheme',
+              supervisedExternalCommits: true,
+              allowLocalFileWrites,
+              localWriteIntentReason,
+              requestConfirmation: requestToolConfirmation,
+              actionIntent: visibleUserText,
+              routedTaskText: visibleUserText,
+              toolPolicy: buildQuickCommandToolPolicy(routedToolPolicy, 'interior_design_project_create'),
+            },
+          });
+          emitToolLifecycle({
+            correlationId,
+            name: 'interior_design_project_create',
+            arguments: createArgs,
+            ...(precreatedDesignProjectRecord.error
+              ? { error: precreatedDesignProjectRecord.error }
+              : { result: formatToolResultForUi(precreatedDesignProjectRecord.result) }),
+          });
+        }
+      }
       const shouldCreateDesignProject = turnFlow.industryWorkflowEntryId === 'project'
-        && isDesignProjectCreationRequest(visibleUserText);
-      if (turnFlow.industryWorkflowEntryId && !shouldCreateDesignProject) {
+        && isDesignProjectCreationRequest(visibleUserText)
+        && !createAndSchemeDesignProject;
+      const designProjectReadyForScheme = !createAndSchemeDesignProject
+        || Boolean(precreatedDesignProjectRecord && !precreatedDesignProjectRecord.error);
+      if (turnFlow.industryWorkflowEntryId && !shouldCreateDesignProject && designProjectReadyForScheme) {
         const startedIndustryWorkflow = startIndustryWorkflow({
           userId: uid,
           domain: resolvedDomain === 'work' ? 'work' : 'personal',
@@ -2004,6 +2060,7 @@ export function registerChatHandler(
           requestId,
         });
         chatIndustryWorkflowTask = startedIndustryWorkflow.task;
+        chatIndustryConversationTaskId = startedIndustryWorkflow.conversationTaskId;
         chatIndustryPrerequisite = getIndustryWorkflowPrerequisiteStatus(chatIndustryWorkflowTask);
         routedToolPolicy = bindIndustryWorkflowToolPolicy(
           routedToolPolicy,
@@ -2364,7 +2421,12 @@ export function registerChatHandler(
             undefined,
             {
               userId: uid,
-              taskId: actionTaskExecution.state?.taskId || requestId,
+              // Industry stages can reuse a durable project-stage task even
+              // when the generic action classifier did not create a pointer.
+              // Bind every model/tool receipt to the canonical task returned
+              // by startIndustryWorkflow so terminal receipts close the same
+              // ledger row instead of leaving a ghost "executing" task.
+              taskId: chatIndustryConversationTaskId || actionTaskExecution.state?.taskId || requestId,
               conversationId: conversation.id,
               turnId: requestId,
               requestId,
@@ -2593,11 +2655,12 @@ export function registerChatHandler(
           ? buildDeterministicClientNavigationCommand(executionPipeline.normalizedIntent)
           : null;
         const deterministicDesignProjectCreate = turnFlow.industryWorkflowEntryId === 'project'
+          && !createAndSchemeDesignProject
           ? buildDeterministicDesignProjectCreateCommand(visibleUserText)
           : null;
         const quickResult = capabilityMetaResponse
           ? { matched: true, responseText: capabilityMetaResponse }
-          : deterministicDesignProjectCreate || deterministicClientNavigation || (shouldRunLegacyDirectExecution() ? await matchQuickCommand(
+          : deterministicRuntimeWork || deterministicDesignProjectCreate || deterministicClientNavigation || (shouldRunLegacyDirectExecution() ? await matchQuickCommand(
               continuationOpenTarget ? buildInternalOpenCommand(visibleUserText, continuationOpenTarget) : text,
               uid,
               {
@@ -2791,7 +2854,9 @@ export function registerChatHandler(
 
       let responseText = '';
       let llmWasCalled = false;
-      const allToolRecords: ToolExecutionRecord[] = [];
+      const allToolRecords: ToolExecutionRecord[] = precreatedDesignProjectRecord
+        ? [precreatedDesignProjectRecord]
+        : [];
       let actionPreflightContext = '';
       const runPreflightTool = async (name: string, args: Record<string, any>): Promise<ToolExecutionRecord> => {
         const correlationId = `preflight-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -3977,7 +4042,7 @@ export function registerChatHandler(
             turnFlow.industryWorkflowEntryId ? undefined : onChunk,
             {
               userId: uid,
-              taskId: actionTaskExecution.state?.taskId || requestId,
+              taskId: chatIndustryConversationTaskId || actionTaskExecution.state?.taskId || requestId,
               conversationId: conversation.id,
               turnId: requestId,
               requestId,

@@ -16,6 +16,10 @@ function isMultiWorkspaceLedgerStatusRequest(value: string): boolean {
 export function isDesignProjectStatusRequest(text: unknown): boolean {
   const value = String(text || '').trim();
   if (!value) return false;
+  // Positive design execution must win over generic status words such as
+  // "current", "stage", and "verification" that legitimately occur in
+  // project, CAD, visualization, presentation, and handoff requests.
+  if (isDesignProjectCreationRequest(value) || isCurrentIndustryWorkflowExecutionRequest(value)) return false;
   // A cross-workspace receipt summary belongs to the generic industry action
   // ledger. The active-project stage reader is intentionally single-project
   // and must not collapse five requested workspaces into one CAD/status row.
@@ -28,3 +32,7 @@ export function isDesignProjectStatusRequest(text: unknown): boolean {
     DESIGN_SUBJECT_EN_RE.test(value) && DESIGN_STATUS_EN_RE.test(value)
   );
 }
+import {
+  isCurrentIndustryWorkflowExecutionRequest,
+  isDesignProjectCreationRequest,
+} from '../regions/packs/cn/industry_capability_profile';

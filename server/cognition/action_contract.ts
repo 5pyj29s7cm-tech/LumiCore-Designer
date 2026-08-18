@@ -1663,6 +1663,13 @@ function hasArtifactVerification(records: ToolExecutionRecord[]): boolean {
       return (payload?.exists === true && Number(payload?.size ?? payload?.sizeBytes ?? 1) > 0)
         || /"exists"\s*:\s*true/i.test(record.result) && !/"(?:size|sizeBytes)"\s*:\s*0\b/i.test(record.result);
     }
+    if (record.name === 'cad_generate_dxf' && record.terminalVerification?.status === 'verified') {
+      const payload = parseRecordJson(record);
+      return payload?.exists === true
+        && Number(payload?.size ?? payload?.sizeBytes ?? 1) > 0
+        && payload?.previewExists === true
+        && Number(payload?.previewSize ?? payload?.previewSizeBytes ?? 1) > 0;
+    }
     return false;
   });
 }
