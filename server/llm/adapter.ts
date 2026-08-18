@@ -516,6 +516,48 @@ export function isForbiddenLocalCadImageFallback(
   return /certutil(?:\.exe)?\s+-(?:encode|decode)|(?:to|from)base64|stringfrombase64|base64string|convert\.?tobase64|base64\s+(?:encode|decode)|\[\s*convert\s*\]\s*::\s*(?:to|from)base64/i.test(payload);
 }
 
+function firstMissingVerifiedIndustryReceipt(
+  requiredReceipts: string[] | undefined,
+  executionLog: ToolExecutionRecord[],
+): string {
+  return (requiredReceipts || []).find(name => !executionLog.some(record => (
+    record.name === name
+    && !record.error
+    && record.terminalVerification?.status === 'verified'
+    && String(record.result || '').trim()
+  ))) || '';
+}
+
+function hasUnknownRequiredIndustryOutcome(
+  requiredReceipts: string[] | undefined,
+  executionLog: ToolExecutionRecord[],
+): boolean {
+  return (requiredReceipts || []).some(name => [...executionLog].reverse().find(
+    record => record.name === name,
+  )?.error?.match(
+    /unknown (?:prior )?(?:external commit )?outcome|external commit outcome is unknown|automatic resend was stopped/i,
+  ));
+}
+
+function buildMissingIndustryReceiptSummary(task: string, missingReceipt: string): string {
+  return /[\u3400-\u9fff]/.test(task)
+    ? `行业工作流未完成：缺少本轮必须的已核验工具回执 ${missingReceipt}。系统已停止继续调用无关只读工具；没有把历史文件或旧回执当作本次产物。`
+    : `Industry workflow creation stopped: the current run is missing the required verified ${missingReceipt} receipt. Unrelated read-only calls were stopped, and historical files or receipts were not treated as current output.`;
+}
+
+function isStaleIndustryLedgerRead(toolName: string): boolean {
+  return /^(?:interior_design_project_status|work_takeover_task_get|industry_workspace_status|unrelated_read_only)$/.test(
+    String(toolName || '').trim(),
+  );
+}
+
+function hasCurrentIndustryReceiptAttempt(
+  receiptName: string,
+  executionLog: ToolExecutionRecord[],
+): boolean {
+  return executionLog.some(record => record.name === receiptName);
+}
+
 export async function runWithTools(
   messages: NormalizedMessage[],
   toolRegistry: ToolRegistry,
@@ -567,6 +609,8 @@ export async function runWithTools(
   let loopLimit = Math.max(1, effectiveMaxIterations);
   let forceVerifiedIndustryFinalResponse = false;
   const requiredIndustryReplans = new Set<string>();
+  const forcedRequiredIndustryAttempts = new Set<string>();
+  let forcedRequiredIndustryTool = '';
   let industryAssessmentFinalResponseReserved = false;
   for (let iteration = 0; iteration < loopLimit; iteration++) {
     // Check for cancellation between iterations
@@ -581,7 +625,11 @@ export async function runWithTools(
       context?.toolPolicy,
       { failClosedWithoutPolicy: context?.source === 'orchestrator' },
     );
-    const toolDeclarations = forceVerifiedIndustryFinalResponse ? [] : policyToolDeclarations;
+    const toolDeclarations = forceVerifiedIndustryFinalResponse
+      ? []
+      : forcedRequiredIndustryTool
+        ? policyToolDeclarations.filter(declaration => declaration.function.name === forcedRequiredIndustryTool)
+        : policyToolDeclarations;
     const exposedToolNames = new Set(toolDeclarations.map(declaration => declaration.function.name));
 
     const llmStart = Date.now();
@@ -653,21 +701,18 @@ export async function runWithTools(
     }
 
     if (!response.toolCalls || response.toolCalls.length === 0) {
-      const hasUnknownRequiredIndustryOutcome = (context?.industryWorkflowRequiredToolReceipts || [])
-        .some(name => [...executionLog].reverse().find(record => record.name === name)?.error?.match(
-          /unknown (?:prior )?(?:external commit )?outcome|external commit outcome is unknown|automatic resend was stopped/i,
-        ));
-      const missingRequiredIndustryTool = (
-        context?.industryWorkflowRequiredToolReceipts || []
-      ).find(name => !executionLog.some(record => (
-        record.name === name
-        && !record.error
-        && record.terminalVerification?.status === 'verified'
-        && String(record.result || '').trim()
-      ))) || '';
+      const unknownRequiredIndustryOutcome = hasUnknownRequiredIndustryOutcome(
+        context?.industryWorkflowRequiredToolReceipts,
+        executionLog,
+      );
+      const missingRequiredIndustryTool = firstMissingVerifiedIndustryReceipt(
+        context?.industryWorkflowRequiredToolReceipts,
+        executionLog,
+      );
       if (
         missingRequiredIndustryTool
-        && !hasUnknownRequiredIndustryOutcome
+        && !unknownRequiredIndustryOutcome
+        && !hasCurrentIndustryReceiptAttempt(missingRequiredIndustryTool, executionLog)
         && !requiredIndustryReplans.has(missingRequiredIndustryTool)
         && exposedToolNames.has(missingRequiredIndustryTool)
       ) {
@@ -682,6 +727,34 @@ export async function runWithTools(
         });
         if (iteration + 1 >= loopLimit) loopLimit += 1;
         continue;
+      }
+      if (
+        missingRequiredIndustryTool
+        && !unknownRequiredIndustryOutcome
+        && !hasCurrentIndustryReceiptAttempt(missingRequiredIndustryTool, executionLog)
+        && !forcedRequiredIndustryAttempts.has(missingRequiredIndustryTool)
+        && policyToolDeclarations.some(declaration => declaration.function.name === missingRequiredIndustryTool)
+      ) {
+        forcedRequiredIndustryAttempts.add(missingRequiredIndustryTool);
+        forcedRequiredIndustryTool = missingRequiredIndustryTool;
+        conversationHistory.push({
+          role: 'system',
+          content: [
+            `Recovery mode: the current task still lacks the verified ${missingRequiredIndustryTool} receipt.`,
+            `The next model turn exposes only ${missingRequiredIndustryTool}. Call it now and reconstruct its arguments from the latest user instruction plus current-loop verified receipts.`,
+            'Do not answer with prose, read historical task state, or reuse an older artifact. If exact source facts are insufficient, pass that insufficiency to the required tool instead of inventing values.',
+          ].join('\n'),
+        });
+        if (iteration + 1 >= loopLimit) loopLimit += 1;
+        continue;
+      }
+      if (missingRequiredIndustryTool && !unknownRequiredIndustryOutcome) {
+        recordWorkflowIfToolsUsed(executionLog, messages, config);
+        return {
+          text: buildMissingIndustryReceiptSummary(primaryTask, missingRequiredIndustryTool),
+          toolCalls: executionLog,
+          usageRecords,
+        };
       }
       const autoCompletion = await completeIndustryWorkflowFromVerifiedReceipts({
         registry: toolRegistry,
@@ -740,6 +813,54 @@ export async function runWithTools(
       toolRegistry,
       primaryTask,
     );
+
+    const replannedMissingIndustryTool = firstMissingVerifiedIndustryReceipt(
+      context?.industryWorkflowRequiredToolReceipts,
+      executionLog,
+    );
+    if (
+      replannedMissingIndustryTool
+      && requiredIndustryReplans.has(replannedMissingIndustryTool)
+      && !hasUnknownRequiredIndustryOutcome(context?.industryWorkflowRequiredToolReceipts, executionLog)
+      && !normalizedToolCalls.some(toolCall => toolCall.name === replannedMissingIndustryTool)
+    ) {
+      const staleLedgerLoop = normalizedToolCalls.length === 0
+        || normalizedToolCalls.every(toolCall => isStaleIndustryLedgerRead(toolCall.name));
+      if (
+        staleLedgerLoop
+        && !hasCurrentIndustryReceiptAttempt(replannedMissingIndustryTool, executionLog)
+        && !forcedRequiredIndustryAttempts.has(replannedMissingIndustryTool)
+        && policyToolDeclarations.some(declaration => declaration.function.name === replannedMissingIndustryTool)
+      ) {
+        forcedRequiredIndustryAttempts.add(replannedMissingIndustryTool);
+        forcedRequiredIndustryTool = replannedMissingIndustryTool;
+        conversationHistory.push({
+          role: 'system',
+          content: [
+            `Recovery mode: the current task still lacks the verified ${replannedMissingIndustryTool} receipt.`,
+            `The next model turn exposes only ${replannedMissingIndustryTool}. Call it now and reconstruct its arguments from the latest user instruction plus current-loop verified receipts.`,
+            'Do not read historical task state or reuse an older artifact. If exact source facts are insufficient, pass that insufficiency to the required tool instead of inventing values.',
+          ].join('\n'),
+        });
+        if (iteration + 1 >= loopLimit) loopLimit += 1;
+        continue;
+      }
+      if (forcedRequiredIndustryAttempts.has(replannedMissingIndustryTool)) {
+        recordWorkflowIfToolsUsed(executionLog, messages, config);
+        return {
+          text: buildMissingIndustryReceiptSummary(primaryTask, replannedMissingIndustryTool),
+          toolCalls: executionLog,
+          usageRecords,
+        };
+      }
+    }
+
+    if (
+      forcedRequiredIndustryTool
+      && normalizedToolCalls.some(toolCall => toolCall.name === forcedRequiredIndustryTool)
+    ) {
+      forcedRequiredIndustryTool = '';
+    }
 
     // Check for duplicate tool calls (prevents infinite loops within maxIterations)
     const lastAssistantMsg = conversationHistory
@@ -964,6 +1085,14 @@ export async function runWithTools(
       if (iteration + 1 >= loopLimit) loopLimit += 1;
     }
 
+    if (
+      !firstMissingVerifiedIndustryReceipt(context?.industryWorkflowRequiredToolReceipts, executionLog)
+      && (context?.industryWorkflowRequiredToolReceipts?.length || 0) > 0
+      && iteration + 1 >= loopLimit
+    ) {
+      loopLimit += 1;
+    }
+
     const readyWorkProduct = buildReadyWorkProductSummary(messages, executionLog);
     if (readyWorkProduct) {
       recordWorkflowIfToolsUsed(executionLog, messages, config);
@@ -976,6 +1105,20 @@ export async function runWithTools(
   }
 
   recordWorkflowIfToolsUsed(executionLog, messages, config);
+  const missingRequiredIndustryTool = firstMissingVerifiedIndustryReceipt(
+    context?.industryWorkflowRequiredToolReceipts,
+    executionLog,
+  );
+  if (
+    missingRequiredIndustryTool
+    && !hasUnknownRequiredIndustryOutcome(context?.industryWorkflowRequiredToolReceipts, executionLog)
+  ) {
+    return {
+      text: buildMissingIndustryReceiptSummary(primaryTask, missingRequiredIndustryTool),
+      toolCalls: executionLog,
+      usageRecords,
+    };
+  }
   const readyWorkProduct = buildReadyWorkProductSummary(messages, executionLog);
   if (readyWorkProduct) {
     return {
@@ -998,7 +1141,7 @@ function recordWorkflowIfToolsUsed(
   config: Pick<LLMConfig, 'userId' | 'domain' | 'orgId'>,
 ): void {
   if (executionLog.length === 0) return;
-  const rawContent = messages.find(m => m.role === 'user')?.content || '';
+  const rawContent = [...messages].reverse().find(m => m.role === 'user')?.content || '';
   const userMsg = typeof rawContent === 'string' ? rawContent : Array.isArray(rawContent) ? rawContent.filter(c => c.type === 'text').map(c => (c as any).text).join(' ') : '';
   const safeMsg = userMsg || '';
   recordWorkflow({

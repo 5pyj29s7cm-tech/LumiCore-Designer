@@ -117,6 +117,44 @@ describe('durable conversation task execution ledger', () => {
     expect(resumed.state?.policySnapshot?.allowedTools).toEqual(expect.arrayContaining(initialPolicy.allowedTools));
   });
 
+  it('starts an explicit current CAD command as a new task even when it says continue', () => {
+    const policy = {
+      allowedTools: ['mcp_design-studio-pack_drawing_ingest_qa', 'cad_generate_dxf'],
+      requireConfirmation: [],
+      forbiddenTools: [],
+      maxIterations: 8,
+    };
+    const oldTask = prepareConversationActionTaskState(null, {
+      userText: '只读真实任务账本，不要运行工作流。',
+      requestId: 'old-request',
+      toolPolicy: policy,
+      forceTask: true,
+    });
+    const currentCommand = 'CAD 方案实机验收：继续当前已激活项目“暮蓝-26验收住宅”，生成并核验 DXF 和 SVG 预览。';
+    const currentTask = prepareConversationActionTaskState(oldTask.state, {
+      userText: currentCommand,
+      requestId: 'cad-request',
+      toolPolicy: policy,
+      forceTask: true,
+      forceNewTask: true,
+    });
+
+    expect(currentTask.kind).toBe('new');
+    expect(currentTask.state?.taskId).not.toBe(oldTask.state?.taskId);
+    expect(currentTask.state?.goal).toBe(currentCommand);
+    expect(currentTask.state?.latestInstruction).toBe(currentCommand);
+    expect(currentTask.state?.supersededTaskId).toBe(oldTask.state?.taskId);
+
+    const confirmed = prepareConversationActionTaskState(currentTask.state, {
+      userText: '确认',
+      requestId: 'cad-confirmation',
+      toolPolicy: policy,
+      forceResume: true,
+    });
+    expect(confirmed.kind).toBe('resume');
+    expect(confirmed.state?.taskId).toBe(currentTask.state?.taskId);
+  });
+
   it('keeps prior permissions on terse replies and deliberately expands them for a real follow-up', () => {
     const merged = applyTaskPolicySnapshot(
       {

@@ -212,6 +212,42 @@ describe('designer project delivery loop', () => {
     expect(JSON.parse(reboundActionTask.context).industryWorkflow.workTakeoverTaskId).toBe(first.task.id);
   });
 
+  it('settles the project root between verified stages instead of leaving a ghost execution', () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_root_settlement_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, { name: 'Root settlement project' });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const scope = { userId, domain: 'personal' as const, orgId: '' };
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi-design-root-'));
+    try {
+      const projectStage = startIndustryWorkflow({ ...scope, entryId: 'project', source: 'chat' });
+      recordIndustryWorkflowExecution({
+        ...scope,
+        taskId: projectStage.task.id,
+        resultText: stageResult('project'),
+        toolRecords: stageToolRecords('project'),
+      });
+      const cadStage = startIndustryWorkflow({ ...scope, entryId: 'cad', source: 'chat' });
+      const cadResult = recordIndustryWorkflowExecution({
+        ...scope,
+        taskId: cadStage.task.id,
+        resultText: stageResult('cad'),
+        filePaths: stageFile(directory, 'cad'),
+        toolRecords: stageToolRecords('cad'),
+      });
+
+      expect(cadResult.verification.passed).toBe(true);
+      const rootTask = readDB().conversationActionTasks.find(
+        (task: any) => task.id === `design_project_${project.id}`,
+      );
+      expect(rootTask).toMatchObject({ status: 'blocked', activeRequestId: '' });
+      expect(rootTask.blocker).toMatch(/Stage cad is verified.*next design stage/i);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('links all five stages to one project root and completes only from verified receipts', async () => {
     const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const userId = `design_loop_${suffix}`;

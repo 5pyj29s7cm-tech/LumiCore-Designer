@@ -629,10 +629,14 @@ function settleBoundDesignProjectStage(
     artifacts: task.artifacts,
     verification,
   });
-  if (binding.entryId === 'handoff' && verification.passed && state.rootTaskId) {
+  if (state.rootTaskId) {
     const correlation = correlationFor(task);
     const record = verificationRecord(task, verification, correlation);
     const db = readDB();
+    const projectCompleted = binding.entryId === 'handoff' && verification.passed;
+    const blocker = verification.passed
+      ? `Stage ${binding.entryId} is verified. Awaiting an explicit request for the next design stage.`
+      : verification.summary;
     settleBackgroundConversationActionTask(db, {
       taskId: state.rootTaskId,
       userId: task.userId,
@@ -642,7 +646,8 @@ function settleBoundDesignProjectStage(
         taskId: state.rootTaskId,
         idempotencyKey: `${record.idempotencyKey}:project-root`,
       }],
-      status: 'completed',
+      status: projectCompleted ? 'completed' : 'blocked',
+      blocker: projectCompleted ? undefined : blocker,
       requestId: correlation.requestId,
     });
     writeDB(db);

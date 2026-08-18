@@ -281,4 +281,129 @@ describe('LLM tool loop cancellation boundary', () => {
     expect(result.toolCalls.map(record => record.name)).toEqual(['industry_source_assessment']);
     expect(result.text).toMatch(/creation stopped/i);
   });
+
+  it('forces the exact missing industry tool after the model falls back to stale ledger reads', async () => {
+    const registry = new ToolRegistry();
+    const assessment = vi.fn(async () => JSON.stringify({ ok: true, status: 'verified' }));
+    const output = vi.fn(async () => JSON.stringify({ ok: true, status: 'verified', path: 'current.dxf' }));
+    const unrelatedRead = vi.fn(async () => JSON.stringify({ ok: true, status: 'observed', path: 'old.dxf' }));
+    for (const [name, handler] of [
+      ['industry_source_assessment', assessment],
+      ['industry_output_create', output],
+      ['unrelated_read_only', unrelatedRead],
+    ] as const) {
+      registry.register({
+        name,
+        description: name,
+        parameters: { type: 'object', properties: {}, required: [] },
+        permission: 'public',
+        securityLevel: 'safe',
+        handler,
+      });
+    }
+    mocks.makeLLMCall
+      .mockResolvedValueOnce({
+        text: '',
+        toolCalls: [{ id: 'assessment', name: 'industry_source_assessment', arguments: {} }],
+      })
+      .mockResolvedValueOnce({ text: 'The old CAD file already exists.', toolCalls: [] })
+      .mockResolvedValueOnce({
+        text: 'Using the historical file as the current result.',
+        toolCalls: [{ id: 'old-read', name: 'unrelated_read_only', arguments: {} }],
+      })
+      .mockResolvedValueOnce({
+        text: '',
+        toolCalls: [{ id: 'current-output', name: 'industry_output_create', arguments: {} }],
+      })
+      .mockResolvedValueOnce({ text: 'Created and verified current.dxf.', toolCalls: [] });
+
+    const result = await runWithTools(
+      [{ role: 'user', content: 'Create and verify the current CAD output.' }],
+      registry,
+      { provider: 'deepseek', model: 'test-model' },
+      undefined,
+      3,
+      ...getters,
+      undefined,
+      {
+        industryWorkflowTaskId: 'wt_task_current',
+        industryWorkflowRequiredToolReceipts: ['industry_source_assessment', 'industry_output_create'],
+        toolPolicy: {
+          allowedTools: ['industry_source_assessment', 'industry_output_create', 'unrelated_read_only'],
+          requireConfirmation: [],
+          forbiddenTools: [],
+          maxIterations: 3,
+        },
+      },
+    );
+
+    expect(assessment).toHaveBeenCalledTimes(1);
+    expect(output).toHaveBeenCalledTimes(1);
+    expect(unrelatedRead).not.toHaveBeenCalled();
+    expect(result.toolCalls.map(record => record.name)).toEqual([
+      'industry_source_assessment',
+      'industry_output_create',
+    ]);
+    expect(result.text).toBe('Created and verified current.dxf.');
+    expect(result.text).not.toMatch(/historical file as the current result/i);
+  });
+
+  it('fails closed when the model also ignores the forced missing industry tool', async () => {
+    const registry = new ToolRegistry();
+    const assessment = vi.fn(async () => JSON.stringify({ ok: true, status: 'verified' }));
+    const output = vi.fn(async () => JSON.stringify({ ok: true, status: 'verified', path: 'current.dxf' }));
+    const unrelatedRead = vi.fn(async () => JSON.stringify({ ok: true, status: 'observed', path: 'old.dxf' }));
+    for (const [name, handler] of [
+      ['industry_source_assessment', assessment],
+      ['industry_output_create', output],
+      ['unrelated_read_only', unrelatedRead],
+    ] as const) {
+      registry.register({
+        name,
+        description: name,
+        parameters: { type: 'object', properties: {}, required: [] },
+        permission: 'public',
+        securityLevel: 'safe',
+        handler,
+      });
+    }
+    mocks.makeLLMCall
+      .mockResolvedValueOnce({
+        text: '',
+        toolCalls: [{ id: 'assessment', name: 'industry_source_assessment', arguments: {} }],
+      })
+      .mockResolvedValueOnce({ text: 'The old CAD file already exists.', toolCalls: [] })
+      .mockResolvedValueOnce({
+        text: 'Using the historical file as the current result.',
+        toolCalls: [{ id: 'old-read', name: 'unrelated_read_only', arguments: {} }],
+      })
+      .mockResolvedValueOnce({ text: 'I will still use the historical file.', toolCalls: [] });
+
+    const result = await runWithTools(
+      [{ role: 'user', content: 'Create and verify the current CAD output.' }],
+      registry,
+      { provider: 'deepseek', model: 'test-model' },
+      undefined,
+      3,
+      ...getters,
+      undefined,
+      {
+        industryWorkflowTaskId: 'wt_task_current',
+        industryWorkflowRequiredToolReceipts: ['industry_source_assessment', 'industry_output_create'],
+        toolPolicy: {
+          allowedTools: ['industry_source_assessment', 'industry_output_create', 'unrelated_read_only'],
+          requireConfirmation: [],
+          forbiddenTools: [],
+          maxIterations: 3,
+        },
+      },
+    );
+
+    expect(assessment).toHaveBeenCalledTimes(1);
+    expect(output).not.toHaveBeenCalled();
+    expect(unrelatedRead).not.toHaveBeenCalled();
+    expect(result.toolCalls.map(record => record.name)).toEqual(['industry_source_assessment']);
+    expect(result.text).toMatch(/industry_output_create/);
+    expect(result.text).not.toMatch(/historical file as the current result/i);
+  });
 });
