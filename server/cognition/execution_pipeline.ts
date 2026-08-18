@@ -196,7 +196,12 @@ export function buildLumiExecutionPipeline(
 ): LumiExecutionPipeline {
   const turnIntent = input.prebuiltDispatch || buildLumiTurnDispatch(input.dispatch);
   const decisionText = input.decisionText || turnIntent.flow.routeText;
-  const normalizedIntent = normalizeActionIntent(decisionText);
+  // The safety-normalized intent belongs to the current user turn. Enriched
+  // route text may contain a recovered task/status snapshot, which is useful
+  // for legacy capability selection but must never overwrite the user's new
+  // semantic roles (for example, turning "generate an image" into a status
+  // query because an active-task bridge contains the word "status").
+  const normalizedIntent = normalizeActionIntent(input.dispatch.text);
   const legacyExecution = buildLumiExecutionDecision({
     flow: turnIntent.flow,
     text: decisionText,

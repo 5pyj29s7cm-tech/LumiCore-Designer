@@ -575,7 +575,9 @@ export function normalizeConversationActionState(
       .slice(0, 8),
     latestBlocker: status === 'completed'
       ? ''
-      : compact(receiptCompletion?.blocker || value.latestBlocker, 380),
+      : status === 'blocked'
+        ? compact(value.latestBlocker || receiptCompletion?.blocker, 380)
+        : compact(receiptCompletion?.blocker || value.latestBlocker, 380),
     unfinished: Boolean(value.unfinished),
     evidenceTools: Array.from(new Set(Array.isArray(value.evidenceTools) ? value.evidenceTools : []))
       .map(name => compact(name, 120))
@@ -626,10 +628,18 @@ export function buildConversationActionContinuationState(
 
   const previous = normalizeConversationActionState(input.previous);
   const followupIntent = classifyConversationActionFollowupIntent(userText, previous);
+  const sameRequest = Boolean(
+    previous?.activeRequestId
+    && input.requestId
+    && previous.activeRequestId === input.requestId,
+  );
   const samePreparedTurn = Boolean(
     previous
     && previous.latestInstruction === userText
-    && ['planning', 'executing', 'waiting_confirmation'].includes(previous.status || ''),
+    && (
+      sameRequest
+      || ['planning', 'executing', 'waiting_confirmation'].includes(previous.status || '')
+    ),
   );
   const inheritsPrevious = (followupIntent !== 'none' || samePreparedTurn) && Boolean(previous);
   const currentHistory: ActionContinuationHistoryItem[] = [
@@ -656,13 +666,22 @@ export function buildConversationActionContinuationState(
   const completion = taskCompletionFromReceipts(completionGoal, receipts);
   const currentFailure = [...calls].reverse().find(record => !toolCallSucceeded(record));
   const hasFailure = completion.records.some(record => !toolCallSucceeded(record));
-  const status: ConversationTaskStatus = followupIntent === 'status' && currentFailure
+  const receiptDerivedStatus: ConversationTaskStatus = followupIntent === 'status' && currentFailure
     ? 'blocked'
     : completion.complete
     ? 'completed'
     : hasFailure
       ? 'blocked'
       : 'executing';
+  const preserveAuthoritativeTerminal = Boolean(
+    samePreparedTurn
+    && sameRequest
+    && previous
+    && ['blocked', 'completed', 'cancelled'].includes(previous.status || ''),
+  );
+  const status: ConversationTaskStatus = preserveAuthoritativeTerminal
+    ? previous!.status
+    : receiptDerivedStatus;
 
   return normalizeConversationActionState({
     version: 2,
@@ -682,7 +701,9 @@ export function buildConversationActionContinuationState(
       ...(inheritsPrevious ? previous!.sourcePaths : []),
       ...current.sourcePaths,
     ])).slice(0, 8),
-    latestBlocker: completion.blocker || (currentFailure ? toolCallFailure(currentFailure) : ''),
+    latestBlocker: preserveAuthoritativeTerminal && status === 'blocked'
+      ? previous!.latestBlocker
+      : completion.blocker || (currentFailure ? toolCallFailure(currentFailure) : ''),
     unfinished: status !== 'completed',
     evidenceTools: Array.from(new Set([
       ...(inheritsPrevious ? previous!.evidenceTools : []),
@@ -695,7 +716,9 @@ export function buildConversationActionContinuationState(
     ])).slice(-10),
     updatedAt: input.updatedAt || new Date().toISOString(),
     evidenceMessageId: input.evidenceMessageId,
-    completionSource: completion.complete
+    completionSource: preserveAuthoritativeTerminal
+      ? previous?.completionSource
+      : completion.complete
       ? 'tool_receipt'
       : inheritsPrevious
         ? previous?.completionSource

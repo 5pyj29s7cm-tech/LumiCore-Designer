@@ -22,7 +22,16 @@ const CAPABILITY_ACCESS_RE =
  */
 export function isCapabilityMetaQuestion(text: string): boolean {
   const normalized = String(text || '').replace(/\s+/g, ' ').trim();
-  if (!normalized || !CAPABILITY_SUBJECT_RE.test(normalized)) return false;
+  if (!normalized) return false;
+  // "Do not call tools; explain this edition/workflow" is a scope boundary,
+  // not a question about tool mounting or operation mode. Remove only the
+  // negated control clause before classifying the semantic subject so a real
+  // capability question later in the same sentence still works.
+  const semanticText = normalized.replace(
+    /(?:\u5148)?(?:\u4e0d\u8981|\u4e0d\u7528|\u65e0\u9700|\u4e0d\u9700\u8981)(?:\u5728\u672c\u8f6e)?(?:\u8c03\u7528|\u4f7f\u7528|\u5f00\u542f|\u8fd0\u884c|\u6267\u884c)?[^\uff0c\u3002\uff1b;]{0,20}(?:\u5de5\u5177|\u6280\u80fd)[\uff0c\u3002\uff1b;]?/gu,
+    ' ',
+  ).replace(/\s+/g, ' ').trim();
+  if (!CAPABILITY_SUBJECT_RE.test(semanticText)) return false;
   if (/(?:\u521a\u624d|\u521a\u521a|\u4e0a\u6b21|\u4e0a\u4e00\u8f6e|\u6ca1.{0,12}\u6210\u529f|\u5931\u8d25|\u62a5\u9519|\u5361\u4f4f|\u4e3a\u4ec0\u4e48.{0,20}\u6ca1.{0,12}(?:\u6267\u884c|\u8c03\u7528)|\b(?:earlier|last\s+time|failed|error|stuck|didn'?t\s+(?:run|call))\b)/iu.test(normalized)) {
     return false;
   }
@@ -32,8 +41,8 @@ export function isCapabilityMetaQuestion(text: string): boolean {
     || /\b(?:are|aren't|isn't)\s+(?:you|lumi).{0,24}(?:assistant|autonomous)\s+mode\b/i.test(normalized);
   if (asksAboutMode) return true;
 
-  return CAPABILITY_META_QUESTION_RE.test(normalized)
-    && CAPABILITY_ACCESS_RE.test(normalized);
+  return CAPABILITY_META_QUESTION_RE.test(semanticText)
+    && CAPABILITY_ACCESS_RE.test(semanticText);
 }
 
 function isChinese(text: string): boolean {

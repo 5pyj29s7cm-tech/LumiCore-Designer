@@ -517,9 +517,11 @@ export function registerIndustryWorkflowTools(registry: ToolRegistry): void {
         'industry_workflow_complete',
         'work_takeover_task_get',
       ]);
-      const evidenceRecords = (context?.getCurrentToolRecords?.() || []).filter(record => (
+      const currentRecords = (context?.getCurrentToolRecords?.() || []).filter(record => (
         !excluded.has(record.name)
-        && !record.error
+      ));
+      const evidenceRecords = currentRecords.filter(record => (
+        !record.error
         && record.terminalVerification?.status === 'verified'
         && String(record.result || '').trim()
       ));
@@ -535,7 +537,10 @@ export function registerIndustryWorkflowTools(registry: ToolRegistry): void {
         ...activeScope,
         taskId,
         resultText: archivedResult,
-        toolRecords: evidenceRecords,
+        // Verification uses successful receipts as evidence, but also receives
+        // terminal failures so the durable project ledger preserves the real
+        // provider/tool blocker instead of degrading it to "no file yet".
+        toolRecords: currentRecords,
         source: context?.source || 'industry_natural_language',
       });
       return JSON.stringify({

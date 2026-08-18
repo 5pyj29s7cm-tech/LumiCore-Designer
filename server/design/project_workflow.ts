@@ -67,6 +67,24 @@ const STAGE_PROJECT_STATUS: Record<InteriorDesignStageId, InteriorProjectStatus>
   handoff: 'handoff',
 };
 
+const PROJECT_STATUS_ORDER: InteriorProjectStatus[] = [
+  'brief',
+  'planning',
+  'design',
+  'visualization',
+  'handoff',
+  'archived',
+];
+
+function mostAdvancedProjectStatus(
+  current: InteriorProjectStatus,
+  candidate: InteriorProjectStatus,
+): InteriorProjectStatus {
+  return PROJECT_STATUS_ORDER.indexOf(candidate) > PROJECT_STATUS_ORDER.indexOf(current)
+    ? candidate
+    : current;
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -284,10 +302,20 @@ export function settleInteriorProjectWorkflowStage(input: {
     updatedAt: timestamp,
     completedAt: input.verification.passed ? timestamp : '',
   };
-  workflow.activeStage = input.verification.passed && input.entryId === 'handoff' ? '' : input.entryId;
+  if (!input.verification.passed) {
+    workflow.activeStage = input.entryId;
+  } else if (input.entryId === 'handoff') {
+    workflow.activeStage = '';
+  } else {
+    workflow.activeStage = [...INTERIOR_DESIGN_STAGE_IDS]
+      .reverse()
+      .find(entryId => workflow.stages[entryId].status === 'completed') || input.entryId;
+  }
   workflow.updatedAt = timestamp;
   project.workflow = workflow;
-  if (input.verification.passed) project.status = STAGE_PROJECT_STATUS[input.entryId];
+  if (input.verification.passed) {
+    project.status = mostAdvancedProjectStatus(project.status, STAGE_PROJECT_STATUS[input.entryId]);
+  }
   project.updatedAt = timestamp;
   writeDB(db);
   return cloneWorkflow(workflow);

@@ -3,7 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { flushDBOrThrow, readDB } from '../db_layer';
+import { flushDBOrThrow, readDB, writeDB } from '../db_layer';
+import { getOrCreateActiveConversation } from '../server/conversation/manager';
+import { ensureBackgroundConversationActionTask } from '../server/conversation/action_ledger';
 import {
   createInteriorProject,
   getActiveInteriorProject,
@@ -58,7 +60,7 @@ function stageFile(directory: string, entryId: string): string[] {
 }
 
 function stageToolRecords(entryId: string): any[] {
-  const names: Record<string, string[]> = {
+    const names: Record<string, string[]> = {
     project: [
       'mcp_design-studio-pack_interior_project_brief',
       'mcp_design-studio-pack_space_planning_checklist',
@@ -89,6 +91,78 @@ describe('designer project delivery loop', () => {
     setActiveInteriorProject(scopeId, owner, project.id);
     expect(getActiveInteriorProject(scopeId, owner)?.id).toBe(project.id);
     expect(getActiveInteriorProject(scopeId, other)).toBeNull();
+  });
+
+  it('rebinds a reused blocked stage to the current conversation action task', () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_rebind_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, { name: 'Rebind project' });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const conversation = getOrCreateActiveConversation(userId, 'lumi', 'personal', '');
+    const firstTaskId = `conversation_first_${suffix}`;
+    const secondTaskId = `conversation_second_${suffix}`;
+    const db = readDB();
+    ensureBackgroundConversationActionTask(db, {
+      taskId: firstTaskId,
+      conversationId: conversation.id,
+      userId,
+      domain: 'personal',
+      orgId: '',
+      goal: 'Create project scheme',
+      target: 'design:project',
+      requestId: `request_first_${suffix}`,
+      source: 'chat',
+    });
+    ensureBackgroundConversationActionTask(db, {
+      taskId: secondTaskId,
+      conversationId: conversation.id,
+      userId,
+      domain: 'personal',
+      orgId: '',
+      goal: 'Retry project scheme',
+      target: 'design:project',
+      requestId: `request_second_${suffix}`,
+      source: 'chat',
+    });
+    writeDB(db);
+
+    const first = startIndustryWorkflow({
+      userId,
+      domain: 'personal',
+      orgId: '',
+      entryId: 'project',
+      source: 'chat',
+      conversationId: conversation.id,
+      conversationTaskId: firstTaskId,
+      requestId: `request_first_${suffix}`,
+    });
+    recordIndustryWorkflowExecution({
+      userId,
+      domain: 'personal',
+      orgId: '',
+      taskId: first.task.id,
+      resultText: 'Project scheme is blocked because no verified professional receipt exists.',
+      toolRecords: [],
+    });
+    const resumed = startIndustryWorkflow({
+      userId,
+      domain: 'personal',
+      orgId: '',
+      entryId: 'project',
+      source: 'chat',
+      conversationId: conversation.id,
+      conversationTaskId: secondTaskId,
+      requestId: `request_second_${suffix}`,
+    });
+
+    expect(resumed.reused).toBe(true);
+    expect(resumed.task.id).toBe(first.task.id);
+    expect(resumed.conversationTaskId).toBe(secondTaskId);
+    expect(resumed.task.metadata.industryWorkflow.conversationTaskId).toBe(secondTaskId);
+    const reboundActionTask = readDB().conversationActionTasks.find((task: any) => task.id === secondTaskId);
+    expect(reboundActionTask).toMatchObject({ status: 'executing', parentTaskId: `design_project_${project.id}` });
+    expect(JSON.parse(reboundActionTask.context).industryWorkflow.workTakeoverTaskId).toBe(first.task.id);
   });
 
   it('links all five stages to one project root and completes only from verified receipts', async () => {
@@ -201,6 +275,46 @@ describe('designer project delivery loop', () => {
     const status = JSON.parse(await registry.execute('interior_design_project_status', {}, context));
     expect(status.project.id).toBe(created.project.id);
     expect(status.workflow.stages).toHaveProperty('handoff');
+  });
+
+  it('does not regress the overall project status when an earlier stage is rerun', () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_status_monotonic_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, { name: 'Monotonic stage project' });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const scope = { userId, domain: 'personal' as const, orgId: '' };
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi-design-status-monotonic-'));
+    try {
+      const projectStage = startIndustryWorkflow({ ...scope, entryId: 'project', source: 'chat' });
+      recordIndustryWorkflowExecution({
+        ...scope,
+        taskId: projectStage.task.id,
+        resultText: stageResult('project'),
+        toolRecords: stageToolRecords('project'),
+      });
+      const cadStage = startIndustryWorkflow({ ...scope, entryId: 'cad', source: 'chat' });
+      recordIndustryWorkflowExecution({
+        ...scope,
+        taskId: cadStage.task.id,
+        resultText: stageResult('cad'),
+        filePaths: stageFile(directory, 'cad'),
+        toolRecords: stageToolRecords('cad'),
+      });
+      expect(getActiveInteriorProject(scopeId, userId)?.status).toBe('design');
+
+      const repeatedProjectStage = startIndustryWorkflow({ ...scope, entryId: 'project', source: 'chat' });
+      recordIndustryWorkflowExecution({
+        ...scope,
+        taskId: repeatedProjectStage.task.id,
+        resultText: stageResult('project'),
+        toolRecords: stageToolRecords('project'),
+      });
+      expect(getActiveInteriorProject(scopeId, userId)?.status).toBe('design');
+      expect(getInteriorProjectWorkflow(scopeId, project.id)?.activeStage).toBe('cad');
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('reports insufficient CAD source as a business blocker instead of a capability failure', async () => {

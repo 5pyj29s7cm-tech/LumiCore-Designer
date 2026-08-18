@@ -242,13 +242,13 @@ function enhanceToolRouteForFlow(
   const designProjectCreation = !recoveredCurrentAppEdit
     && flow.industryWorkflowEntryId === 'project'
     && isDesignProjectCreationRequest(flow.routeText);
+  const namesExistingWorkTakeoverTask = /\bwt_task_[a-z0-9_-]+\b/i.test(flow.routeText);
   if (industryWorkflowMatch || designProjectCreation) {
     addAvailable(additions, available, [
       ...(designProjectCreation
         ? ['interior_design_project_create', 'interior_design_project_select', 'interior_design_project_status']
         : ['industry_workflow_start', 'industry_workflow_complete']),
-      'work_takeover_task_get',
-      'work_takeover_task_verify_result',
+      ...(namesExistingWorkTakeoverTask ? ['work_takeover_task_get', 'work_takeover_task_verify_result'] : []),
       ...industryExecutionTools,
     ]);
     categories.push('industry_workflow');
@@ -286,13 +286,13 @@ function enhanceToolRouteForFlow(
     const toolNames = unique([
       'industry_workspace_status',
       'industry_workspace_bind',
-      'work_takeover_task_get',
+      ...(namesExistingWorkTakeoverTask ? ['work_takeover_task_get'] : []),
       ...persistentTaskTools,
       ...localCadDiscoveryTools,
       ...boundedIndustryExecutionTools,
       'industry_workflow_start',
       'industry_workflow_complete',
-      'work_takeover_task_verify_result',
+      ...(namesExistingWorkTakeoverTask ? ['work_takeover_task_verify_result'] : []),
     ]).filter(name => available.has(name));
     return {
       ...route,

@@ -22,6 +22,12 @@ describe('capability access explanations', () => {
     expect(isCapabilityMetaQuestion(text)).toBe(false);
   });
 
+  it('does not mistake a no-tool edition onboarding request for a mode question', () => {
+    const text = '这是设计师版实机测试。先不要调用任何工具，请说明你是什么版本、五个工作入口怎么串成最终交付，以及我不会使用时你能怎样一步步教我。';
+    expect(isCapabilityMetaQuestion(text)).toBe(false);
+    expect(buildCapabilityMetaResponse({ text, operationMode: 'assistant' })).toBeNull();
+  });
+
   it('explains the integrated command-center entry and per-turn routing truth', () => {
     const response = buildCapabilityMetaResponse({
       text: '\u90a3\u8981\u600e\u4e48\u624d\u80fd\u8ba9\u4f60\u4f7f\u7528\u5176\u5b83\u5de5\u5177',

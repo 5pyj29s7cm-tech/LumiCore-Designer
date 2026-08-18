@@ -11,7 +11,12 @@ import { hasVisibleAutoCadExecutionEvidence, requiresVisibleAutoCadExecution } f
 import { guardCurrentAppToolCall } from '../cognition/current_app_execution';
 import { isConfirmationBlockedToolRecord } from '../tools/confirmation_block';
 import { isDesignProjectStatusRequest } from '../design/status_intent';
+import { formatVerifiedDesignProjectStatus } from '../design/status_response';
 import { executeToolCall } from '../tools/execution_engine';
+import {
+  completeIndustryWorkflowFromVerifiedReceipts,
+  isVerifiedIndustryWorkflowCompletionRecord,
+} from '../industry/workflow_autocomplete';
 import {
   GENERIC_TOOL_PLANNING_PROMPT,
   GENERIC_TOOL_REPLAN_PROMPT,
@@ -561,7 +566,7 @@ export async function runWithTools(
   // needed for ordinary chat, explanations, corrections, and receipt recall.
   let loopLimit = Math.max(1, effectiveMaxIterations);
   let forceVerifiedIndustryFinalResponse = false;
-  let requiredIndustryReplans = 0;
+  const requiredIndustryReplans = new Set<string>();
   let industryAssessmentFinalResponseReserved = false;
   for (let iteration = 0; iteration < loopLimit; iteration++) {
     // Check for cancellation between iterations
@@ -648,26 +653,59 @@ export async function runWithTools(
     }
 
     if (!response.toolCalls || response.toolCalls.length === 0) {
-      const firstRequiredIndustryTool = context?.industryWorkflowRequiredToolReceipts?.[0] || '';
-      const attemptedRequiredIndustryAssessment = !firstRequiredIndustryTool
-        || executionLog.some(record => record.name === firstRequiredIndustryTool);
+      const hasUnknownRequiredIndustryOutcome = (context?.industryWorkflowRequiredToolReceipts || [])
+        .some(name => [...executionLog].reverse().find(record => record.name === name)?.error?.match(
+          /unknown (?:prior )?(?:external commit )?outcome|external commit outcome is unknown|automatic resend was stopped/i,
+        ));
+      const missingRequiredIndustryTool = (
+        context?.industryWorkflowRequiredToolReceipts || []
+      ).find(name => !executionLog.some(record => (
+        record.name === name
+        && !record.error
+        && record.terminalVerification?.status === 'verified'
+        && String(record.result || '').trim()
+      ))) || '';
       if (
-        firstRequiredIndustryTool
-        && !attemptedRequiredIndustryAssessment
-        && requiredIndustryReplans < 1
-        && exposedToolNames.has(firstRequiredIndustryTool)
+        missingRequiredIndustryTool
+        && !hasUnknownRequiredIndustryOutcome
+        && !requiredIndustryReplans.has(missingRequiredIndustryTool)
+        && exposedToolNames.has(missingRequiredIndustryTool)
       ) {
-        requiredIndustryReplans += 1;
+        requiredIndustryReplans.add(missingRequiredIndustryTool);
         conversationHistory.push({
           role: 'system',
           content: [
-            `The bound industry contract requires an actual ${firstRequiredIndustryTool} receipt before an answer is accepted.`,
+            `The bound industry contract requires a verified ${missingRequiredIndustryTool} receipt before an answer is accepted.`,
             'Call that exact professional assessment tool now using only the server-bound source facts.',
             'If the source is insufficient, record the missing facts in the tool arguments and stop downstream creation rather than guessing.',
           ].join('\n'),
         });
         if (iteration + 1 >= loopLimit) loopLimit += 1;
         continue;
+      }
+      const autoCompletion = await completeIndustryWorkflowFromVerifiedReceipts({
+        registry: toolRegistry,
+        records: executionLog,
+        context,
+      });
+      if (autoCompletion) {
+        executionLog.push(autoCompletion);
+        onToolCall?.(autoCompletion);
+        if (isVerifiedIndustryWorkflowCompletionRecord(autoCompletion)) {
+          forceVerifiedIndustryFinalResponse = true;
+          conversationHistory.push({
+            role: 'system',
+            content: [
+              'The server archived the industry workflow because every contract-required capability produced a verified current-loop receipt.',
+              'Write the final human-facing answer only from the verified tool results already in this conversation.',
+              'State deliverable paths, source constraints, assumptions or missing fields, risks, and the next review step.',
+              'Do not call another tool and do not claim external delivery or professional approval without a separate receipt.',
+              `Completion receipt: ${compactToolResultForModel(autoCompletion.name, autoCompletion.result)}`,
+            ].join('\n'),
+          });
+          if (iteration + 1 >= loopLimit) loopLimit += 1;
+          continue;
+        }
       }
       if (
         iteration === 0
@@ -835,6 +873,35 @@ export async function runWithTools(
       }
     }
 
+    // The model may produce a ready artifact and trigger the generic
+    // work-product fast return before it asks for archival verification. Close
+    // the bound industry task first whenever the current batch completed every
+    // contract-required capability.
+    const batchAutoCompletion = await completeIndustryWorkflowFromVerifiedReceipts({
+      registry: toolRegistry,
+      records: executionLog,
+      context,
+    });
+    if (batchAutoCompletion) {
+      executionLog.push(batchAutoCompletion);
+      onToolCall?.(batchAutoCompletion);
+      if (isVerifiedIndustryWorkflowCompletionRecord(batchAutoCompletion)) {
+        forceVerifiedIndustryFinalResponse = true;
+        conversationHistory.push({
+          role: 'system',
+          content: [
+            'The server archived the industry workflow because every contract-required capability produced a verified current-loop receipt.',
+            'Write the final human-facing answer only from the verified tool results already in this conversation.',
+            'State deliverable paths, source constraints, assumptions or missing fields, risks, and the next review step.',
+            'Do not call another tool and do not claim external delivery or professional approval without a separate receipt.',
+            `Completion receipt: ${compactToolResultForModel(batchAutoCompletion.name, batchAutoCompletion.result)}`,
+          ].join('\n'),
+        });
+        if (iteration + 1 >= loopLimit) loopLimit += 1;
+        continue;
+      }
+    }
+
     const verifiedIndustryCompletion = [...executionLog].reverse().find(record => {
       if (record.name !== 'industry_workflow_complete' || record.error) return false;
       try {
@@ -871,17 +938,20 @@ export async function runWithTools(
       && isDesignProjectStatusRequest(primaryTask)
       && !forceVerifiedIndustryFinalResponse
     ) {
-      forceVerifiedIndustryFinalResponse = true;
-      conversationHistory.push({
-        role: 'system',
-        content: [
-          'The durable interior-design project status has been read successfully.',
-          'Answer now without another tool call.',
-          'Treat each workflow stage status, verificationStatus, blocker, completedStages, and nextStage as authoritative.',
-          'Do not reinterpret older artifact history as the current state, and do not claim that an uncompleted stage is done.',
-        ].join('\n'),
-      });
-      if (iteration + 1 >= loopLimit) loopLimit += 1;
+      const statusText = formatVerifiedDesignProjectStatus(verifiedDesignProjectStatus, primaryTask);
+      if (statusText) {
+        conversationHistory.push({
+          role: 'system',
+          content: [
+            'The durable design project ledger has been read and verified.',
+            'Write one concise, tool-free final answer grounded only in the verified status below.',
+            'Do not start the next design stage or reinterpret missing fields.',
+            `Verified status: ${statusText}`,
+          ].join('\n'),
+        });
+        if (iteration + 1 >= loopLimit) loopLimit += 1;
+        continue;
+      }
     }
 
     const firstRequiredIndustryTool = context?.industryWorkflowRequiredToolReceipts?.[0] || '';

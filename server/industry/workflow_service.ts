@@ -780,6 +780,14 @@ export function startIndustryWorkflow(input: StartIndustryWorkflowInput): Indust
   const conversation = (requestedConversationId
     ? getConversationForScope(requestedConversationId, input.userId, input.domain, input.orgId)
     : null) || getOrCreateActiveConversation(input.userId, 'lumi', input.domain, input.orgId);
+  const requestedConversationTaskId = compact(input.conversationTaskId, 200);
+  const existingConversationTaskId = requestedConversationTaskId && (readDB().conversationActionTasks || []).some((candidate: any) => (
+    candidate.id === requestedConversationTaskId
+    && candidate.conversationId === conversation.id
+    && candidate.userId === input.userId
+    && candidate.domain === input.domain
+    && String(candidate.orgId || '') === String(input.orgId || '')
+  )) ? requestedConversationTaskId : '';
   let projectRootTaskId = '';
   if (designProject) {
     const rootDb = readDB();
@@ -802,12 +810,42 @@ export function startIndustryWorkflow(input: StartIndustryWorkflowInput): Indust
         && ['queued', 'in_progress', 'waiting_confirmation', 'blocked'].includes(candidate.status);
     });
     if (existingStageTask) {
-      const correlation = correlationFor(existingStageTask);
+      const previousCorrelation = correlationFor(existingStageTask);
+      const conversationTaskId = existingConversationTaskId || previousCorrelation.conversationTaskId;
+      const reboundStageTask = conversationTaskId && (
+        conversationTaskId !== previousCorrelation.conversationTaskId
+        || conversation.id !== previousCorrelation.conversationId
+        || requestId !== previousCorrelation.requestId
+      )
+        ? updateWorkTakeoverTask(input.userId, existingStageTask.id, {
+            metadata: {
+              industryWorkflow: {
+                ...workflowMetadata(existingStageTask),
+                conversationId: conversation.id,
+                conversationTaskId,
+                requestId,
+              },
+            },
+            note: `Rebound active industry workflow to conversation action task ${conversationTaskId}.`,
+          }) || existingStageTask
+        : existingStageTask;
+      const correlation = correlationFor(reboundStageTask);
       const actionDb = readDB();
       const actionTask = (actionDb.conversationActionTasks || []).find((candidate: any) => (
         candidate.id === correlation.conversationTaskId && candidate.userId === input.userId
       ));
       if (actionTask) {
+        const existingContext = parseObject(actionTask.context);
+        actionTask.context = JSON.stringify({
+          ...existingContext,
+          industryWorkflow: {
+            workTakeoverTaskId: reboundStageTask.id,
+            productLine: contract.productLine,
+            entryId: contract.entryId,
+            inputDigest: sha256(sourceInput),
+            ...(designProject ? { projectId: designProject.id, projectName: designProject.name } : {}),
+          },
+        });
         actionTask.parentTaskId = projectRootTaskId;
         actionTask.status = 'executing';
         actionTask.blocker = '';
@@ -822,14 +860,14 @@ export function startIndustryWorkflow(input: StartIndustryWorkflowInput): Indust
             orgId: designProject.orgId,
             projectId: designProject.id,
             entryId: contract.entryId,
-            taskId: existingStageTask.id,
+            taskId: reboundStageTask.id,
             conversationTaskId: correlation.conversationTaskId,
             rootConversationId: conversation.id,
             rootTaskId: projectRootTaskId,
           })
         : undefined;
       return {
-        task: existingStageTask,
+        task: reboundStageTask,
         conversationId: correlation.conversationId,
         conversationTaskId: correlation.conversationTaskId,
         requestId: correlation.requestId,
@@ -841,14 +879,6 @@ export function startIndustryWorkflow(input: StartIndustryWorkflowInput): Indust
       };
     }
   }
-  const requestedConversationTaskId = compact(input.conversationTaskId, 200);
-  const existingConversationTaskId = requestedConversationTaskId && (readDB().conversationActionTasks || []).some((candidate: any) => (
-    candidate.id === requestedConversationTaskId
-    && candidate.conversationId === conversation.id
-    && candidate.userId === input.userId
-    && candidate.domain === input.domain
-    && String(candidate.orgId || '') === String(input.orgId || '')
-  )) ? requestedConversationTaskId : '';
   const task = createWorkTakeoverTask({
     userId: input.userId,
     domain: input.domain,

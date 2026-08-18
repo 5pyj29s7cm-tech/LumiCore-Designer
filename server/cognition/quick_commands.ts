@@ -25,6 +25,7 @@ import {
   requestedDesktopWindowAction,
 } from './action_contract';
 import { getPersonalClientSurfaceByAction } from '../../shared/client_surfaces';
+import { isDesignProjectCreationRequest } from '../regions/packs/cn/industry_capability_profile';
 
 export interface QuickCommandResult {
   /** The response text to send back to the user */
@@ -47,6 +48,77 @@ export interface QuickCommandOptions {
   orgId?: string;
   surface?: WorkTakeoverTurnSurface;
   currentAppTarget?: string;
+}
+
+function captureChineseField(text: string, pattern: RegExp): string {
+  return String(text.match(pattern)?.[1] || '').replace(/^[“”"'\s]+|[“”"'\s]+$/g, '').trim();
+}
+
+export function buildDeterministicDesignProjectCreateCommand(text: string): QuickCommandResult | null {
+  const clean = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!isDesignProjectCreationRequest(clean)) return null;
+  const name = captureChineseField(clean, /(?:\u540d\u79f0|\u9879\u76ee\u540d(?:\u79f0)?)(?:\u4e3a|\u662f|\u53eb)?\s*[“"']?([^”"'\uff0c\u3002\uff1b;]{2,80})/u);
+  if (!name) return null;
+  const projectType = /(?:\u4f4f\u5b85|\u5bb6\u88c5)/u.test(clean)
+    ? 'residential'
+    : /(?:\u529e\u516c|\u5199\u5b57\u697c)/u.test(clean)
+      ? 'office'
+      : /(?:\u96f6\u552e|\u5546\u4e1a|\u5e97\u94fa)/u.test(clean)
+        ? 'retail'
+        : /(?:\u9152\u5e97|\u6c11\u5bbf|\u9910\u996e)/u.test(clean)
+          ? 'hospitality'
+          : 'other';
+  const location = captureChineseField(clean, /(?:\u5730\u70b9|\u4f4d\u7f6e|\u9879\u76ee\u5730\u5740)(?:\u4e3a|\u662f)?\s*([^\uff0c\u3002\uff1b;]{2,80})/u);
+  const area = captureChineseField(clean, /(?:\u5efa\u7b51\u9762\u79ef|\u5957\u5185\u9762\u79ef|\u9762\u79ef)(?:\u4e3a|\u662f)?\s*([0-9.]+\s*(?:\u5e73\u65b9\u7c73|\u5e73\u7c73|\u33a1))/u);
+  const occupants = captureChineseField(clean, /(?:\u5c45\u4f4f\u8005|\u4f7f\u7528\u8005|\u5bb6\u5ead\u6210\u5458)(?:\u4e3a|\u662f)?\s*([^\uff0c\u3002\uff1b;]{2,120})/u);
+  const budget = captureChineseField(clean, /(?:[^\uff0c\u3002\uff1b;]{0,16})?\u9884\u7b97(?:\u4e3a|\u662f)?\s*([0-9.]+\s*(?:\u4e07\u5143|\u5143|CNY|RMB))/iu);
+  const style = captureChineseField(clean, /(?:\u504f\u597d|\u98ce\u683c(?:\u4e3a|\u662f)?|\u559c\u6b22)\s*([^\uff0c\u3002\uff1b;]{2,80})/u);
+  const requirements = captureChineseField(clean, /\u9700\u6c42\s*[\uff1a:]\s*([\s\S]*?)(?=[\uff1b;]\s*\u7ea6\u675f\s*[\uff1a:]|\u3002\s*\u8bf7|$)/u);
+  const constraints = captureChineseField(clean, /\u7ea6\u675f\s*[\uff1a:]\s*([\s\S]*?)(?=\u3002\s*\u8bf7|$)/u);
+  const args: Record<string, string> = { name, projectType };
+  for (const [key, value] of Object.entries({ location, area, occupants, budget, style, requirements, constraints })) {
+    if (value) args[key] = value;
+  }
+  return {
+    matched: true,
+    responseText: '\u6b63\u5728\u521b\u5efa\u5e76\u6fc0\u6d3b\u5ba4\u5185\u8bbe\u8ba1\u9879\u76ee\u3002',
+    toolCall: { name: 'interior_design_project_create', arguments: args },
+    formatToolResult: (raw, error) => {
+      if (error) return `\u9879\u76ee\u6ca1\u6709\u521b\u5efa\u6210\u529f\uff1a${error}`;
+      try {
+        const payload = JSON.parse(raw || '{}');
+        if (payload.ok !== true || payload.status !== 'created' || payload.persisted !== true || payload.active !== true) {
+          return '\u9879\u76ee\u521b\u5efa\u56de\u6267\u672a\u901a\u8fc7\u6821\u9a8c\uff0c\u5df2\u505c\u6b62\u3002';
+        }
+        const project = payload.project || {};
+        const brief = project.brief || {};
+        const facts = [
+          project.name ? `\u540d\u79f0=${project.name}` : '',
+          project.projectType ? `\u7c7b\u578b=${project.projectType}` : '',
+          brief.location ? `\u5730\u70b9=${brief.location}` : '',
+          brief.area ? `\u9762\u79ef=${brief.area}` : '',
+          brief.occupants ? `\u4f7f\u7528\u8005=${brief.occupants}` : '',
+          brief.budget ? `\u9884\u7b97=${brief.budget}` : '',
+          brief.style ? `\u98ce\u683c=${brief.style}` : '',
+          brief.requirements ? `\u9700\u6c42=${brief.requirements}` : '',
+        ].filter(Boolean);
+        const missing = [
+          ['location', '\u5730\u70b9'], ['area', '\u9762\u79ef'], ['occupants', '\u4f7f\u7528\u8005'],
+          ['budget', '\u9884\u7b97'], ['style', '\u98ce\u683c'], ['requirements', '\u9700\u6c42'],
+        ].filter(([key]) => !String(brief[key] || '').trim()).map(([, label]) => label);
+        return [
+          `\u9879\u76ee\u5df2\u521b\u5efa\u5e76\u6fc0\u6d3b\uff0c\u6301\u4e45\u9879\u76ee ID\uff1a${project.id}\u3002`,
+          `\u5df2\u77e5\u4e8b\u5b9e\uff1a${facts.join('\uff1b')}\u3002`,
+          `\u7f3a\u5931\u9879\uff1a${missing.length ? missing.join('\u3001') : '\u5df2\u63d0\u4f9b\u7684 Brief \u5b57\u6bb5\u65e0\u7f3a\u5931'}\u3002`,
+          `\u8303\u56f4\u98ce\u9669\uff1a${brief.constraints || '\u672a\u8bb0\u5f55\uff0c\u9700\u5728\u8fdb\u5165\u65b9\u6848\u524d\u8865\u5145'}\u3002`,
+          '\u4e0b\u4e00\u6b65\uff1a\u5148\u590d\u6838\u539f\u59cb\u5c3a\u5bf8\u3001\u627f\u91cd\u7ed3\u6784\u3001\u6d88\u9632\u548c\u673a\u7535\u6761\u4ef6\uff0c\u518d\u8fdb\u5165\u8bbe\u8ba1\u9879\u76ee\u65b9\u6848\u9636\u6bb5\u3002',
+          '\u672c\u8f6e\u53ea\u521b\u5efa\u9879\u76ee\u5bb9\u5668\u5e76\u5f52\u6863 Brief\uff1b\u672a\u751f\u6210 CAD\u3001\u6548\u679c\u56fe\u6216 PPT\uff0c\u672a\u4fee\u6539\u5916\u90e8\u8f6f\u4ef6\uff0c\u672a\u53d1\u9001\u7ed9\u5ba2\u6237\u3002',
+        ].join('\n');
+      } catch {
+        return '\u9879\u76ee\u521b\u5efa\u56de\u6267\u65e0\u6cd5\u89e3\u6790\uff0c\u4e0d\u4f1a\u8bf4\u6210\u5df2\u5b8c\u6210\u3002';
+      }
+    },
+  };
 }
 
 /**
@@ -180,6 +252,11 @@ function findKnownLoginPreset(target: string) {
 }
 
 const patterns: QuickPattern[] = [
+  {
+    patterns: [/[\s\S]+/u],
+    handler: match => buildDeterministicDesignProjectCreateCommand(match[0])
+      || { responseText: '', matched: false },
+  },
   {
     patterns: [/[\s\S]+/u],
     handler: (match) => {

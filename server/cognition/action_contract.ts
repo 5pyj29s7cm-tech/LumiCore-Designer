@@ -9,6 +9,7 @@ import { classifyRuntimeWorkIntent } from './runtime_work_intent';
 import { CN_ACTION_CONTRACT_BLOCKERS } from '../regions/packs/cn/voice_fast_path_messages';
 import { normalizeActionIntent } from './normalized_action_intent';
 import { isDesignProjectStatusRequest } from '../design/status_intent';
+import { isDesignProjectCreationRequest } from '../regions/packs/cn/industry_capability_profile';
 
 export type LumiActionContractKind =
   | 'none'
@@ -244,13 +245,20 @@ export function isSimpleDesktopOpenRequest(input: string): boolean {
 
 export function requiresDesktopAiCollaboration(input: string): boolean {
   const text = compact(extractPrimaryTaskText(input));
+  const positiveText = text.replace(
+    /(?:不要|不得|禁止|严禁|无需|不需要|不能|别|避免)[^。！？!?；;\n]{0,96}(?:AI|模型|agent|智能体)[^。！？!?；;\n]*/giu,
+    ' ',
+  );
   // i18n-allow: multilingual desktop-AI surface recognition; not user-visible copy.
-  const hasAiSurface = /(?:WorkBuddy|Codex|ChatGPT|Claude|Gemini|DeepSeek|Kimi|豆包|通义|文心|Perplexity|Cursor|Copilot|Ollama|LM\s*Studio|Cherry\s*Studio|AnythingLLM|外部\s*AI|桌面\s*AI|AI\s*(?:工具|客户端|app))/iu.test(text)
-    // i18n-allow: generic AI-target recognition; not user-visible copy.
-    || /(?:AI|模型|agent|智能体)/iu.test(text);
+  const hasNamedAiSurface = /(?:WorkBuddy|Codex|ChatGPT|Claude|Gemini|DeepSeek|Kimi|豆包|通义|文心|Perplexity|Cursor|Copilot|Ollama|LM\s*Studio|Cherry\s*Studio|AnythingLLM|外部\s*AI|桌面\s*AI|AI\s*(?:工具|客户端|app))/iu.test(positiveText);
+  // Generic words such as "模型" and "智能体" are collaboration targets
+  // only when a positive sentence actually directs work to or requests an
+  // answer from them. A safety boundary such as "禁止凭模型记忆编造" must
+  // not divert an industry task into the external-AI lane.
+  const hasGenericAiCollaborationTarget = /(?:问(?!题)(?:一下|问)?|询问|发给|发送给|交给|让|跟|和).{0,48}(?:AI|模型|agent|智能体)|(?:AI|模型|agent|智能体).{0,48}(?:聊天|对话|讨论|回答|协同|合作|汇总|对比)/iu.test(positiveText);
   // i18n-allow: multilingual collaboration-action recognition; not user-visible copy.
-  const hasCollaborationAction = /(?:问(?:一下|问)?|询问|发给|发送给|交给|跟|和|同).{0,48}(?:聊天|聊|对话|说|问|讨论)|(?:聊天|对话|讨论|回答|结果|总结|对比|汇总)|\b(?:ask|send\s+to|hand\s+off|chat|talk|discuss|answer|collect|compare|summari[sz]e)\b/iu.test(text);
-  return hasAiSurface && hasCollaborationAction;
+  const hasCollaborationAction = /(?:问(?!题)(?:一下|问)?|询问|发给|发送给|交给|跟|和).{0,48}(?:聊天|聊|对话|说|问|讨论)|(?:聊天|对话|讨论|回答|结果|总结|对比|汇总)|\b(?:ask|send\s+to|hand\s+off|chat|talk|discuss|answer|collect|compare|summari[sz]e)\b/iu.test(positiveText);
+  return (hasNamedAiSurface || hasGenericAiCollaborationTarget) && hasCollaborationAction;
 }
 
 export function requiresExternalAiHistory(input: string): boolean {
@@ -476,8 +484,12 @@ export function hasBlankAutoCadDocumentEvidence(records: ToolExecutionRecord[] =
 export function requiresAuthenticatedWebResult(input: string): boolean {
   const text = compact(input);
   if (!text) return false;
-  const hasAccountSurface = /\u767b\u5f55|\u81ea\u52a8\u767b\u5f55|\u8d26\u53f7|\u8d26\u6237|\u4f1a\u8bdd|login|log\s*in|sign\s*in|account|session/i.test(text);
-  const hasTargetWork = /\u67e5|\u627e|\u641c|\u68c0\u7d22|\u8bfb|\u4e0b\u8f7d|\u6253\u5f00|find|search|query|look\s*up|fetch|download/i.test(text);
+  const positiveText = text.replace(
+    /(?:不要|不得|禁止|严禁|无需|不需要|不能|别|避免)[^。！？!?；;\n]{0,96}(?:登录|账号|账户|会话|login|log\s*in|sign\s*in|account|session)[^。！？!?；;\n]*/giu,
+    ' ',
+  );
+  const hasAccountSurface = /\u767b\u5f55|\u81ea\u52a8\u767b\u5f55|\u8d26\u53f7|\u8d26\u6237|\u4f1a\u8bdd|login|log\s*in|sign\s*in|account|session/i.test(positiveText);
+  const hasTargetWork = /\u67e5|\u627e|\u641c|\u68c0\u7d22|\u8bfb|\u4e0b\u8f7d|\u6253\u5f00|find|search|query|look\s*up|fetch|download/i.test(positiveText);
   return hasAccountSurface && hasTargetWork;
 }
 
@@ -717,6 +729,10 @@ export function buildActionContract(input: string): LumiActionContract {
     || normalizedIntent.kind === 'client_navigation'
     || normalizedIntent.kind === 'client_state'
   ) return NONE_CONTRACT;
+  // A durable interior-project status query may mention a task id, current
+  // task, or ledger. Those words describe the project-stage receipt and must
+  // not redirect verification to the generic runtime_work_status contract.
+  if (isDesignProjectStatusRequest(text)) return buildDesignDeliveryContract();
   const runtimeWorkIntent = classifyRuntimeWorkIntent(text);
   if (runtimeWorkIntent !== 'none') {
     const cancelling = runtimeWorkIntent === 'cancel';
@@ -955,8 +971,12 @@ export function buildActionContract(input: string): LumiActionContract {
     });
   }
 
+  const positiveBrowserAccountText = text.replace(
+    /(?:不要|不得|禁止|严禁|无需|不需要|不能|别|避免)[^。！？!?；;\n]{0,96}(?:登录|浏览器|打开网站|外部网站|网页|网站|login|log\s*in|browser|website|site)[^。！？!?；;\n]*/giu,
+    ' ',
+  );
   if (
-    matches(text, /\u767b\u5f55|\u6d4f\u89c8\u5668|\u6253\u5f00\u7f51\u7ad9|\u81ea\u52a8\u767b\u5f55|browser|login|log\s*in|website|site/i) &&
+    matches(positiveBrowserAccountText, /\u767b\u5f55|\u6d4f\u89c8\u5668|\u6253\u5f00\u7f51\u7ad9|\u81ea\u52a8\u767b\u5f55|browser|login|log\s*in|website|site/i) &&
     !matches(text, /\bCAD\b|\bDXF\b|\bDWG\b|AutoCAD|\u753b\u56fe|\u753b\u56fe\u7eb8|\u56fe\u7eb8|\u5e73\u9762\u56fe|\u65bd\u5de5\u56fe|\u88c5\u4fee|cad/i)
   ) {
     return withDefaults({
@@ -1820,7 +1840,7 @@ function hasDesignDeliveryEvidence(records: ToolExecutionRecord[], taskText: str
         && Boolean(compact(payload?.project?.id));
     });
   }
-  const wantsProjectCreation = /(?:新建|创建).{0,12}(?:室内)?设计项目|(?:new|create).{0,18}(?:interior|design)\s+project/iu.test(taskText);
+  const wantsProjectCreation = isDesignProjectCreationRequest(taskText);
   if (wantsProjectCreation) {
     return records.some(record => {
       if (record.name !== 'interior_design_project_create' || record.error) return false;

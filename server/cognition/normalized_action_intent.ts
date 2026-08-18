@@ -12,6 +12,8 @@ export type NormalizedActionIntentKind =
   | 'client_navigation'
   | 'client_state'
   | 'desktop_operation'
+  | 'media_generation'
+  | 'document_creation'
   | 'cad_drafting'
   | 'scheduled_task'
   | 'status_query'
@@ -101,6 +103,13 @@ function currentTurnText(value: string): string {
     .trim();
 }
 
+function stripNegatedActionClauses(value: string): string {
+  return String(value || '')
+    .replace(/(?:\u4e0d\u8981|\u4e0d\u7528|\u65e0\u9700|\u4e0d\u5fc5|\u7981\u6b62|\u4e0d\u5f97|\u5207\u52ff|\u8bf7\u52ff|\u522b)[^\uff0c\u3002\uff1b!?\uff01\uff1f]{0,160}/gu, ' ')
+    .replace(/\b(?:do\s+not|don't|dont|must\s+not|never|without)\b[^.!?;]{0,200}/gi, ' ')
+    .trim();
+}
+
 function trimSlot(value: string): string {
   return String(value || '')
     .replace(/^[\s“”‘’「」『』"']+|[\s“”‘’「」『』"'，。！？!?：:；;、]+$/gu, '')
@@ -173,8 +182,13 @@ function statusQuery(text: string): NormalizedActionIntent | null {
   // Registered edition workspaces participate in the same durable status
   // lookup as generic tasks. This keeps spoken follow-ups such as “设计项目进度呢”
   // on the receipt-backed status lane instead of asking the model to guess.
+  // A workspace label plus a bare completion word is not a status query. Long
+  // execution instructions routinely contain acceptance clauses such as
+  // "missing any receipt means incomplete". Require explicit interrogative or
+  // progress/status wording so those clauses cannot suppress the requested
+  // creation tools in the normalized-vs-legacy safety comparison.
   const registeredSurfaceStatus =
-    /(?:进度|状态|结果呢|做到哪|到哪了|怎么样|做完了吗|完成了吗|好了吗)/u.test(text) // i18n-allow: Reviewed Chinese status-follow-up input recognition.
+    /(?:\u8fdb\u5ea6|\u72b6\u6001|\u7ed3\u679c(?:\u5462|\u5982\u4f55|\u600e\u4e48\u6837)?|\u505a\u5230\u54ea|\u5230\u54ea(?:\u4e86)?|\u600e\u4e48\u6837|\u662f\u5426(?:\u5df2\u7ecf)?\u5b8c\u6210|\u6709\u6ca1\u6709\u5b8c\u6210|\u505a\u5b8c\u4e86\u5417|\u5b8c\u6210\u4e86\u5417|\u505a\u597d\u4e86\u5417|\u597d\u4e86\u5417)|\b(?:status|progress|done\s+yet|is\s+(?:it|this|the\s+task)\s+(?:complete|completed|done))\b/iu.test(text) // i18n-allow: Reviewed multilingual status-follow-up input recognition.
       ? REGISTERED_CLIENT_SURFACE_RULES.find(candidate => candidate.pattern.test(text))
       : undefined;
   if (registeredSurfaceStatus) {
@@ -423,9 +437,44 @@ function localDesktopOperation(text: string): NormalizedActionIntent | null {
   };
 }
 
+function mediaGeneration(text: string): NormalizedActionIntent | null {
+  const image = /(?:\u751f\u6210|\u5236\u4f5c|\u505a|\u51fa|\u6e32\u67d3).{0,24}(?:\u56fe\u7247|\u56fe\u50cf|\u6548\u679c\u56fe|\u6e32\u67d3\u56fe|\u6d77\u62a5)|\b(?:generate|create|make|render)\b.{0,32}\b(?:image|visual|render|poster)\b/iu.test(text);
+  const video = /(?:\u751f\u6210|\u5236\u4f5c|\u505a|\u51fa).{0,24}(?:\u89c6\u9891|\u52a8\u753b)|\b(?:generate|create|make)\b.{0,32}\b(?:video|animation)\b/iu.test(text);
+  if (!image && !video) return null;
+  return {
+    kind: 'media_generation',
+    operation: 'create',
+    subject: 'user',
+    target: image ? 'image' : 'video',
+    payload: text,
+    sideEffectClass: 'external_commit',
+    relation: /(?:\u7ee7\u7eed|\u63a5\u7740|\u4e0b\u4e00\u6b65)|\b(?:continue|next)\b/iu.test(text) ? 'continue' : 'new',
+    confidence: 0.95,
+    rule: image ? 'explicit-image-generation' : 'explicit-video-generation',
+  };
+}
+
+function documentCreation(text: string): NormalizedActionIntent | null {
+  const presentation = /(?:\u6267\u884c|\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u8f93\u51fa|\u5bfc\u51fa|\u5b8c\u6210).{0,32}(?:\u63d0\u6848\s*PPT|PPT|\u6f14\u793a\u6587\u7a3f|presentation)|(?:\u63d0\u6848\s*PPT|PPT|\u6f14\u793a\u6587\u7a3f).{0,24}(?:\u9636\u6bb5|\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u8f93\u51fa|\u5bfc\u51fa)/iu.test(text);
+  const document = /(?:\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u8f93\u51fa|\u5bfc\u51fa).{0,28}(?:PDF|DOCX|Word\s*\u6587\u6863|\u62a5\u544a\u6587\u4ef6)|\b(?:generate|create|export)\b.{0,32}\b(?:pdf|docx|document|report)\b/iu.test(text);
+  if (!presentation && !document) return null;
+  return {
+    kind: 'document_creation',
+    operation: 'create',
+    subject: 'user',
+    target: presentation ? 'presentation' : 'document',
+    payload: text,
+    sideEffectClass: 'local_write',
+    relation: /(?:\u7ee7\u7eed|\u63a5\u7740|\u4e0b\u4e00\u6b65)|\b(?:continue|next)\b/iu.test(text) ? 'continue' : 'new',
+    confidence: 0.95,
+    rule: presentation ? 'explicit-presentation-creation' : 'explicit-document-creation',
+  };
+}
+
 export function normalizeActionIntent(value: string): NormalizedActionIntent {
   const text = currentTurnText(value);
   if (!text) return { ...EMPTY_INTENT };
+  const affirmativeActionText = stripNegatedActionClauses(text);
 
   // Order is a safety invariant. Later action-shaped words cannot override a
   // correction, status query, client-native route, external-AI read, or
@@ -433,12 +482,14 @@ export function normalizeActionIntent(value: string): NormalizedActionIntent {
   const priority = [
     correctionOrExplanation(text),
     statusQuery(text),
-    clientNavigation(text),
+    clientNavigation(affirmativeActionText),
     externalAiHistoryRead(text),
     inboundMessageRead(text),
-    outgoingMessageSend(text),
-    genericExternalCommit(text),
-    localDesktopOperation(text),
+    outgoingMessageSend(affirmativeActionText),
+    mediaGeneration(affirmativeActionText),
+    documentCreation(affirmativeActionText),
+    genericExternalCommit(affirmativeActionText),
+    localDesktopOperation(affirmativeActionText),
   ].find(Boolean);
   if (priority) return priority;
 

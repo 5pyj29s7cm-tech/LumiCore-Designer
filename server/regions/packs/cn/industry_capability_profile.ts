@@ -136,6 +136,27 @@ function normalizeCompactMatchText(value: unknown): string {
   return normalizeText(value).replace(/\s+/g, '');
 }
 
+function stripNegatedRoutingClauses(value: unknown): string {
+  return String(value || '')
+    .replace(/(?:\u4e0d\u8981|\u4e0d\u7528|\u65e0\u9700|\u4e0d\u5fc5|\u7981\u6b62|\u4e0d\u5f97|\u5207\u52ff|\u8bf7\u52ff)[^\uff0c\u3002\uff1b!?\uff01\uff1f]{0,120}/gu, ' ')
+    .replace(/\b(?:do\s+not|don't|dont|must\s+not|never)\b[^.!?;]{0,160}/gi, ' ');
+}
+
+function isExplicitWorkflowTarget(normalizedText: string, normalizedTerm: string): boolean {
+  if (!normalizedText || !normalizedTerm) return false;
+  let offset = 0;
+  while (offset < normalizedText.length) {
+    const index = normalizedText.indexOf(normalizedTerm, offset);
+    if (index < 0) return false;
+    const prefix = normalizedText.slice(Math.max(0, index - 56), index);
+    if (/(?:\u5f00\u59cb|\u542f\u52a8|\u7ee7\u7eed|\u6267\u884c|\u8fdb\u5165|\u63a8\u8fdb|\u5904\u7406|\u5236\u4f5c|\u751f\u6210|start|enter|continue|advance|execute|run|build|create)[^\uff0c\u3002\uff1b!?\uff01\uff1f]{0,36}$/iu.test(prefix)) {
+      return true;
+    }
+    offset = index + Math.max(1, normalizedTerm.length);
+  }
+  return false;
+}
+
 export function getCurrentIndustryCapabilityProfile(): IndustryCapabilityProfile | null {
   const productLine = currentProductLine();
   if (!productLine) return null;
@@ -167,19 +188,27 @@ export function getCurrentIndustryCapabilityProfile(): IndustryCapabilityProfile
 
 export function matchCurrentIndustryWorkflow(text: unknown): IndustryWorkflowMatch | null {
   const profile = getCurrentIndustryCapabilityProfile();
-  const normalized = normalizeText(text);
-  const compactNormalized = normalizeCompactMatchText(text);
+  const affirmativeText = stripNegatedRoutingClauses(text);
+  const normalized = normalizeText(affirmativeText);
+  const compactNormalized = normalizeCompactMatchText(affirmativeText);
   if (!profile || !normalized) return null;
 
   const candidates = profile.entries.map(entry => {
     const matchedTerms: string[] = [];
     let score = 0;
+    const displayTerm = normalizeText(entry.displayName);
     for (const rawTerm of entry.routingTerms) {
       const term = normalizeText(rawTerm);
       const compactTerm = normalizeCompactMatchText(rawTerm);
       if (!term || (!normalized.includes(term) && !compactNormalized.includes(compactTerm))) continue;
       matchedTerms.push(rawTerm);
       score += normalized === term ? 100 : 18 + Math.min(term.length, 16);
+      // A visible workspace label such as “效果图” or “合同审查” is a
+      // stronger routing signal than generic context such as “项目 Brief”.
+      // Negated clauses were removed above, so a guard like “不要生成效果图”
+      // cannot steal the route from the explicitly requested stage.
+      if (term === displayTerm) score += 40;
+      if (isExplicitWorkflowTarget(normalized, term)) score += 160;
     }
     const semanticPatterns = PROFILE_COPY[profile.productLine].entries[entry.entryId]?.routingPatterns || [];
     if (semanticPatterns.some(pattern => pattern.test(normalized))) {
@@ -195,20 +224,47 @@ export function matchCurrentIndustryWorkflow(text: unknown): IndustryWorkflowMat
   return candidates[0];
 }
 
+export function isCurrentIndustryMultiWorkspaceLedgerStatusRequest(text: unknown): boolean {
+  const normalized = String(text || '').trim();
+  const profile = getCurrentIndustryCapabilityProfile();
+  if (!normalized || !profile) return false;
+  const requestedWorkspaceCount = profile.entries
+    .filter(entry => normalized.includes(entry.displayName)).length;
+  return requestedWorkspaceCount >= 2
+    && /(?:分别|逐项|各自|行业任务账本|最终回执|最近任务)/u.test(normalized)
+    && /(?:状态|进度|结果|关键结果|交付物|确认边界|回执)/u.test(normalized);
+}
+
 export function isCurrentIndustryWorkflowExecutionRequest(text: unknown): boolean {
   const normalized = String(text || '').trim();
   if (!matchCurrentIndustryWorkflow(normalized)) return false;
+  if (isCurrentIndustryMultiWorkspaceLedgerStatusRequest(normalized)) return false;
   if (/(?:做完|完成|进度|状态|结果).{0,10}(?:吗|呢|如何|怎样|怎么|没有)|(?:是否|是不是).{0,20}(?:完成|做完)/u.test(normalized)) return false;
-  if (/(?:不要|不用|无需|不需要|禁止).{0,16}(?:执行|开始|创建|生成|调用|工具|新任务)/u.test(normalized)) return false;
-  if (/(?:是什么|有哪些|能做什么|会做什么|怎么用|如何使用|介绍一下|支持吗|能不能|可不可以|可以吗|会不会|为什么|怎么回事|做完了吗|完成了吗|好了吗|进度|状态|结果呢|what\s+(?:is|are|can)|how\s+(?:to|do|does)|can\s+(?:you|it)|status|progress)[？?。.!！]*$/iu.test(normalized)) return false;
-  return /(?:请|帮我|给我|替我|开始|启动|继续|执行|处理|整理|生成|制作|创建|输出|分析|汇总|核对|检查|审查|审核|检索|查找|查一下|查一查|预测|准备|导入|归档|做一|做个|做份|做一下|看一下|看一看|算一下|算一算|review|analy[sz]e|generate|create|prepare|start|run|check|audit|draft|build|produce|reconcile|forecast|file)/iu.test(normalized);
+
+  // Negative constraints belong to their own clause. A request such as
+  // “执行方案阶段；不要新建第二个项目；不要生成 CAD” is still an execution
+  // request for the scheme stage, with two explicit forbidden side effects.
+  const affirmativeText = normalized
+    .replace(/(?:不要|不用|无需|不需要|不必|禁止|不得|切勿|请勿)[^，。；!?！？]{0,80}/gu, ' ')
+    .replace(/\b(?:do\s+not|don't|dont|must\s+not|never)\b[^.!?;]{0,120}/gi, ' ')
+    .trim();
+  if (!affirmativeText) return false;
+
+  if (/(?:是什么|有哪些|能做什么|会做什么|怎么用|如何使用|介绍一下|支持吗|能不能|可不可以|可以吗|会不会|为什么|怎么回事|what\s+(?:is|are|can)|how\s+(?:to|do|does)|can\s+(?:you|it)|status|progress)[？?。.!！]*$/iu.test(affirmativeText)) return false;
+  return /(?:开始|启动|继续|执行|处理|整理|生成|制作|创建|输出|分析|汇总|核对|检查|审查|审核|检索|查找|预测|准备|导入|归档|做一|做个|做份|看一|算一|review|analy[sz]e|generate|create|prepare|start|run|check|audit|draft|build|produce|reconcile|forecast|file)/iu.test(affirmativeText);
 }
 
 export function isDesignProjectCreationRequest(text: unknown): boolean {
   if (currentProductLine() !== 'design') return false;
   const normalized = String(text || '').trim();
-  return /\b(?:create|start|new)\b.{0,24}\b(?:interior\s+)?design\s+project\b/i.test(normalized)
-    || /(?:\u65b0\u5efa|\u521b\u5efa|\u65b0\u589e|\u5efa\u4e00\u4e2a).{0,12}(?:\u5ba4\u5185|\u88c5\u4fee|\u8bbe\u8ba1)?\u9879\u76ee/u.test(normalized);
+  // A stage request commonly contains a negative guard such as
+  // “不要新建第二个项目”. Remove only those negated creation mentions so a
+  // real positive creation request elsewhere in the same turn still wins.
+  const affirmativeText = normalized
+    .replace(/(?:\u4e0d\u8981|\u4e0d\u7528|\u65e0\u9700|\u4e0d\u5fc5|\u7981\u6b62|\u4e0d\u5f97|\u5207\u52ff|\u8bf7\u52ff).{0,10}(?:\u65b0\u5efa|\u521b\u5efa|\u65b0\u589e|\u5efa\u4e00\u4e2a).{0,16}(?:\u5ba4\u5185|\u88c5\u4fee|\u8bbe\u8ba1)?\u9879\u76ee/gu, ' ')
+    .replace(/\b(?:do\s+not|don't|dont|must\s+not|never)\b.{0,28}\b(?:create|start|new)\b.{0,24}\b(?:interior\s+)?design\s+project\b/gi, ' ');
+  return /\b(?:create|start|new)\b.{0,24}\b(?:interior\s+)?design\s+project\b/i.test(affirmativeText)
+    || /(?:\u65b0\u5efa|\u521b\u5efa|\u65b0\u589e|\u5efa\u4e00\u4e2a).{0,12}(?:\u5ba4\u5185|\u88c5\u4fee|\u8bbe\u8ba1)?\u9879\u76ee/u.test(affirmativeText);
 }
 
 export function formatIndustryCapabilityProfilePrompt(text?: unknown): string {

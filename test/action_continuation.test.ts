@@ -470,6 +470,46 @@ describe('recent action continuation', () => {
     expect(state?.latestBlocker).toContain('write verification failed');
   });
 
+  it('preserves an authoritative same-request blocker when the visible reply only carries a verified status receipt', () => {
+    const instruction = '\u6267\u884c\u63d0\u6848 PPT \u9636\u6bb5\uff0c\u524d\u7f6e\u672a\u901a\u8fc7\u5c31\u505c\u6b62\u3002';
+    const state = buildConversationActionContinuationState({
+      previous: {
+        version: 2,
+        taskId: 'task_presentation_guard',
+        status: 'blocked',
+        goal: instruction,
+        latestInstruction: instruction,
+        latestBlocker: 'Design stage presentation is blocked until visualization is verified.',
+        activeRequestId: 'request_presentation_guard',
+        unfinished: true,
+        assistantState: '',
+        appTarget: '',
+        receipts: [],
+        sourcePaths: [],
+        evidenceTools: [],
+        toolSummaries: [],
+        revision: 3,
+        updatedAt: '2026-08-16T00:00:00.000Z',
+      },
+      userText: instruction,
+      assistantText: '\u6548\u679c\u56fe\u672a\u901a\u8fc7\uff0c\u5df2\u505c\u6b62\u751f\u6210 PPT\u3002',
+      requestId: 'request_presentation_guard',
+      toolCalls: [{
+        name: 'interior_design_project_status',
+        arguments: {},
+        result: JSON.stringify({ ok: true, persisted: true, status: 'observed' }),
+        terminalVerification: { status: 'verified', strategy: 'measured', reason: 'ledger read' },
+      }],
+    });
+
+    expect(state).toMatchObject({
+      taskId: 'task_presentation_guard',
+      status: 'blocked',
+      activeRequestId: 'request_presentation_guard',
+      latestBlocker: expect.stringContaining('visualization'),
+    });
+  });
+
   it('drops a superseded execution branch after the user corrects the task', () => {
     const bridge = buildRecentActionContinuationBridge('继续', [
       { role: 'user', message: '在 AutoCAD 里画户型图。' },

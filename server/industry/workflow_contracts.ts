@@ -117,6 +117,7 @@ const DESIGN_CONTRACTS: IndustryWorkflowContract[] = [
     requiresFileArtifact: false,
     acceptedFileExtensions: [],
     executionTools: [
+      'interior_design_project_status',
       'mcp_design-studio-pack_interior_project_brief',
       'mcp_design-studio-pack_space_planning_checklist',
       'mcp_design-studio-pack_site_survey_report',
@@ -142,6 +143,7 @@ const DESIGN_CONTRACTS: IndustryWorkflowContract[] = [
     requiresFileArtifact: true,
     acceptedFileExtensions: ['.dxf', '.dwg', '.cad', '.svg', '.pdf'],
     executionTools: [
+      'interior_design_project_status',
       'mcp_design-studio-pack_drawing_ingest_qa',
       'read_file',
       'read_pdf',
@@ -169,6 +171,7 @@ const DESIGN_CONTRACTS: IndustryWorkflowContract[] = [
     requiresFileArtifact: true,
     acceptedFileExtensions: ['.png', '.jpg', '.jpeg', '.webp', '.tif', '.tiff', '.pdf'],
     executionTools: [
+      'interior_design_project_status',
       'mcp_design-studio-pack_interior_visual_direction',
       'read_file',
       'read_pdf',

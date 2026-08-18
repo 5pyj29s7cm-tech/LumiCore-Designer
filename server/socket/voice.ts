@@ -13,6 +13,11 @@ import { compactToolResultForModel, runWithTools } from "../llm/adapter";
 import { toolRegistry } from "../tools/registry";
 import { ToolExecutionRecord } from "../tools/types";
 import { executeToolCall } from "../tools/execution_engine";
+import { formatVerifiedDesignProjectStatus } from "../design/status_response";
+import {
+  completeIndustryWorkflowFromVerifiedReceipts,
+  isVerifiedIndustryWorkflowCompletionRecord,
+} from "../industry/workflow_autocomplete";
 import {
   GENERIC_TOOL_PLANNING_PROMPT,
   GENERIC_TOOL_REPLAN_PROMPT,
@@ -68,6 +73,7 @@ import { CONVERSATIONAL_MEMORY_EVIDENCE } from "../memory/types";
 import { searchKnowledgeBase } from "../org/kb";
 import {
   buildDeterministicClientNavigationCommand,
+  buildDeterministicDesignProjectCreateCommand,
   buildQuickCommandToolPolicy,
   matchQuickCommand,
 } from "../cognition/quick_commands";
@@ -79,10 +85,16 @@ import {
   type OperationMode,
 } from "../cognition/operation_modes";
 import { getStoredOperationMode, saveStoredOperationMode } from "../cognition/operation_mode_store";
+import { isDesignProjectStatusRequest } from "../design/status_intent";
 import { formatOperationModeSwitchResponse } from "../i18n/operation_mode_messages";
 import { buildInternalOpenCommand } from "../i18n/naturalness_messages";
 import { buildInteractionModeOverlay } from "../cognition/turn_flow";
 import { buildLumiExecutionPipeline } from "../cognition/execution_pipeline";
+import { isCurrentIndustryGuidanceRequest } from "../industry/user_guidance";
+import {
+  isCurrentIndustryWorkflowExecutionRequest,
+  matchCurrentIndustryWorkflow,
+} from "../regions/packs/cn/industry_capability_profile";
 import { shouldAllowExplicitLocalFileWrite } from "../cognition/local_write_intent";
 import { shouldRunLegacyDirectExecution } from "../cognition/legacy_route_policy";
 import { bindCapabilityExecutionPlanTask } from "../cognition/capability_execution_plan";
@@ -1309,14 +1321,20 @@ async function processVoiceInput(
   let recentVoiceHistory: any[] = [];
   let actionContinuationBridge = '';
   let continuationOpenTarget: string | null = null;
+  const explicitIndustryWorkflowRequest = Boolean(matchCurrentIndustryWorkflow(actionIntentText))
+    && isCurrentIndustryWorkflowExecutionRequest(actionIntentText);
   try {
     const conversation = getOrCreateActiveConversation(session.userId, session.agentId, voiceScope.domain, voiceScope.orgId);
     recentVoiceHistory = getMessages(conversation.id, 30);
-    actionContinuationBridge = buildRecentActionContinuationBridge(
-      actionIntentText,
-      recentVoiceHistory,
-      conversation.actionContinuationState,
-    );
+    actionContinuationBridge = isCurrentIndustryGuidanceRequest(actionIntentText)
+      || explicitIndustryWorkflowRequest
+      || isDesignProjectStatusRequest(actionIntentText)
+      ? ''
+      : buildRecentActionContinuationBridge(
+          actionIntentText,
+          recentVoiceHistory,
+          conversation.actionContinuationState,
+        );
     continuationOpenTarget = resolveRecentActionOpenTarget(
       actionIntentText,
       conversation.actionContinuationState,
@@ -1563,7 +1581,9 @@ async function processVoiceInput(
     },
     registry: toolRegistry,
     personalityToolPolicy: personality.toolPolicy,
-    actionTaskState: conversationTurn.conversation.actionContinuationState,
+    actionTaskState: explicitIndustryWorkflowRequest || isDesignProjectStatusRequest(actionIntentText)
+      ? undefined
+      : conversationTurn.conversation.actionContinuationState,
     traceText: actionIntentText,
     source: 'voice',
   });
@@ -1583,6 +1603,9 @@ async function processVoiceInput(
   });
   if (capabilityMetaResponse) {
     preMatchedQuickResult = { matched: true, responseText: capabilityMetaResponse };
+  }
+  if (!preMatchedQuickResult && turnFlow.industryWorkflowEntryId === 'project') {
+    preMatchedQuickResult = buildDeterministicDesignProjectCreateCommand(actionIntentText);
   }
   if (!preMatchedQuickResult && clientActionOnlyTurn) {
     preMatchedQuickResult = buildDeterministicClientNavigationCommand(
@@ -1879,6 +1902,7 @@ async function processVoiceInput(
   const maxIterations = executionDecision.allowToolUse
     ? Math.max(1, executionDecision.maxIterations || 1)
     : 1;
+  let voiceLoopLimit = maxIterations;
   const toolResultPreviewLimit = 500;
   const formatToolResultForUi = (value?: string) => value?.slice(0, toolResultPreviewLimit) || '';
   const emitToolLifecycle = (payload: {
@@ -2054,6 +2078,8 @@ async function processVoiceInput(
   })();
   let responseText = '';
   let toolResults: ToolExecutionRecord[] = [];
+  let forceVerifiedIndustryFinalResponse = false;
+  const requiredIndustryReplans = new Set<string>();
   const persistVoiceLearning = (
     assistantText: string,
     options: {
@@ -2306,6 +2332,41 @@ async function processVoiceInput(
     }
   };
 
+  if (isDesignProjectStatusRequest(actionIntentText)) {
+    const statusRecord = await executeToolCall({
+      registry: toolRegistry,
+      name: 'interior_design_project_status',
+      arguments: {},
+      context: toolContext,
+    });
+    responseText = formatVerifiedDesignProjectStatus(statusRecord, actionIntentText)
+      || '\u5f53\u524d\u9879\u76ee\u8d26\u672c\u6ca1\u6709\u8fd4\u56de\u53ef\u9a8c\u8bc1\u7684\u72b6\u6001\u56de\u6267\uff0c\u672c\u6b21\u6ca1\u6709\u6267\u884c\u65b0\u5de5\u4f5c\u3002';
+    emitAgent('agent:response', {
+      text: responseText,
+      agentName: 'Lumi',
+      source: 'voice_design_project_status',
+      finalized: true,
+      blocked: false,
+      reason: '',
+    });
+    persistVoiceUserMessage('design_project_status');
+    persistVoiceAssistantMessage(conversationTurn.conversation.id, responseText, {
+      toolCalls: [statusRecord],
+      cognitiveIntent: 'design_project_status',
+      llmWasCalled: false,
+      source: 'voice_design_project_status',
+    });
+    queueFinalizedSpeech(responseText);
+    await Promise.allSettled(ttsPromises);
+    if (!isCurrentTurn()) return;
+    socket.emit('chat:conversation_updated', {
+      conversationId: conversationTurn.conversation.id,
+      agentId: session.agentId,
+      source: 'voice_design_project_status',
+    });
+    return;
+  }
+
   if (voiceIndustryWorkflowTask && voiceIndustryPrerequisite) {
     const statusRecord = await executeToolCall({
       registry: toolRegistry,
@@ -2339,6 +2400,18 @@ async function processVoiceInput(
       assistantTextTrusted: true,
       finalizationReason: recorded.verification.summary,
     });
+    if (actionTaskExecution.state?.taskId) {
+      setConversationActionExecutionStatus(
+        conversationTurn.conversation.id,
+        session.userId,
+        'blocked',
+        {
+          blocker: recorded.verification.summary || voiceIndustryPrerequisite.blocker,
+          assistantState: responseText,
+          requestId,
+        },
+      );
+    }
     persistVoiceAssistantMessage(conversationTurn.conversation.id, responseText, {
       toolCalls: [statusRecord],
       cognitiveIntent: 'industry_prerequisite_blocked',
@@ -2395,7 +2468,7 @@ async function processVoiceInput(
     return;
   }
 
-  if (actionFollowupIntent === 'status') {
+  if (actionFollowupIntent === 'status' && !isDesignProjectStatusRequest(actionIntentText)) {
     responseText = getConversationActionStatus(
       conversationTurn.conversation.id,
       session.userId,
@@ -3400,11 +3473,11 @@ async function processVoiceInput(
         { role: 'user', content: routedUserText },
       ];
 
-      voiceToolLoop: for (let iter = 0; iter < maxIterations; iter++) {
+      voiceToolLoop: for (let iter = 0; iter < voiceLoopLimit; iter++) {
       if (pipelineAbort?.signal.aborted) break;
 
       logger.info(`[Audio] LLM iter ${iter + 1}/${maxIterations}: provider=${provider} model=${effectiveModel}`);
-      const toolDeclarations = executionDecision.allowToolUse
+      const toolDeclarations = executionDecision.allowToolUse && !forceVerifiedIndustryFinalResponse
         ? toolRegistry.getToolDeclarationsForPolicy(routedToolPolicy)
         : [];
 
@@ -3450,6 +3523,32 @@ async function processVoiceInput(
       recordTokenUsage(session.userId, streamResult.routing?.selectedProvider || provider, streamResult.routing?.selectedModel || effectiveModel, streamResult.usage, `voice_stream_${Date.now()}`, 'voice');
 
       if (plannedToolCalls.length === 0) {
+        const missingRequiredIndustryTool = (
+          toolContext.industryWorkflowRequiredToolReceipts || []
+        ).find(name => !toolResults.some(record => (
+          record.name === name
+          && !record.error
+          && record.terminalVerification?.status === 'verified'
+          && String(record.result || '').trim()
+        ))) || '';
+        if (
+          missingRequiredIndustryTool
+          && !requiredIndustryReplans.has(missingRequiredIndustryTool)
+          && toolDeclarations.some(declaration => declaration.function.name === missingRequiredIndustryTool)
+        ) {
+          requiredIndustryReplans.add(missingRequiredIndustryTool);
+          messages.push({
+            role: 'system',
+            content: [
+              `The bound industry contract requires a verified ${missingRequiredIndustryTool} receipt before an answer is accepted.`,
+              'Call that exact professional capability now using only the server-bound source facts.',
+              'If evidence is insufficient, record the missing facts and stop downstream creation rather than guessing.',
+            ].join('\n'),
+          });
+          responseText = '';
+          if (iter + 1 >= voiceLoopLimit) voiceLoopLimit += 1;
+          continue;
+        }
         if (
           iter === 0
           && toolResults.length === 0
@@ -3462,6 +3561,48 @@ async function processVoiceInput(
           messages.push({ role: 'system', content: GENERIC_TOOL_REPLAN_PROMPT });
           responseText = '';
           continue;
+        }
+        const autoCompletion = await completeIndustryWorkflowFromVerifiedReceipts({
+          registry: toolRegistry,
+          records: toolResults,
+          context: {
+            ...toolContext,
+            getCurrentToolRecords: () => [...toolResults],
+          },
+        });
+        if (autoCompletion) {
+          toolResults.push(autoCompletion);
+          const correlationId = autoCompletion.id || `industry-autocomplete-${Date.now()}`;
+          if (autoCompletion.error) {
+            emitToolLifecycle({
+              correlationId,
+              name: autoCompletion.name,
+              arguments: autoCompletion.arguments,
+              error: autoCompletion.error,
+            });
+          } else {
+            emitToolLifecycle({
+              correlationId,
+              name: autoCompletion.name,
+              arguments: autoCompletion.arguments,
+              result: formatToolResultForUi(autoCompletion.result),
+            });
+          }
+          if (isVerifiedIndustryWorkflowCompletionRecord(autoCompletion)) {
+            forceVerifiedIndustryFinalResponse = true;
+            messages.push({
+              role: 'system',
+              content: [
+                'The server archived the industry workflow because every contract-required capability produced a verified current-loop receipt.',
+                'Answer now only from the verified receipts. State deliverable paths, source constraints, missing fields, risks, and the next review step.',
+                'Do not call another tool and do not claim external delivery or professional approval without a separate receipt.',
+                `Completion receipt: ${compactToolResultForModel(autoCompletion.name, autoCompletion.result)}`,
+              ].join('\n'),
+            });
+            responseText = '';
+            if (iter + 1 >= voiceLoopLimit) voiceLoopLimit += 1;
+            continue;
+          }
         }
         break;
       }
@@ -3491,7 +3632,10 @@ async function processVoiceInput(
           id: tc.id,
           name: tc.name,
           arguments: executionArguments,
-          context: toolContext,
+          context: {
+            ...toolContext,
+            getCurrentToolRecords: () => [...toolResults],
+          },
           preflight: () => currentAppGuard.allowed
             ? { allowed: true, arguments: executionArguments }
             : {
@@ -3523,6 +3667,19 @@ async function processVoiceInput(
           name: tc.name,
         });
 
+        if (isVerifiedIndustryWorkflowCompletionRecord(executionRecord)) {
+          forceVerifiedIndustryFinalResponse = true;
+          messages.push({
+            role: 'system',
+            content: [
+              'The industry workflow now has a verified server receipt.',
+              'Answer now only from the verified receipts and do not call another tool.',
+              'State deliverable paths, source constraints, missing fields, risks, and the next review step.',
+            ].join('\n'),
+          });
+          if (iter + 1 >= voiceLoopLimit) voiceLoopLimit += 1;
+        }
+
         // A confirmation denial is a hard task boundary. Do not let the model
         // re-plan, replace the pending action, or run later calls from the same
         // batch before the user has confirmed the exact stored arguments.
@@ -3534,6 +3691,19 @@ async function processVoiceInput(
     } // end if (!usedOrchestrator)
 
     if (!isCurrentTurn()) return;
+
+    if (isDesignProjectStatusRequest(actionIntentText)) {
+      const verifiedStatusRecord = [...toolResults].reverse().find(record => (
+        record.name === 'interior_design_project_status'
+        && !record.error
+        && record.terminalVerification?.status === 'verified'
+      ));
+      const deterministicStatus = formatVerifiedDesignProjectStatus(
+        verifiedStatusRecord,
+        actionIntentText,
+      );
+      if (deterministicStatus) responseText = deterministicStatus;
+    }
 
     if (pendingConfirmationCreatedThisTurn) {
       responseText = CN_TASK_EXECUTION_MESSAGES.waitingConfirmation(

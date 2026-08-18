@@ -109,6 +109,7 @@ describe('chat and voice tool-call stability', () => {
   });
 
   it('keeps voice tool execution visible and aligned with chat permission behavior', () => {
+    const socketChat = readFileSync(path.join(process.cwd(), 'server/socket/chat.ts'), 'utf8');
     const voice = readFileSync(path.join(process.cwd(), 'server/socket/voice.ts'), 'utf8');
     const restChat = readFileSync(path.join(process.cwd(), 'server/routes/chat_routes.ts'), 'utf8');
 
@@ -128,6 +129,17 @@ describe('chat and voice tool-call stability', () => {
     expect(voice).toContain('startIndustryWorkflow({');
     expect(voice).toContain('getIndustryWorkflowPrerequisiteStatus');
     expect(voice).toContain('voice_industry_prerequisite_guard');
+    expect(socketChat).toContain('getIndustryWorkflowPrerequisiteStatus');
+    expect(socketChat).toContain('chat_industry_prerequisite_guard');
+    expect(socketChat).toContain('chat_design_project_status');
+    expect(socketChat).toContain('recordIndustryWorkflowExecution');
+    expect(socketChat).toContain("setConversationActionExecutionStatus(conversationId, uid, 'blocked'");
+    const chatPrerequisiteStart = socketChat.indexOf('if (chatIndustryWorkflowTask && chatIndustryPrerequisite)');
+    const chatPrerequisiteEnd = socketChat.indexOf('effectiveSystemPrompt +=', chatPrerequisiteStart);
+    const chatPrerequisiteGuard = socketChat.slice(chatPrerequisiteStart, chatPrerequisiteEnd);
+    expect(chatPrerequisiteGuard).toContain('requestId, deferActionPreparation: true');
+    expect(voice).toContain("conversationTurn.conversation.id,\n        session.userId,\n        'blocked'");
+    expect(voice).toContain('voice_design_project_status');
     expect(voice).toContain('bindIndustryWorkflowToolPolicy');
   });
 

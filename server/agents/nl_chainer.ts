@@ -58,7 +58,7 @@ interface ChainerLLMConfig {
   source?: string;
   desktopRelay?: (tool: string, args: Record<string, any>) => Promise<string>;
   context?: ToolContext;
-  onTool?: (record: ToolExecutionRecord) => void;
+  onTool?: (record: Omit<ToolExecutionRecord, 'result'> & { result?: string }) => void;
 }
 
 export function filterChainerToolNamesByPolicy(
@@ -552,6 +552,20 @@ function buildSimpleSummary(results: Array<{ step: number; tool: string; output:
   return summary;
 }
 
+export function deterministicChainerReceiptResponse(
+  toolRecords: ToolExecutionRecord[],
+): string | null {
+  if (toolRecords.length !== 1) return null;
+  const record = toolRecords[0];
+  if (
+    record.name !== 'interior_design_project_status'
+    || record.error
+    || record.terminalVerification?.status !== 'verified'
+    || !String(record.result || '').trim()
+  ) return null;
+  return record.result;
+}
+
 // ── Main entry point ──
 
 export async function runNLChainer(
@@ -661,7 +675,7 @@ If no suitable alternative exists, output: { "toolName": "" }`;
       throw new Error(`Tool "${name}" is outside the inherited execution policy for this task.`);
     }
     const id = `chain_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    config.onTool?.({ id, name, arguments: args, result: '' });
+    config.onTool?.({ id, name, arguments: args });
     const record = await executeToolCall({
       registry: toolRegistry,
       id,
@@ -680,12 +694,16 @@ If no suitable alternative exists, output: { "toolName": "" }`;
 
   const stepResults = await executePlan(plan, executeTool, config.context, onStep, replanFn);
 
-  // Phase 3: Synthesize
-  const finalResponse = await synthesizeResponse(
-    userTask, plan, stepResults,
-    config.provider, config.model, config.userId,
-    llmGetters,
-  );
+  // Phase 3: Synthesize. A one-step durable design-status lookup is formatted
+  // deterministically by the shared final-response layer, so a second LLM call
+  // adds latency and can hold the chat queue open even though the read receipt
+  // already completed. Return the verified payload directly for that route.
+  const finalResponse = deterministicChainerReceiptResponse(toolRecords)
+    || await synthesizeResponse(
+      userTask, plan, stepResults,
+      config.provider, config.model, config.userId,
+      llmGetters,
+    );
 
   return { plan, stepResults, finalResponse, toolRecords };
 }

@@ -17,9 +17,27 @@ import {
   type OperationMode,
 } from "../cognition/operation_modes";
 import { getStoredOperationMode, saveStoredOperationMode } from "../cognition/operation_mode_store";
+import { isDesignProjectStatusRequest } from "../design/status_intent";
+import { formatVerifiedDesignProjectStatus } from "../design/status_response";
 import { buildInteractionModeOverlay } from "../cognition/turn_flow";
 import { buildLumiCapabilitySelection } from "../cognition/capability_selection";
 import { buildLumiExecutionPipeline } from "../cognition/execution_pipeline";
+import { isCurrentIndustryGuidanceRequest } from "../industry/user_guidance";
+import { getIndustryWorkflowContract } from "../industry/workflow_contracts";
+import {
+  getCurrentIndustryCapabilityProfile,
+  isCurrentIndustryMultiWorkspaceLedgerStatusRequest,
+  isDesignProjectCreationRequest,
+  isCurrentIndustryWorkflowExecutionRequest,
+  matchCurrentIndustryWorkflow,
+} from "../regions/packs/cn/industry_capability_profile";
+import {
+  getIndustryWorkflowPrerequisiteStatus,
+  recordIndustryWorkflowExecution,
+  startIndustryWorkflow,
+} from "../industry/workflow_service";
+import { formatIndustryWorkflowPrerequisiteBlocker } from '../industry/user_facing';
+import { bindIndustryWorkflowToolPolicy } from "../industry/execution_policy";
 import { shouldAllowExplicitLocalFileWrite } from "../cognition/local_write_intent";
 import { shouldRunLegacyDirectExecution } from "../cognition/legacy_route_policy";
 import { bindCapabilityExecutionPlanTask } from "../cognition/capability_execution_plan";
@@ -101,6 +119,7 @@ import { hasExplicitTeamExecutionRequest, isUserCorrectionOrExplanationQuestion 
 import { summarizeToolRecordForPersistence } from "../cognition/tool_record_status";
 import {
   buildDeterministicClientNavigationCommand,
+  buildDeterministicDesignProjectCreateCommand,
   buildQuickCommandToolPolicy,
   matchQuickCommand,
 } from "../cognition/quick_commands";
@@ -1032,6 +1051,13 @@ export function registerChatHandler(
       if (!recordChatExecutionEvent(executionScope, requestId, event, normalizedPayload)) return;
       io.to(executionRoom).emit(event, normalizedPayload);
     };
+    const emitConversationUpdated = (payload: Record<string, any>) => {
+      io.to(executionRoom).emit('chat:conversation_updated', {
+        ...payload,
+        requestId,
+        originSocketId: socket.id,
+      });
+    };
     console.log('[ChatHandler] domain:', resolvedDomain, 'orgId:', resolvedOrgId);
 
     // Request ids are idempotency keys. Socket.IO may deliver a buffered emit
@@ -1095,6 +1121,7 @@ export function registerChatHandler(
         visibleUserText,
         activeConversationForStatus?.actionContinuationState,
       ) === 'status'
+      && !isDesignProjectStatusRequest(visibleUserText)
     ) {
       const activeConversation = activeConversationForStatus || getActiveConversation(
         uid,
@@ -1302,7 +1329,7 @@ export function registerChatHandler(
           emitAgent("agent:response", { text: responseText, agentName: "Lumi", finalized: true, blocked: false, reason: '' });
           addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, domain: resolvedDomain, orgId: resolvedOrgId, cognitiveIntent: 'task_cancel' });
           addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'assistant', content: responseText, domain: resolvedDomain, orgId: resolvedOrgId, cognitiveIntent: 'task_cancel' });
-          socket.emit('chat:conversation_updated', { conversationId, agentId: conversationAgentId, source: 'chat', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
+          emitConversationUpdated({ conversationId, agentId: conversationAgentId, source: 'chat', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
           emitAgent("agent:status", { status: "idle" });
           releaseChatSession();
           return;
@@ -1315,13 +1342,20 @@ export function registerChatHandler(
           .map(record => ({ role: record.role, message: record.message, response: record.response }));
         chatContextBridge = buildClientSurfaceContinuationBridge(visibleUserText, dbHistoryItems);
       }
-      actionContinuationBridge = buildRecentActionContinuationBridge(
-        visibleUserText,
-        conversationTurn.rolledOver
-          ? persistedConversationHistory
-          : [...historyItems, ...persistedConversationHistory],
-        conversation?.actionContinuationState,
-      );
+      const explicitIndustryWorkflowRequest = Boolean(matchCurrentIndustryWorkflow(visibleUserText))
+        && isCurrentIndustryWorkflowExecutionRequest(visibleUserText);
+      const explicitDesignProjectStatusRequest = isDesignProjectStatusRequest(visibleUserText);
+      actionContinuationBridge = isCurrentIndustryGuidanceRequest(visibleUserText)
+        || explicitIndustryWorkflowRequest
+        || explicitDesignProjectStatusRequest
+        ? ''
+        : buildRecentActionContinuationBridge(
+            visibleUserText,
+            conversationTurn.rolledOver
+              ? persistedConversationHistory
+              : [...historyItems, ...persistedConversationHistory],
+            conversation?.actionContinuationState,
+          );
       const continuationOpenTarget = resolveRecentActionOpenTarget(
         visibleUserText,
         conversation?.actionContinuationState,
@@ -1418,7 +1452,13 @@ export function registerChatHandler(
         },
         registry: toolRegistry,
         personalityToolPolicy: personality.toolPolicy,
-        actionTaskState: conversation?.actionContinuationState,
+        // Industry workflows have their own durable task/receipt ledger. A
+        // stale generic conversation snapshot (for example one captured while
+        // an older shadow gate blocked image generation) must not shrink the
+        // current contract's explicit tool allowlist on retry.
+        actionTaskState: explicitIndustryWorkflowRequest || explicitDesignProjectStatusRequest
+          ? undefined
+          : conversation?.actionContinuationState,
         isSanctuary,
         traceText: currentTurnDecisionText,
         source: eventSource,
@@ -1579,13 +1619,18 @@ export function registerChatHandler(
         visibleUserText,
         conversation?.actionContinuationState,
       );
-      if (conversationId && actionFollowupIntent === 'status') {
+      const explicitMultiIndustryLedgerStatus = isCurrentIndustryMultiWorkspaceLedgerStatusRequest(visibleUserText);
+      if (
+        conversationId
+        && (actionFollowupIntent === 'status' || explicitMultiIndustryLedgerStatus)
+        && !isDesignProjectStatusRequest(visibleUserText)
+      ) {
         const statusText = getConversationActionStatus(conversationId, uid, visibleUserText, conversation?.actionContinuationState);
         emitAgent("agent:status", { status: "responding", agentName: personality.name });
         emitAgent("agent:response", { text: statusText, agentName: personality.name, finalized: true, blocked: false, reason: '' });
         addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId });
         addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'assistant', content: statusText, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, cognitiveIntent: 'task_status' });
-        socket.emit('chat:conversation_updated', { conversationId, agentId: conversationAgentId, source: 'chat', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
+        emitConversationUpdated({ conversationId, agentId: conversationAgentId, source: 'chat', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
         emitAgent("agent:status", { status: "idle" });
         releaseChatSession();
         return;
@@ -1598,9 +1643,9 @@ export function registerChatHandler(
         emitAgent("agent:status", { status: "responding", agentName: personality.name });
         emitAgent("agent:response", { text: recentFailureExplanation, agentName: personality.name, finalized: true, blocked: false, reason: '' });
         if (conversationId) {
-          addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId });
+          addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, requestId, deferActionPreparation: true });
           addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'assistant', content: recentFailureExplanation, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId });
-          socket.emit('chat:conversation_updated', { conversationId, agentId: conversationAgentId, source: 'chat', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
+          emitConversationUpdated({ conversationId, agentId: conversationAgentId, source: 'chat', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
         }
         persistChatLearning(recentFailureExplanation, {
           sourceInteractionId: `${interactionId}_recent_failure_explanation`,
@@ -1724,7 +1769,7 @@ export function registerChatHandler(
           if (conversationId) {
             addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, mode: directlyAppliedMode, domain: resolvedDomain, orgId: resolvedOrgId });
             addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'assistant', content: responseText, personality: personality.id, mode: directlyAppliedMode, cognitiveIntent: finalizedMode.blocked ? 'work_product_guard' : undefined, domain: resolvedDomain, orgId: resolvedOrgId });
-            socket.emit('chat:conversation_updated', { conversationId, agentId: conversationAgentId, source: 'chat_mode', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
+            emitConversationUpdated({ conversationId, agentId: conversationAgentId, source: 'chat_mode', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
           }
           if (!finalizedMode.blocked) {
             persistChatLearning(responseText, {
@@ -1852,7 +1897,7 @@ export function registerChatHandler(
         });
 
         if (conversationId) {
-          addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId });
+          addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, requestId, deferActionPreparation: true });
           for (const tc of workflowToolCalls) {
             const tcSummary = summarizeToolRecordForPersistence(tc);
             addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'tool', content: tcSummary, domain: resolvedDomain, orgId: resolvedOrgId });
@@ -1891,7 +1936,7 @@ export function registerChatHandler(
           reason: finalizedWorkflow.reason || '',
         });
         if (conversationId) {
-          socket.emit('chat:conversation_updated', { conversationId, agentId: conversationAgentId, source: specialWorkflow.source, rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
+          emitConversationUpdated({ conversationId, agentId: conversationAgentId, source: specialWorkflow.source, rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
         }
         if (!finalizedWorkflow.blocked) {
           persistChatLearning(workflowResponseText, {
@@ -1928,7 +1973,7 @@ export function registerChatHandler(
       });
       const desktopExecutionTracker = createDesktopExecutionTracker(desktopExecutionPolicy.executionPlan);
       const toolRoute = executionDecision.toolRoute;
-      const routedToolPolicy = executionDecision.toolPolicy;
+      let routedToolPolicy = executionDecision.toolPolicy;
       const actionTaskExecution = turnFlow.conceptualCapabilityQuestion
         ? { state: null, kind: 'conversation' as const }
         : conversationId
@@ -1941,6 +1986,31 @@ export function registerChatHandler(
             forceResume: Boolean(pendingConfirmation || actionFollowupIntent === 'execute'),
           })
         : { state: null, kind: 'conversation' as const };
+      let chatIndustryWorkflowTask: ReturnType<typeof startIndustryWorkflow>['task'] | null = null;
+      let chatIndustryPrerequisite: ReturnType<typeof getIndustryWorkflowPrerequisiteStatus> = null;
+      const shouldCreateDesignProject = turnFlow.industryWorkflowEntryId === 'project'
+        && isDesignProjectCreationRequest(visibleUserText);
+      if (turnFlow.industryWorkflowEntryId && !shouldCreateDesignProject) {
+        const startedIndustryWorkflow = startIndustryWorkflow({
+          userId: uid,
+          domain: resolvedDomain === 'work' ? 'work' : 'personal',
+          orgId: resolvedDomain === 'work' ? resolvedOrgId : '',
+          entryId: turnFlow.industryWorkflowEntryId,
+          sourceInput: visibleUserText,
+          source: 'chat',
+          context: { source: 'chat', autoBound: true },
+          conversationId,
+          conversationTaskId: actionTaskExecution.state?.taskId,
+          requestId,
+        });
+        chatIndustryWorkflowTask = startedIndustryWorkflow.task;
+        chatIndustryPrerequisite = getIndustryWorkflowPrerequisiteStatus(chatIndustryWorkflowTask);
+        routedToolPolicy = bindIndustryWorkflowToolPolicy(
+          routedToolPolicy,
+          chatIndustryWorkflowTask,
+          toolRegistry.getToolDeclarations().map(declaration => declaration.function.name),
+        );
+      }
       if (conversationId && actionTaskExecution.state?.taskId) {
         executionPipeline.executionPlan = bindCapabilityExecutionPlanTask(
           executionPipeline.executionPlan,
@@ -1977,6 +2047,126 @@ export function registerChatHandler(
         setConversationActionExecutionStatus(conversationId, uid, 'executing', { requestId });
       }
       const exposeAgentWork = turnFlow.exposeAgentWork;
+      if (explicitDesignProjectStatusRequest) {
+        const statusRecord = await executeToolCall({
+          registry: toolRegistry,
+          name: 'interior_design_project_status',
+          arguments: {},
+          context: {
+            userId: uid,
+            turnId: requestId,
+            requestId,
+            conversationId,
+            domain: resolvedDomain,
+            orgId: resolvedOrgId,
+            desktopRelay,
+            llmGetters,
+            source: 'chat_design_project_status',
+            supervisedExternalCommits: true,
+            allowLocalFileWrites: false,
+            localWriteIntentReason: '',
+            actionIntent: visibleUserText,
+            routedTaskText: visibleUserText,
+            toolPolicy: routedToolPolicy,
+          },
+        });
+        const responseText = formatVerifiedDesignProjectStatus(statusRecord, visibleUserText)
+          || '\u5f53\u524d\u9879\u76ee\u8d26\u672c\u6ca1\u6709\u8fd4\u56de\u53ef\u9a8c\u8bc1\u7684\u72b6\u6001\u56de\u6267\uff0c\u672c\u6b21\u6ca1\u6709\u6267\u884c\u65b0\u5de5\u4f5c\u3002';
+        if (conversationId) {
+          addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, requestId, skipActionContinuation: true });
+          addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'tool', content: summarizeToolRecordForPersistence(statusRecord), domain: resolvedDomain, orgId: resolvedOrgId, requestId, skipActionContinuation: true });
+          addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'assistant', content: responseText, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, toolCalls: [statusRecord], cognitiveIntent: 'design_project_status', requestId, skipActionContinuation: true });
+        }
+        emitAgent('agent:status', { status: 'responding', agentName: personality.name });
+        emitAgent('agent:response', {
+          text: responseText,
+          agentName: personality.name,
+          source: 'chat_design_project_status',
+          finalized: true,
+          blocked: false,
+          reason: '',
+        });
+        if (conversationId) {
+          emitConversationUpdated({ conversationId, agentId: conversationAgentId, source: 'chat_design_project_status', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
+        }
+        emitAgent('agent:status', { status: 'idle', agentName: personality.name });
+        releaseChatSession();
+        return;
+      }
+      if (chatIndustryWorkflowTask && chatIndustryPrerequisite) {
+        const statusRecord = await executeToolCall({
+          registry: toolRegistry,
+          name: 'interior_design_project_status',
+          arguments: { projectId: chatIndustryPrerequisite.projectId },
+          context: {
+            userId: uid,
+            taskId: actionTaskExecution.state?.taskId,
+            turnId: requestId,
+            requestId,
+            conversationId,
+            domain: resolvedDomain,
+            orgId: resolvedOrgId,
+            desktopRelay,
+            llmGetters,
+            source: 'chat_industry_prerequisite_guard',
+            supervisedExternalCommits: true,
+            allowLocalFileWrites,
+            localWriteIntentReason,
+            actionIntent: visibleUserText,
+            routedTaskText: visibleUserText,
+            toolPolicy: routedToolPolicy,
+            industryWorkflowTaskId: chatIndustryWorkflowTask.id,
+            industryWorkflowEntryId: turnFlow.industryWorkflowEntryId,
+            industryWorkflowProductLine: String(chatIndustryWorkflowTask.metadata?.industryWorkflow?.productLine || ''),
+          },
+        });
+        const responseText = formatIndustryWorkflowPrerequisiteBlocker(chatIndustryPrerequisite);
+        const recorded = recordIndustryWorkflowExecution({
+          userId: uid,
+          domain: resolvedDomain === 'work' ? 'work' : 'personal',
+          orgId: resolvedDomain === 'work' ? resolvedOrgId : '',
+          taskId: chatIndustryWorkflowTask.id,
+          resultText: responseText,
+          toolRecords: [statusRecord],
+          source: 'chat_prerequisite_guard',
+        });
+        persistChatTakeoverExecution(responseText, {
+          toolRecords: [statusRecord],
+          source: 'chat_industry_prerequisite_guard',
+          sourceInteractionId: `${interactionId}_industry_prerequisite`,
+          capabilitySelection,
+          finalizationBlocked: true,
+          assistantTextTrusted: true,
+          finalizationReason: recorded.verification.summary,
+        });
+        if (conversationId && actionTaskExecution.state?.taskId) {
+          setConversationActionExecutionStatus(conversationId, uid, 'blocked', {
+            blocker: recorded.verification.summary || chatIndustryPrerequisite.blocker,
+            assistantState: responseText,
+            requestId,
+          });
+        }
+        if (conversationId) {
+          addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, requestId, deferActionPreparation: true });
+          addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'tool', content: summarizeToolRecordForPersistence(statusRecord), domain: resolvedDomain, orgId: resolvedOrgId });
+          addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'assistant', content: responseText, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, toolCalls: [statusRecord], cognitiveIntent: 'industry_prerequisite_blocked', requestId });
+        }
+        emitAgent('agent:status', { status: 'responding', agentName: personality.name });
+        emitAgent('agent:response', {
+          text: responseText,
+          agentName: personality.name,
+          source: 'chat_industry_prerequisite_guard',
+          finalized: true,
+          blocked: true,
+          reason: recorded.verification.summary,
+        });
+        if (conversationId) {
+          emitConversationUpdated({ conversationId, agentId: conversationAgentId, source: 'chat_industry_prerequisite_guard', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
+        }
+        emitAgent('agent:status', { status: 'idle', agentName: personality.name });
+        releaseChatSession();
+        return;
+      }
       effectiveSystemPrompt += '\n\n' + formatClientSelfPrompt(uid, { domain: resolvedDomain, orgId: resolvedOrgId });
       console.log('[ChatHandler] tool gate:', executionDecision.allowToolUse ? 'enabled' : 'chat-only', 'operationMode:', operationMode, 'effective:', effectiveOperationMode, 'surface:', turnFlow.surface, 'clientActionOnly:', clientActionOnlyTurn, 'selfRepair:', selfRepairTurn, 'capabilityLane:', capabilitySelection.lane, 'trace:', intentTrace.summary, 'route:', toolRoute ? `${toolRoute.toolNames.length}/${toolRoute.totalAvailable} ${toolRoute.categories.join(',') || 'fallback'}` : 'none');
       socket.emit('agent:intent_trace', intentTrace);
@@ -2223,10 +2413,10 @@ export function registerChatHandler(
           reason: finalized.reason || '',
         });
         if (conversationId) {
-          addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId });
+          addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, requestId, deferActionPreparation: true });
           addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'assistant', content: finalized.text, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, toolCalls: confirmationRecords, cognitiveIntent: finalized.blocked ? 'work_product_guard' : 'confirmation' });
           scheduleChatSummary(conversationId);
-          socket.emit('chat:conversation_updated', { conversationId, agentId: conversationAgentId, source: 'chat', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
+          emitConversationUpdated({ conversationId, agentId: conversationAgentId, source: 'chat', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
         }
         persistChatTakeoverExecution(finalized.text, {
           toolRecords: confirmationRecords,
@@ -2365,7 +2555,7 @@ export function registerChatHandler(
           reason: finalizedWorkflowQuick.reason || '',
         });
         if (conversationId) {
-          socket.emit('chat:conversation_updated', {
+          emitConversationUpdated({
             conversationId,
             agentId: conversationAgentId,
             source: 'workflow',
@@ -2402,9 +2592,12 @@ export function registerChatHandler(
         const deterministicClientNavigation = clientActionOnlyTurn
           ? buildDeterministicClientNavigationCommand(executionPipeline.normalizedIntent)
           : null;
+        const deterministicDesignProjectCreate = turnFlow.industryWorkflowEntryId === 'project'
+          ? buildDeterministicDesignProjectCreateCommand(visibleUserText)
+          : null;
         const quickResult = capabilityMetaResponse
           ? { matched: true, responseText: capabilityMetaResponse }
-          : deterministicClientNavigation || (shouldRunLegacyDirectExecution() ? await matchQuickCommand(
+          : deterministicDesignProjectCreate || deterministicClientNavigation || (shouldRunLegacyDirectExecution() ? await matchQuickCommand(
               continuationOpenTarget ? buildInternalOpenCommand(visibleUserText, continuationOpenTarget) : text,
               uid,
               {
@@ -2437,6 +2630,10 @@ export function registerChatHandler(
               arguments: quickResult.toolCall.arguments,
               context: {
                 userId: uid,
+                taskId: actionTaskExecution.state?.taskId || requestId,
+                conversationId: conversation.id,
+                turnId: requestId,
+                requestId,
                 domain: resolvedDomain,
                 orgId: resolvedOrgId,
                 desktopRelay,
@@ -2504,13 +2701,13 @@ export function registerChatHandler(
             reason: quickFinalized.reason || '',
           });
           if (conversationId) {
-            addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId });
+            addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, requestId, deferActionPreparation: true });
             if (quickResult.toolCall) {
               addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'tool', content: `[Tool: ${quickResult.toolCall.name}] Called`, domain: resolvedDomain, orgId: resolvedOrgId });
             }
-            addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'assistant', content: quickResponseText, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, toolCalls: quickToolRecords.length ? quickToolRecords : undefined, cognitiveIntent: quickFinalized.blocked ? 'work_product_guard' : undefined });
+            addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'assistant', content: quickResponseText, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, toolCalls: quickToolRecords.length ? quickToolRecords : undefined, cognitiveIntent: quickFinalized.blocked ? 'work_product_guard' : undefined, requestId });
             scheduleChatSummary(conversationId);
-            socket.emit('chat:conversation_updated', { conversationId, agentId: conversationAgentId, source: 'chat', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
+            emitConversationUpdated({ conversationId, agentId: conversationAgentId, source: 'chat', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
           }
           if (!quickFinalized.blocked) {
             persistChatLearning(quickResponseText, {
@@ -2643,6 +2840,8 @@ export function registerChatHandler(
         executionDecision.allowToolUse &&
         !clientActionOnlyTurn &&
         !selfRepairTurn &&
+        !turnFlow.industryWorkflowEntryId &&
+        !explicitDesignProjectStatusRequest &&
         !isSanctuary &&
         shouldRunVisibleActionPreflight(visibleUserText, attachments);
 
@@ -3113,7 +3312,7 @@ export function registerChatHandler(
                     toolCalls: toolCalls?.length ? toolCalls : undefined,
                     cognitiveIntent: guarded ? 'work_product_guard' : undefined,
                   });
-                  socket.emit('chat:conversation_updated', { conversationId, agentId: conversationAgentId, source: 'background_delegation', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
+                  emitConversationUpdated({ conversationId, agentId: conversationAgentId, source: 'background_delegation', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
                 }
                 if (deliverToConversation) {
                   const db = readDB();
@@ -3582,7 +3781,7 @@ export function registerChatHandler(
       }
 
       // Path B2: NL Task Chainer — for office workflows that chain tools (search→read→create etc.)
-      if (!responseText && !actionPreflightContext && executionDecision.allowToolUse && !clientActionOnlyTurn && !selfRepairTurn && shouldChainTask(executionTaskText)) {
+      if (!responseText && !actionPreflightContext && executionDecision.allowToolUse && !clientActionOnlyTurn && !selfRepairTurn && !turnFlow.industryWorkflowEntryId && shouldChainTask(executionTaskText)) {
         // Pre-flight: auto-install any matching uninstalled/outdated skills
         await autoInstallForTask(
           executionTaskText,
@@ -3626,7 +3825,9 @@ export function registerChatHandler(
                 },
               },
               onTool: (record) => {
-                allToolRecords.push(record);
+                if (record.result !== undefined || record.error !== undefined) {
+                  allToolRecords.push(record as ToolExecutionRecord);
+                }
                 const payload: Record<string, any> = {
                   correlationId: record.id,
                   toolCallId: record.id,
@@ -3634,7 +3835,7 @@ export function registerChatHandler(
                   arguments: record.arguments,
                   args: record.arguments,
                 };
-                if (record.result !== '') payload.result = formatToolResultForUi(record.result);
+                if (record.result !== undefined) payload.result = formatToolResultForUi(record.result);
                 if (record.error !== undefined) payload.error = record.error;
                 emitAgent("agent:tool_call", payload);
                 emitAgent("agent:tool", payload);
@@ -3734,13 +3935,29 @@ export function registerChatHandler(
             });
           } else {
             const maxIterations = routedToolPolicy?.maxIterations || personality.toolPolicy.maxIterations || 25;
+            const currentIndustryProfile = getCurrentIndustryCapabilityProfile();
+            const currentIndustryContract = turnFlow.industryWorkflowEntryId
+              ? getIndustryWorkflowContract(
+                  currentIndustryProfile?.productLine,
+                  turnFlow.industryWorkflowEntryId,
+                )
+              : null;
 
           // Collect tool calls for persistence
 
           const result = await runWithTools(
             messages,
             toolRegistry,
-            { provider: activeProvider, model: activeModel, userId: uid, domain: resolvedDomain, orgId: resolvedOrgId, ...reasoningRoutePolicy },
+            {
+              provider: activeProvider,
+              model: activeModel,
+              userId: uid,
+              domain: resolvedDomain,
+              orgId: resolvedOrgId,
+              signal: abortController.signal,
+              ...(turnFlow.industryWorkflowEntryId ? { requestTimeoutMs: 90_000 } : {}),
+              ...reasoningRoutePolicy,
+            },
             isSanctuary ? undefined : (record) => {
               allToolRecords.push(record);
               if (isDirectDesktopTool(record.name)) return;
@@ -3757,7 +3974,7 @@ export function registerChatHandler(
             },
             maxIterations,
             llmGetters.getDeepSeek, llmGetters.getGemini, llmGetters.getOpenAI, llmGetters.getAnthropic, llmGetters.getQwen,
-            onChunk,
+            turnFlow.industryWorkflowEntryId ? undefined : onChunk,
             {
               userId: uid,
               taskId: actionTaskExecution.state?.taskId || requestId,
@@ -3789,6 +4006,17 @@ export function registerChatHandler(
               ...(routedToolPolicy ? { toolPolicy: routedToolPolicy } : {}),
               actionIntent: visibleUserText,
               routedTaskText: turnFlow.routeText,
+              ...(turnFlow.industryWorkflowEntryId ? {
+                industryWorkflowSourceInput: visibleUserText,
+                ...(chatIndustryWorkflowTask ? { industryWorkflowTaskId: chatIndustryWorkflowTask.id } : {}),
+                industryWorkflowEntryId: turnFlow.industryWorkflowEntryId,
+                industryWorkflowProductLine: currentIndustryProfile?.productLine,
+                industryWorkflowRequiredToolReceipts: Array.isArray(
+                  chatIndustryWorkflowTask?.metadata?.industryWorkflow?.contract?.requiredToolReceipts
+                )
+                  ? chatIndustryWorkflowTask.metadata.industryWorkflow.contract.requiredToolReceipts.map(String)
+                  : currentIndustryContract?.requiredToolReceipts || [],
+              } : {}),
               desktopExecutionTracker,
               ...(executionDecision.allowToolUse || clientActionOnlyTurn || selfRepairTurn ? { requestConfirmation: requestToolConfirmation } : {}),
             },
@@ -3826,6 +4054,18 @@ export function registerChatHandler(
         }
       }
 
+      if (explicitDesignProjectStatusRequest) {
+        const verifiedStatusRecord = [...allToolRecords].reverse().find(record => (
+          record.name === 'interior_design_project_status'
+          && !record.error
+          && record.terminalVerification?.status === 'verified'
+        ));
+        const deterministicStatus = formatVerifiedDesignProjectStatus(
+          verifiedStatusRecord,
+          visibleUserText,
+        );
+        if (deterministicStatus) responseText = deterministicStatus;
+      }
       chatTextGate.finish();
       const finalizedDesktopRecords = withDesktopExecutionReceipt(allToolRecords, desktopExecutionTracker);
       if (finalizedDesktopRecords.length > allToolRecords.length) {
@@ -3857,7 +4097,7 @@ export function registerChatHandler(
       // Save to conversation via conversation manager (reuse conversationId from setup)
 
       if (conversationId) {
-        addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId });
+        addMessage({ userId: uid, agentId: conversationAgentId, conversationId, role: 'user', content: storedUserContent, personality: personality.id, domain: resolvedDomain, orgId: resolvedOrgId, requestId, deferActionPreparation: true });
         // Persist tool calls interleaved before the assistant response
         for (const tc of allToolRecords) {
           if (!tc.error && !String(tc.result || '').trim()) continue;
@@ -3876,6 +4116,7 @@ export function registerChatHandler(
           toolCalls: allToolRecords.length ? allToolRecords : undefined,
           cognitiveIntent: finalResponse.blocked ? 'work_product_guard' : cognition.intent.category,
           llmWasCalled,
+          requestId,
         });
         // (conversation_updated NOW emitted AFTER agent:response — see below)
 
@@ -3902,7 +4143,7 @@ export function registerChatHandler(
       });
       // Re-emit conversation_updated AFTER response so the client syncs from API with complete data
       if (conversationId) {
-        socket.emit('chat:conversation_updated', { conversationId, agentId: conversationAgentId, source: 'chat', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
+        emitConversationUpdated({ conversationId, agentId: conversationAgentId, source: 'chat', rolledOver: conversationTurn.rolledOver, previousConversationId: conversationTurn.previousConversationId });
       }
       emitAgent("agent:status", { status: "idle" });
 

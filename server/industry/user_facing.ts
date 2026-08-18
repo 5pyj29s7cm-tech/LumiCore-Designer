@@ -57,8 +57,8 @@ export function formatIndustryWorkflowPrerequisiteBlocker(input: {
   const missing = input.missing.map(item => DESIGN_STAGE_LABELS[item] || item).join('、');
   return [
     `我已核对「${projectName}」的持久项目账本。`,
-    `当前不能进入${target}：上游的${missing}尚未通过真实回执。`,
+    `当前不能进入${target}：上游阶段“${missing}”尚未通过真实回执。`,
     '本轮没有生成或覆盖下游文件，也没有执行任何对外发送。',
-    `请先完成${missing}；通过核验后，Lumi 会继续沿用同一项目和已有成果，不需要重新建项目或重新猜测资料。`,
+    `请先完成并核验：${missing}。通过后，Lumi 会继续沿用同一项目和已有成果，不需要重新建项目或重新猜测资料。`,
   ].join('\n');
 }

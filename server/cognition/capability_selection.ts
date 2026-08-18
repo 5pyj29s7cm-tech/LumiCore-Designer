@@ -23,6 +23,7 @@ import {
   rankReadOnlyToolPatterns,
   type RankedReadOnlyToolPattern,
 } from '../context/read_only_tool_learning';
+import { getCurrentIndustryCapabilityProfile } from '../regions/packs/cn/industry_capability_profile';
 
 export type LumiCapabilityLane =
   | 'conversation'
@@ -213,14 +214,6 @@ function selectLane(input: LumiCapabilitySelectionInput): Pick<LumiCapabilitySel
     };
   }
 
-  if (flow.executionGovernance.capabilityLearningIntent !== 'none') {
-    return {
-      lane: 'capability_learning',
-      primary: flow.executionGovernance.capabilityLearningIntent,
-      reasons: [...reasons, flow.executionGovernance.capabilityLearningReason],
-    };
-  }
-
   if (input.dispatch.boundary === 'task_center') {
     return {
       lane: 'task_center',
@@ -256,6 +249,37 @@ function selectLane(input: LumiCapabilitySelectionInput): Pick<LumiCapabilitySel
       lane: 'internal_memory',
       primary: 'sleep/dream memory consolidation',
       reasons: [...reasons, 'sleep, dream, or memory consolidation tools matched'],
+    };
+  }
+
+  if (flow.industryWorkflowEntryId && routeHas(input, 'industry_workflow')) {
+    const productLine = getCurrentIndustryCapabilityProfile()?.productLine;
+    if (productLine === 'design') {
+      return {
+        lane: 'design_cad',
+        primary: `design industry workflow (${flow.industryWorkflowEntryId})`,
+        reasons: [...reasons, 'the explicit design workflow outranks incidental negated desktop, repair, or legal substrings'],
+      };
+    }
+    if (productLine === 'legal') {
+      return {
+        lane: 'legal_casework',
+        primary: `legal industry workflow (${flow.industryWorkflowEntryId})`,
+        reasons: [...reasons, 'the explicit legal workflow owns this turn'],
+      };
+    }
+    return {
+      lane: 'artifact_work',
+      primary: `${productLine || 'industry'} workflow (${flow.industryWorkflowEntryId})`,
+      reasons: [...reasons, 'the explicit industry workflow outranks incidental tool-route categories'],
+    };
+  }
+
+  if (flow.executionGovernance.capabilityLearningIntent !== 'none') {
+    return {
+      lane: 'capability_learning',
+      primary: flow.executionGovernance.capabilityLearningIntent,
+      reasons: [...reasons, flow.executionGovernance.capabilityLearningReason],
     };
   }
 
