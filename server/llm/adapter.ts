@@ -1383,6 +1383,10 @@ async function runWithToolsInternal(
         context?.industryWorkflowRequiredToolReceipts,
         executionLog,
       );
+      const requiredIndustryReceiptsComplete = (
+        (context?.industryWorkflowRequiredToolReceipts?.length || 0) > 0
+        && !missingRequiredIndustryTool
+      );
       if (
         missingRequiredIndustryTool
         && !unknownRequiredIndustryOutcome
@@ -1465,13 +1469,15 @@ async function runWithToolsInternal(
         });
         continue;
       }
-      const missingVerification = buildMissingVerificationObligationPrompt(
-        primaryTask,
-        executionLog,
-        toolRegistry,
-        exposedToolNames,
-        context?.toolPolicy,
-      );
+      const missingVerification = requiredIndustryReceiptsComplete
+        ? ''
+        : buildMissingVerificationObligationPrompt(
+            primaryTask,
+            executionLog,
+            toolRegistry,
+            exposedToolNames,
+            context?.toolPolicy,
+          );
       if (
         missingVerification
         && verificationObligationReplans < MAX_VERIFICATION_OBLIGATION_REPLANS
@@ -1491,7 +1497,8 @@ async function runWithToolsInternal(
         continue;
       }
       if (
-        hasUnverifiedToolOutcome(executionLog)
+        !requiredIndustryReceiptsComplete
+        && hasUnverifiedToolOutcome(executionLog)
         && exposedToolNames.size > 0
         && recoveryReplans < MAX_TOOL_RECOVERY_REPLANS
         && iteration + 1 < effectiveMaxIterations
@@ -1852,16 +1859,19 @@ async function runWithToolsInternal(
       if (iteration + 1 >= loopLimit) loopLimit += 1;
     }
 
-    if (
-      !firstMissingVerifiedIndustryReceipt(context?.industryWorkflowRequiredToolReceipts, executionLog)
-      && (context?.industryWorkflowRequiredToolReceipts?.length || 0) > 0
-      && iteration + 1 >= loopLimit
-    ) {
+    const requiredIndustryReceiptsComplete = (
+      (context?.industryWorkflowRequiredToolReceipts?.length || 0) > 0
+      && !firstMissingVerifiedIndustryReceipt(context?.industryWorkflowRequiredToolReceipts, executionLog)
+    );
+    if (requiredIndustryReceiptsComplete && iteration + 1 >= loopLimit) {
       loopLimit += 1;
     }
 
     const readyWorkProduct = buildReadyWorkProductSummary(messages, executionLog);
-    if (readyWorkProduct) {
+    // Industry workflows reserve one final model turn after all required
+    // receipts exist so the user gets a contextual result, not a generic
+    // deterministic checkpoint that hides the actual deliverable summary.
+    if (readyWorkProduct && !requiredIndustryReceiptsComplete) {
       recordWorkflowIfToolsUsed(executionLog, messages, config);
       return {
         text: readyWorkProduct,

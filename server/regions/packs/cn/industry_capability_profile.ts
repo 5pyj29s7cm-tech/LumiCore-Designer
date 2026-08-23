@@ -237,8 +237,19 @@ export function isCurrentIndustryMultiWorkspaceLedgerStatusRequest(text: unknown
 
 export function isCurrentIndustryWorkflowExecutionRequest(text: unknown): boolean {
   const normalized = String(text || '').trim();
-  if (!matchCurrentIndustryWorkflow(normalized)) return false;
+  const workflowMatch = matchCurrentIndustryWorkflow(normalized);
+  if (!workflowMatch) return false;
   if (isCurrentIndustryMultiWorkspaceLedgerStatusRequest(normalized)) return false;
+
+  // A local source folder followed by visible AutoCAD work is a reusable CAD
+  // operation, not the Designer delivery workflow. Keep the industry overlay
+  // only when the user binds the request to a durable project or stage.
+  if (workflowMatch.profile.productLine === 'design' && workflowMatch.entry.entryId === 'cad') {
+    const hasLocalSource = /(?:\u684c\u9762|\u672c\u5730).{0,40}(?:\u6587\u4ef6\u5939|\u76ee\u5f55|\u56fe\u7247|\u56fe\u7eb8|\u8349\u56fe|\u6587\u4ef6)|(?:\u6587\u4ef6\u5939|\u76ee\u5f55).{0,40}(?:\u8bfb\u53d6|\u6574\u7406|\u91cc\u9762)/u.test(normalized);
+    const requestsVisibleAutoCad = /(?:auto\s*cad|\bcad\b).{0,40}(?:\u5b9e\u9645|\u53ef\u89c1|\u91cc\u9762).{0,16}(?:\u753b|\u7ed8\u5236)|(?:\u5b9e\u9645|\u53ef\u89c1).{0,24}(?:auto\s*cad|\bcad\b)/iu.test(normalized);
+    const hasDurableProjectContext = /(?:\u5f53\u524d|\u5df2\u6fc0\u6d3b|\u5df2\u6709|\u8fd9\u4e2a|\u8be5).{0,16}(?:\u8bbe\u8ba1)?\u9879\u76ee|\u9879\u76ee(?:\u7f16\u53f7|\u540d\u79f0|\u5f52\u5c5e|\u9636\u6bb5|\s*brief)|\u65b9\u6848\u9636\u6bb5|\u5f52\u6863|\u884c\u4e1a\u4efb\u52a1|\u5de5\u4f5c\u6d41/iu.test(normalized);
+    if (hasLocalSource && requestsVisibleAutoCad && !hasDurableProjectContext) return false;
+  }
   if (/(?:做完|完成|进度|状态|结果).{0,10}(?:吗|呢|如何|怎样|怎么|没有)|(?:是否|是不是).{0,20}(?:完成|做完)/u.test(normalized)) return false;
 
   // Negative constraints belong to their own clause. A request such as

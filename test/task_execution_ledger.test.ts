@@ -350,6 +350,10 @@ describe('durable conversation task execution ledger', () => {
 
   it('persists handler success without verification as partial instead of completed', () => {
     const record = {
+      taskId: 'task-correlation-42',
+      turnId: 'turn-correlation-42',
+      requestId: 'wechat_bot:message-correlation-42',
+      idempotencyKey: 'wechat_bot:message-correlation-42:client_action',
       name: 'custom_desktop_action',
       arguments: { target: 'Example' },
       result: JSON.stringify({ ok: true, action: 'requested' }),
@@ -381,6 +385,10 @@ describe('durable conversation task execution ledger', () => {
 
     expect(receipts[0].outcome).toBe('partial');
     expect(taskReceiptsToRecords(receipts)[0]).toMatchObject({
+      taskId: 'task-correlation-42',
+      turnId: 'turn-correlation-42',
+      requestId: 'wechat_bot:message-correlation-42',
+      idempotencyKey: 'wechat_bot:message-correlation-42:client_action',
       receipt: {
         status: 'observed',
         target: { id: 'window-42' },
@@ -410,6 +418,10 @@ describe('durable conversation task execution ledger', () => {
       updatedAt: new Date().toISOString(),
     });
     expect(reloaded?.receipts?.[0]).toMatchObject({
+      taskId: 'task-correlation-42',
+      turnId: 'turn-correlation-42',
+      requestId: 'wechat_bot:message-correlation-42',
+      idempotencyKey: 'wechat_bot:message-correlation-42:client_action',
       receipt: { status: 'observed', target: { id: 'window-42' } },
       terminalVerification: { status: 'unverified' },
       capability: {

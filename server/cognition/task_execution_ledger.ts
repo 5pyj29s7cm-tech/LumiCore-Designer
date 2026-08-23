@@ -21,6 +21,10 @@ export interface ConversationTaskPolicySnapshot {
 export interface ConversationTaskReceipt {
   id: string;
   key: string;
+  taskId?: string;
+  turnId?: string;
+  requestId?: string;
+  idempotencyKey?: string;
   name: string;
   arguments: Record<string, unknown>;
   result: string;
@@ -204,6 +208,10 @@ export function normalizeConversationTaskReceipt(value: unknown): ConversationTa
   return {
     id: compact(candidate.id, 180) || key,
     key,
+    ...(compact(candidate.taskId, 180) ? { taskId: compact(candidate.taskId, 180) } : {}),
+    ...(compact(candidate.turnId, 180) ? { turnId: compact(candidate.turnId, 180) } : {}),
+    ...(compact(candidate.requestId, 300) ? { requestId: compact(candidate.requestId, 300) } : {}),
+    ...(compact(candidate.idempotencyKey, 500) ? { idempotencyKey: compact(candidate.idempotencyKey, 500) } : {}),
     name,
     arguments: candidate.arguments && typeof candidate.arguments === 'object' && !Array.isArray(candidate.arguments)
       ? stableValue(candidate.arguments) as Record<string, unknown>
@@ -441,6 +449,10 @@ export function recordsToTaskReceipts(
     return ({
     id: compact(record.id, 180) || `receipt_${Date.now()}_${index}`,
     key: toolRecordKey(record),
+    ...(compact(record.taskId, 180) ? { taskId: compact(record.taskId, 180) } : {}),
+    ...(compact(record.turnId, 180) ? { turnId: compact(record.turnId, 180) } : {}),
+    ...(compact(record.requestId, 300) ? { requestId: compact(record.requestId, 300) } : {}),
+    ...(compact(record.idempotencyKey, 500) ? { idempotencyKey: compact(record.idempotencyKey, 500) } : {}),
     name: compact(record.name, 160),
     arguments: stableValue(record.arguments || {}) as Record<string, unknown>,
     result: compact(record.result, 3000),
@@ -491,6 +503,10 @@ export function taskReceiptsToRecords(receipts: ConversationTaskReceipt[] = []):
     if (!receipt) return null;
     return {
     id: receipt.id,
+    ...(receipt.taskId ? { taskId: receipt.taskId } : {}),
+    ...(receipt.turnId ? { turnId: receipt.turnId } : {}),
+    ...(receipt.requestId ? { requestId: receipt.requestId } : {}),
+    ...(receipt.idempotencyKey ? { idempotencyKey: receipt.idempotencyKey } : {}),
     name: receipt.name,
     arguments: receipt.arguments || {},
     result: receipt.result || '',
