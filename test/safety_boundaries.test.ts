@@ -504,6 +504,10 @@ describe('Action Constitution', () => {
     }, {
       actionIntent: '开始会议模式，记录这次沟通',
       source: 'chat',
+      userId: 'safety-chat-user',
+      authenticated: true,
+      localExecution: true,
+      executionBoundary: 'trusted_local',
     })).resolves.toBe('explicit-intent');
 
     await expect(registry.execute('client_action', {
@@ -512,6 +516,10 @@ describe('Action Constitution', () => {
     }, {
       actionIntent: '进入壁纸模式继续工作',
       source: 'voice',
+      userId: 'safety-voice-user',
+      authenticated: true,
+      localExecution: true,
+      executionBoundary: 'trusted_local',
     })).resolves.toBe('explicit-intent');
   });
 

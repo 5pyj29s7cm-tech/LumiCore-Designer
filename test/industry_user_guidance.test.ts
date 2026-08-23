@@ -88,6 +88,9 @@ describe('industry user guidance', () => {
       actionIntent: '\u8fd9\u4e2a\u5b9a\u5236\u7248\u600e\u4e48\u7528',
       routedTaskText: '\u8fd9\u4e2a\u5b9a\u5236\u7248\u600e\u4e48\u7528',
       source: 'voice',
+      authenticated: true,
+      authRole: 'admin',
+      localExecution: true,
     }));
 
     expect(result).toMatchObject({
@@ -119,6 +122,9 @@ describe('industry user guidance', () => {
       userId,
       domain: 'personal',
       source: 'chat',
+      authenticated: true,
+      authRole: 'admin',
+      localExecution: true,
     }));
     expect(saved).toMatchObject({
       ok: true,
@@ -142,6 +148,9 @@ describe('industry user guidance', () => {
       domain: 'personal',
       actionIntent: '\u4e0b\u4e00\u6b65\u5e94\u8be5\u600e\u4e48\u505a',
       source: 'chat',
+      authenticated: true,
+      authRole: 'admin',
+      localExecution: true,
     }));
     expect(guided.effectivePreference.mode).toBe('guided');
     expect(guided.responseContract.guidedExecutionLimit).toContain('one explicitly requested');

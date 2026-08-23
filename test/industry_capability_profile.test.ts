@@ -179,6 +179,9 @@ describe('industry capability profile and channel routing', () => {
       routedTaskText: secretRequest,
       requestId: 'industry-stable-request-7781',
       idempotencyKey: 'industry-stable-request-7781',
+      authenticated: true,
+      authRole: 'admin',
+      localExecution: true,
     } as any;
     const first = JSON.parse(await registry.execute('industry_workflow_start', { entryId: scenario.entryId }, context));
     const second = JSON.parse(await registry.execute('industry_workflow_start', { entryId: scenario.entryId }, context));
@@ -230,6 +233,10 @@ describe('industry capability profile and channel routing', () => {
       requestId: `industry-org-request-${PRODUCT_VARIANT.productLine}`,
       idempotencyKey: `industry-org-request-${PRODUCT_VARIANT.productLine}`,
       actionIntent: scenario.command,
+      authenticated: true,
+      authRole: 'admin',
+      orgRole: 'owner',
+      localExecution: false,
     } as any));
     expect(started.conversationTaskId).toBe(conversationTaskId);
     const actionTasks = readDB().conversationActionTasks.filter((task: any) => task.userId === userId);
@@ -256,6 +263,9 @@ describe('industry capability profile and channel routing', () => {
       requestId: 'industry-receipt-gate',
       idempotencyKey: 'industry-receipt-gate',
       getCurrentToolRecords: () => [],
+      authenticated: true,
+      authRole: 'admin',
+      localExecution: true,
     } as any;
     const started = JSON.parse(await registry.execute('industry_workflow_start', { entryId: scenario.entryId }, context));
     await expect(registry.execute('industry_workflow_complete', { taskId: started.task.id }, context))
@@ -270,6 +280,7 @@ describe('industry capability profile and channel routing', () => {
       domain: 'personal', orgId: '', source: 'chat', actionIntent: scenario.command,
       routedTaskText: scenario.command, requestId: `bound-task-${Date.now()}`,
       idempotencyKey: `bound-task-${Date.now()}`,
+      authenticated: true, authRole: 'admin', localExecution: true,
     };
     const started = JSON.parse(await registry.execute('industry_workflow_start', { entryId: scenario.entryId }, context));
     context.industryWorkflowTaskId = started.task.id;
@@ -330,6 +341,7 @@ describe('industry capability profile and channel routing', () => {
       domain: 'personal', orgId: '', source: 'voice', actionIntent: scenario.command,
       routedTaskText: scenario.command, requestId: `industry-verified-loop-${PRODUCT_VARIANT.productLine}`,
       idempotencyKey: `industry-verified-loop-${PRODUCT_VARIANT.productLine}`,
+      authenticated: true, authRole: 'admin', localExecution: true,
     };
     const started = JSON.parse(await registry.execute('industry_workflow_start', { entryId: scenario.entryId }, context));
     context.getCurrentToolRecords = () => (

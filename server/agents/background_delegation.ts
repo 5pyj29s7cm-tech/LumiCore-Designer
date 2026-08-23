@@ -14,6 +14,7 @@ export interface BackgroundDelegationDecisionInput {
   selfRepair: boolean;
   sanctuary: boolean;
   directDesktop: boolean;
+  capabilityLane?: string;
   prefersSequentialWorkflow: boolean;
   availableAgentCount: number;
 }
@@ -98,7 +99,11 @@ export function shouldDelegateWorkInBackground(input: BackgroundDelegationDecisi
   if (FOREGROUND_STATUS_OR_RECALL_RE.test(input.text)) return { shouldDelegate: false, reason: 'foreground_status_or_recall' };
   if (input.selfRepair) return { shouldDelegate: false, reason: 'self_repair' };
   if (input.sanctuary) return { shouldDelegate: false, reason: 'sanctuary_agent' };
+  const explicitlyRequested = hasExplicitBackgroundDelegationPreference(input.text);
   if (input.directDesktop) return { shouldDelegate: false, reason: 'direct_desktop_visible_work' };
+  if (input.capabilityLane === 'desktop_control' && !explicitlyRequested) {
+    return { shouldDelegate: false, reason: 'desktop_control_foreground' };
+  }
   if (input.prefersSequentialWorkflow) return { shouldDelegate: false, reason: 'artifact_first_sequential_workflow' };
   if (isBackgroundMetaInquiry(input.text)) return { shouldDelegate: false, reason: 'background_meta_inquiry' };
   if (isBackgroundAppInspection(input.text)) return { shouldDelegate: false, reason: 'background_app_inspection' };
@@ -108,7 +113,6 @@ export function shouldDelegateWorkInBackground(input: BackgroundDelegationDecisi
   if (isForegroundMessagingSend(input.text)) return { shouldDelegate: false, reason: 'foreground_messaging_send' };
   if (!WORK_CATEGORY_ALLOWLIST.has(input.category || '')) return { shouldDelegate: false, reason: 'non_work_category' };
 
-  const explicitlyRequested = hasExplicitBackgroundDelegationPreference(input.text);
   if (input.continuationContext && !explicitlyRequested) {
     return { shouldDelegate: false, reason: 'foreground_task_continuation' };
   }

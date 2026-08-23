@@ -1,11 +1,23 @@
 import { readDB, writeDB } from '../../db_layer';
 import { PRODUCT_VARIANT } from '../../shared/product_variant';
-import { matchCurrentIndustryWorkflow } from '../regions/packs/cn/industry_capability_profile';
+import {
+  isCurrentIndustryWorkflowExecutionRequest,
+  matchCurrentIndustryWorkflow,
+} from '../regions/packs/cn/industry_capability_profile';
+import { isDesignProjectStatusRequest } from '../design/status_intent';
 
 export function isCurrentIndustryGuidanceRequest(text: unknown): boolean {
-  if (!isIndustryGuidanceRequest(text)) return false;
-  if (matchCurrentIndustryWorkflow(text)) return true;
   const value = String(text || '').trim();
+  if (isDesignProjectStatusRequest(value)) return false;
+  const workflowMatch = matchCurrentIndustryWorkflow(value);
+  if (workflowMatch && !isCurrentIndustryWorkflowExecutionRequest(value)) {
+    if (isIndustryGuidanceRequest(value)) return true;
+    // i18n-allow: Edition-specific capability questions; not user-visible copy.
+    if (/(?:是什么|能做什么|支持(?:吗|么|哪些)?|有什么用|怎么用|如何使用)|\b(?:what\s+is|what\s+can|does\s+it\s+support|is\s+.+\s+supported)\b/iu.test(value)) {
+      return true;
+    }
+  }
+  if (!isIndustryGuidanceRequest(value)) return false;
   // i18n-allow: Reviewed onboarding and exact-edition input recognition.
   return /(?:\u7b2c\u4e00\u6b21\u4f7f\u7528|\u65b0\u624b|\u5165\u95e8|\u6559\u6211|\u5e26\u6211|\u4ece\u54ea(?:\u91cc)?\u5f00\u59cb|\u4e0b\u4e00\u6b65(?:\u600e\u4e48|\u5e94\u8be5)|(?:lumi|\u5b9a\u5236\u7248|\u8fd9\u4e2a\u7248\u672c).{0,18}\u600e\u4e48\u7528|\b(?:onboarding|teach\s+me|guide\s+me|walk\s+me\s+through|getting\s+started|what\s+should\s+i\s+do\s+next)\b)/iu.test(value);
 }

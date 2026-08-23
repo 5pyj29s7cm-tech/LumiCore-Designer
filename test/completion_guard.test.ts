@@ -2,6 +2,24 @@ import { describe, expect, it } from 'vitest';
 import { guardCompletionClaims } from '../server/work_product/completion_guard';
 
 describe('completion guard desktop action handling', () => {
+  it('does not mistake a source-access instruction inside verified legal research for an open claim', () => {
+    const task = '律师版实机验收·法条与类案：基于案件ID case-001，只使用可核验来源输出结果；禁止凭模型记忆编造法条，不要登录外部网站。';
+    const response = '法条候选来自本地权威快照。未配置来源只能由律师打开授权网页人工核验；本轮未自动登录任何外部网站。任务回执状态：已验证。';
+    const result = guardCompletionClaims({
+      task,
+      response,
+      toolCalls: [{
+        name: 'legal_search_statute',
+        arguments: { query: '买卖合同纠纷' },
+        result: '{"ok":true,"status":"observed","content":"现行有效候选"}',
+        terminalVerification: { status: 'verified', strategy: 'terminal_receipt', reason: 'Observed source result.' },
+      }],
+    });
+
+    expect(result.blocked).toBe(false);
+    expect(result.text).toBe(response);
+  });
+
   it('does not replace an attempted desktop action with a file-reading guard', () => {
     const response = 'I will open WeChat from the desktop shortcut and check the process.';
 
@@ -152,6 +170,43 @@ describe('design project status completion evidence', () => {
 });
 
 describe('completion guard generic execution claims', () => {
+  it('accepts a verified persistent-task creation receipt before generic desktop or file heuristics', () => {
+    const task = '请创建一个可跨重启继续的持久任务。标题“青穹客户跟进闭环”，类别 customer，来源 chat。现在只创建并持久化任务，不要发送任何消息。';
+    const response = [
+      '任务编号：wt_task_acceptance',
+      '状态：已创建并持久化（in_progress）',
+      '下一步：整理客户需求→生成跟进草稿→等待用户确认后再外发',
+      '需要确认：等待用户确认后再外发',
+    ].join('\n');
+    const result = guardCompletionClaims({
+      task,
+      response,
+      toolCalls: [{
+        name: 'work_takeover_task_create',
+        arguments: { title: '青穹客户跟进闭环', category: 'customer', source: 'chat' },
+        result: JSON.stringify({
+          ok: true,
+          status: 'created',
+          persisted: true,
+          task: {
+            id: 'wt_task_acceptance',
+            status: 'in_progress',
+            nextActions: ['整理客户需求', '生成跟进草稿', '等待用户确认后再外发'],
+            confirmationRequired: ['等待用户确认后再外发'],
+          },
+        }),
+        terminalVerification: {
+          status: 'verified',
+          strategy: 'terminal_receipt',
+          reason: 'Persistent task receipt verified.',
+        },
+      }],
+    });
+
+    expect(result.blocked).toBe(false);
+    expect(result.text).toBe(response);
+  });
+
   const stateDiffCapability = {
     capabilityId: 'desktop.open',
     lane: 'desktop' as const,
@@ -242,7 +297,8 @@ describe('completion guard generic execution claims', () => {
 
     expect(result.blocked).toBe(true);
     expect(result.reason).toContain('current-turn tool execution');
-    expect(result.text).toContain('\u8fd8\u4e0d\u80fd\u8bf4\u6b63\u5728\u6267\u884c');
+    expect(result.text).toContain('\u64cd\u4f5c\u8fd8\u6ca1\u6709\u6210\u529f\u542f\u52a8');
+    expect(result.text).not.toContain('No successful current-turn tool execution');
   });
 
   it('allows a write-completion claim only with current-turn producer evidence', () => {

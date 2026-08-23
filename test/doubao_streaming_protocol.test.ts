@@ -85,18 +85,18 @@ describe('Doubao streaming binary protocol', () => {
   });
 
   it('uses a shorter stable-partial window for a completed sentence', () => {
-    expect(__doubaoStreamingProtocolForTests.getStablePartialCommitDelayMs('听得见我说话吗？')).toBe(700);
-    expect(__doubaoStreamingProtocolForTests.getStablePartialCommitDelayMs('继续说')).toBe(1200);
+    expect(__doubaoStreamingProtocolForTests.getStablePartialCommitDelayMs('Can you hear me?')).toBe(700);
+    expect(__doubaoStreamingProtocolForTests.getStablePartialCommitDelayMs('continue speaking')).toBe(1200);
   });
 
   it('emits only the uncommitted tail of cumulative Doubao transcripts', () => {
     expect(__doubaoStreamingProtocolForTests.getUncommittedTranscript(
-      '听得见我说话吗？',
-      '听得见我说话吗？请回答我。',
-    )).toBe('请回答我。');
+      'Can you hear me?',
+      'Can you hear me? Please answer.',
+    )).toBe('Please answer.');
     expect(__doubaoStreamingProtocolForTests.getUncommittedTranscript(
-      '听得见我说话吗？',
-      '听得见我说话吗？',
+      'Can you hear me?',
+      'Can you hear me?',
     )).toBe('');
   });
 });

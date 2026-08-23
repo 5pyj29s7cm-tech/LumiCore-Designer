@@ -107,7 +107,13 @@ describe('industry edition pure voice replay', () => {
       expect(voice.turnIntent.flow.clientActionOnlyTurn).toBe(true);
       expect(voice.turnIntent.flow.industryWorkflowEntryId || '').toBe('');
       expect(new Set(voice.execution.toolPolicy.allowedTools)).toEqual(new Set(['client_get_state', 'client_action']));
-      expect(new Set(chat.execution.toolPolicy.allowedTools)).toEqual(new Set(voice.execution.toolPolicy.allowedTools));
+      // Main chat remains model-owned: normalized navigation narrows intent,
+      // but it does not restore the legacy regex/quick-command dispatcher.
+      expect(chat.execution.toolPolicy.allowedTools).toEqual(expect.arrayContaining([
+        'client_get_state',
+        'client_action',
+      ]));
+      expect(chat.execution.toolPolicy.allowedTools.length).toBeGreaterThan(2);
       expect(voice.execution.toolPolicy.allowedTools).not.toContain('desktop_open');
       expect(voice.execution.toolPolicy.allowedTools).not.toContain('industry_workflow_start');
 
