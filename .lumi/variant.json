@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "variantId": "designer-client",
   "displayName": "Lumi 设计师定制版",
   "productLine": "design",
@@ -10,20 +10,40 @@
     "mobileAppIdentifier": "com.lumiai.designer",
     "dataDirectoryName": "LumiOS-Designer",
     "updaterChannel": "lumi-designer",
-    "defaultSkills": ["design-studio-pack", "cad-drafting"],
-    "modules": ["spatial-design", "interior-design", "cad-workflows"]
+    "defaultSkills": [
+      "design-studio-pack",
+      "cad-drafting"
+    ],
+    "modules": [
+      "spatial-design",
+      "interior-design",
+      "cad-workflows"
+    ]
   },
   "upstream": {
     "repository": "https://github.com/5pyj29s7cm-tech/lumi-CEO.git",
     "branch": "main",
     "baselineCommit": "59d473e9abeb0b6922db1d7dea1cf0765b5ccb0d",
-    "lastSyncedCommit": "9fd16ed4032e52a9e99646b1397b67a1cafada4b"
+    "lastSyncedCommit": "44df247096418db05c05f8782417b74f18c823eb"
   },
   "repository": "https://github.com/5pyj29s7cm-tech/lumi-designer-client.git",
   "syncPolicy": {
     "coreToVariant": "merge reviewed upstream releases",
-    "variantToCore": "cherry-pick reviewed generic commits"
+    "variantToCore": "cherry-pick reviewed generic commits",
+    "defaultBranchUpdate": "verified fast-forward only"
   },
   "createdAt": "2026-08-03T16:13:55.985Z",
-  "lastSyncedAt": "2026-08-13T22:08:00+08:00"
+  "lastSyncedAt": "2026-08-23T01:29:08.214Z",
+  "delivery": {
+    "localBranch": "variant/designer-client",
+    "remoteBranch": "main",
+    "defaultBranch": "main"
+  },
+  "verification": {
+    "requiredGates": [
+      "lint",
+      "test",
+      "build"
+    ]
+  }
 }
