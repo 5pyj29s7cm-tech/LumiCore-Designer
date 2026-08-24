@@ -349,8 +349,19 @@ describe('industry capability profile and channel routing', () => {
         ? entry.contract.requiredToolReceipts
         : ['industry_domain_result_probe']
     ).map((name: string, index: number) => ({
-      id: `verified-domain-receipt-${index}`, name, arguments: {},
-      result: JSON.stringify({ ok: true, status: 'verified', summary: entry.contract.expectedContentTerms.join(' ') }),
+      id: `verified-domain-receipt-${index}`,
+      taskId: started.conversationTaskId,
+      requestId: started.requestId,
+      name,
+      arguments: {},
+      result: JSON.stringify({
+        ok: true,
+        status: 'verified',
+        taskId: started.task.id,
+        conversationTaskId: started.conversationTaskId,
+        requestId: started.requestId,
+        summary: entry.contract.expectedContentTerms.join(' '),
+      }),
       terminalVerification: { status: 'verified', strategy: 'measured', reason: 'verified domain result' },
     }));
     const completed = JSON.parse(await registry.execute('industry_workflow_complete', { taskId: started.task.id }, context));

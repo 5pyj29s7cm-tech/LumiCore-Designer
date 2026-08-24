@@ -63,7 +63,11 @@ function stageFile(directory: string, entryId: string): string[] {
   return [filePath];
 }
 
-function stageToolRecords(entryId: string): any[] {
+function stageToolRecords(entryId: string, binding: {
+  task: { id: string };
+  conversationTaskId: string;
+  requestId: string;
+}): any[] {
     const names: Record<string, string[]> = {
     project: [
       'mcp_design-studio-pack_interior_project_brief',
@@ -75,10 +79,17 @@ function stageToolRecords(entryId: string): any[] {
     handoff: ['interior_design_project_status', 'design_delivery_package_create'],
   };
   return (names[entryId] || []).map((name, index) => ({
-    id: `${entryId}-${index}`,
+    id: `${entryId}-${binding.requestId}-${index}`,
+    taskId: binding.conversationTaskId,
+    requestId: binding.requestId,
     name,
     arguments: {},
-    result: JSON.stringify({ ok: true, status: 'verified', summary: stageResult(entryId) }),
+    result: JSON.stringify({
+      ok: true,
+      status: 'verified',
+      taskId: binding.task.id,
+      summary: stageResult(entryId),
+    }),
     terminalVerification: { status: 'verified', strategy: 'terminal_receipt', reason: 'verified test receipt' },
   }));
 }
@@ -96,7 +107,7 @@ describe('designer project delivery loop', () => {
       ...scope,
       taskId: first.task.id,
       resultText: stageResult('project'),
-      toolRecords: stageToolRecords('project'),
+      toolRecords: stageToolRecords('project', first),
     });
     expect(delivered.verification.passed).toBe(true);
 
@@ -177,7 +188,7 @@ describe('designer project delivery loop', () => {
         taskId: standalone.task.id,
         resultText: stageResult('cad'),
         filePaths: stageFile(directory, 'cad'),
-        toolRecords: stageToolRecords('cad'),
+        toolRecords: stageToolRecords('cad', standalone),
       });
       expect(delivered.verification.passed).toBe(true);
       expect(delivered.task.status).toBe('delivered');
@@ -289,7 +300,7 @@ describe('designer project delivery loop', () => {
         ...scope,
         taskId: projectStage.task.id,
         resultText: stageResult('project'),
-        toolRecords: stageToolRecords('project'),
+        toolRecords: stageToolRecords('project', projectStage),
       });
       const cadStage = startIndustryWorkflow({ ...scope, entryId: 'cad', source: 'chat' });
       const cadResult = recordIndustryWorkflowExecution({
@@ -297,7 +308,7 @@ describe('designer project delivery loop', () => {
         taskId: cadStage.task.id,
         resultText: stageResult('cad'),
         filePaths: stageFile(directory, 'cad'),
-        toolRecords: stageToolRecords('cad'),
+        toolRecords: stageToolRecords('cad', cadStage),
       });
 
       expect(cadResult.verification.passed).toBe(true);
@@ -340,7 +351,7 @@ describe('designer project delivery loop', () => {
         taskId: earlyHandoff.task.id,
         resultText: stageResult('handoff'),
         filePaths: stageFile(directory, 'handoff'),
-        toolRecords: stageToolRecords('handoff'),
+        toolRecords: stageToolRecords('handoff', earlyHandoff),
       });
       expect(blockedHandoff.verification.passed).toBe(false);
       expect(blockedHandoff.verification.summary).toMatch(/upstream stages/i);
@@ -349,7 +360,7 @@ describe('designer project delivery loop', () => {
         ...scope,
         taskId: projectStage.task.id,
         resultText: stageResult('project'),
-        toolRecords: stageToolRecords('project'),
+        toolRecords: stageToolRecords('project', duplicate),
       });
       expect(projectResult.verification.passed).toBe(true);
 
@@ -361,7 +372,7 @@ describe('designer project delivery loop', () => {
           taskId: started.task.id,
           resultText: stageResult(entryId),
           filePaths: stageFile(directory, entryId),
-          toolRecords: stageToolRecords(entryId),
+          toolRecords: stageToolRecords(entryId, started),
         });
         expect(recorded.verification.passed, `${entryId}: ${recorded.verification.summary}; ${JSON.stringify(recorded.verification.checks)}`).toBe(true);
       }
@@ -373,7 +384,7 @@ describe('designer project delivery loop', () => {
         taskId: resumedHandoff.task.id,
         resultText: stageResult('handoff'),
         filePaths: stageFile(directory, 'handoff'),
-        toolRecords: stageToolRecords('handoff'),
+        toolRecords: stageToolRecords('handoff', resumedHandoff),
       });
       expect(delivered.verification.passed).toBe(true);
 
@@ -437,7 +448,7 @@ describe('designer project delivery loop', () => {
         ...scope,
         taskId: projectStage.task.id,
         resultText: stageResult('project'),
-        toolRecords: stageToolRecords('project'),
+        toolRecords: stageToolRecords('project', projectStage),
       });
       const cadStage = startIndustryWorkflow({ ...scope, entryId: 'cad', source: 'chat' });
       recordIndustryWorkflowExecution({
@@ -445,7 +456,7 @@ describe('designer project delivery loop', () => {
         taskId: cadStage.task.id,
         resultText: stageResult('cad'),
         filePaths: stageFile(directory, 'cad'),
-        toolRecords: stageToolRecords('cad'),
+        toolRecords: stageToolRecords('cad', cadStage),
       });
       expect(getActiveInteriorProject(scopeId, userId)?.status).toBe('design');
 
@@ -454,7 +465,7 @@ describe('designer project delivery loop', () => {
         ...scope,
         taskId: repeatedProjectStage.task.id,
         resultText: stageResult('project'),
-        toolRecords: stageToolRecords('project'),
+        toolRecords: stageToolRecords('project', repeatedProjectStage),
       });
       expect(getActiveInteriorProject(scopeId, userId)?.status).toBe('design');
       expect(getInteriorProjectWorkflow(scopeId, project.id)?.activeStage).toBe('cad');
@@ -475,10 +486,10 @@ describe('designer project delivery loop', () => {
       ...scope,
       taskId: projectStage.task.id,
       resultText: stageResult('project'),
-      toolRecords: stageToolRecords('project'),
+      toolRecords: stageToolRecords('project', projectStage),
     });
     const started = startIndustryWorkflow({ ...scope, entryId: 'cad', source: 'chat' });
-    const assessment = stageToolRecords('cad')[0];
+    const assessment = stageToolRecords('cad', started)[0];
     assessment.result = JSON.stringify({
       status: 'insufficient_verified_geometry',
       evidenceGaps: ['No measured wall coordinates or openings'],
@@ -517,13 +528,13 @@ describe('designer project delivery loop', () => {
       ...scope,
       taskId: projectStage.task.id,
       resultText: stageResult('project'),
-      toolRecords: stageToolRecords('project'),
+      toolRecords: stageToolRecords('project', projectStage),
     });
     const started = startIndustryWorkflow({ ...scope, entryId: 'cad', source: 'chat' });
-    const assessment = stageToolRecords('cad')[0];
+    const assessment = stageToolRecords('cad', started)[0];
     assessment.result = JSON.stringify({ status: 'ready_for_geometry_extraction', evidenceGaps: [] });
     const generation = {
-      ...stageToolRecords('cad')[1],
+      ...stageToolRecords('cad', started)[1],
       result: '',
       error: 'Tool "cad_generate_dxf" requires user confirmation: Local write actions require confirmation unless the current turn explicitly requested a local deliverable.',
       terminalVerification: { status: 'failed', strategy: 'terminal_receipt', reason: 'confirmation required' },
@@ -553,7 +564,7 @@ describe('designer project delivery loop', () => {
       ...scope,
       taskId: projectStage.task.id,
       resultText: stageResult('project'),
-      toolRecords: stageToolRecords('project'),
+      toolRecords: stageToolRecords('project', projectStage),
     });
     const cadStage = startIndustryWorkflow({ ...scope, entryId: 'cad', source: 'chat' });
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi-design-provider-blocker-'));
@@ -563,12 +574,12 @@ describe('designer project delivery loop', () => {
         taskId: cadStage.task.id,
         resultText: stageResult('cad'),
         filePaths: stageFile(directory, 'cad'),
-        toolRecords: stageToolRecords('cad'),
+        toolRecords: stageToolRecords('cad', cadStage),
       });
       const visual = startIndustryWorkflow({ ...scope, entryId: 'visualization', source: 'chat' });
-      const direction = stageToolRecords('visualization')[0];
+      const direction = stageToolRecords('visualization', visual)[0];
       const failedImage = {
-        ...stageToolRecords('visualization')[1],
+        ...stageToolRecords('visualization', visual)[1],
         result: '',
         error: 'All configured image providers failed: qwen: DashScope image error (Arrearage): Access denied.',
         terminalVerification: { status: 'failed', strategy: 'provider_ack', reason: 'provider failure' },
@@ -601,7 +612,7 @@ describe('designer project delivery loop', () => {
         ...scope,
         taskId: projectStage.task.id,
         resultText: stageResult('project'),
-        toolRecords: stageToolRecords('project'),
+        toolRecords: stageToolRecords('project', projectStage),
       });
       const cadStage = startIndustryWorkflow({ ...scope, entryId: 'cad', source: 'chat' });
       recordIndustryWorkflowExecution({
@@ -609,7 +620,7 @@ describe('designer project delivery loop', () => {
         taskId: cadStage.task.id,
         resultText: stageResult('cad'),
         filePaths: stageFile(directory, 'cad'),
-        toolRecords: stageToolRecords('cad'),
+        toolRecords: stageToolRecords('cad', cadStage),
       });
       const historicalPpt = stageFile(directory, 'presentation')[0];
       const presentation = startIndustryWorkflow({ ...scope, entryId: 'presentation', source: 'chat' });
@@ -658,7 +669,7 @@ describe('designer project delivery loop', () => {
     setActiveInteriorProject(scopeId, userId, project.id);
     const scope = { userId, domain: 'personal' as const, orgId: '' };
     const started = startIndustryWorkflow({ ...scope, entryId: 'project', source: 'chat' });
-    const toolRecords = stageToolRecords('project');
+    const toolRecords = stageToolRecords('project', started);
     toolRecords[0].result = JSON.stringify({
       grossArea: '96 m2 measured shell',
       occupants: 'Three-person household',
@@ -709,7 +720,7 @@ describe('designer project delivery loop', () => {
       ...scope,
       taskId: started.task.id,
       resultText: stageResult('project'),
-      toolRecords: stageToolRecords('project'),
+      toolRecords: stageToolRecords('project', started),
     });
     expect(delivered.verification.passed).toBe(true);
 
@@ -732,6 +743,96 @@ describe('designer project delivery loop', () => {
     expect(rejected.verification.passed).toBe(false);
     expect(rejected.task.status).not.toBe('delivered');
     expect(rejected.verification.summary).toMatch(/Missing verified required capability receipts/i);
+  });
+
+  it('rejects required domain receipts copied from workflow A into workflow B', () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_cross_required_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, { name: 'Required receipt isolation project' });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const scope = { userId, domain: 'personal' as const, orgId: '' };
+    const startedA = startIndustryWorkflow({
+      ...scope,
+      entryId: 'project',
+      source: 'chat',
+      requestId: `request_a_${suffix}`,
+    });
+    const recordsA = stageToolRecords('project', startedA);
+    const deliveredA = recordIndustryWorkflowExecution({
+      ...scope,
+      taskId: startedA.task.id,
+      resultText: stageResult('project'),
+      toolRecords: recordsA,
+    });
+    expect(deliveredA.verification.passed).toBe(true);
+
+    const startedB = startIndustryWorkflow({
+      ...scope,
+      entryId: 'project',
+      source: 'chat',
+      requestId: `request_b_${suffix}`,
+    });
+    expect(startedB.task.id).not.toBe(startedA.task.id);
+    const rejectedB = recordIndustryWorkflowExecution({
+      ...scope,
+      taskId: startedB.task.id,
+      resultText: stageResult('project'),
+      toolRecords: recordsA,
+    });
+
+    expect(rejectedB.verification.passed).toBe(false);
+    expect(rejectedB.task.status).not.toBe('delivered');
+    expect(rejectedB.verification.summary).toMatch(/Missing verified required capability receipts/i);
+  });
+
+  it('makes an exact receipt replay idempotent and rejects a conflicting reuse of the same id', () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_receipt_replay_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, { name: 'Receipt replay project' });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const scope = { userId, domain: 'personal' as const, orgId: '' };
+    const started = startIndustryWorkflow({
+      ...scope,
+      entryId: 'project',
+      source: 'chat',
+      requestId: `request_replay_${suffix}`,
+    });
+    const toolRecords = stageToolRecords('project', started);
+    const submission = {
+      ...scope,
+      taskId: started.task.id,
+      resultText: stageResult('project'),
+      toolRecords,
+    };
+    const first = recordIndustryWorkflowExecution(submission);
+    expect(first.verification.passed).toBe(true);
+    const trackedActionTaskIds = new Set([
+      started.conversationTaskId,
+      `design_project_${project.id}`,
+    ]);
+    const actionReceiptCount = (readDB().conversationActionReceipts || [])
+      .filter((receipt: any) => trackedActionTaskIds.has(receipt.taskId)).length;
+    const toolRunCount = (first.task.metadata.workTakeoverToolRuns || []).length;
+    const artifactCount = first.task.artifacts.length;
+
+    const replayed = recordIndustryWorkflowExecution(submission);
+    expect(replayed.verification.verificationId).toBe(first.verification.verificationId);
+    expect(replayed.task.metadata.workTakeoverToolRuns).toHaveLength(toolRunCount);
+    expect(replayed.task.artifacts).toHaveLength(artifactCount);
+    expect((readDB().conversationActionReceipts || [])
+      .filter((receipt: any) => trackedActionTaskIds.has(receipt.taskId))).toHaveLength(actionReceiptCount);
+
+    const conflictingRecords = toolRecords.map(record => ({ ...record }));
+    conflictingRecords[0] = {
+      ...conflictingRecords[0],
+      result: JSON.stringify({ ok: true, status: 'verified', taskId: started.task.id, changed: true }),
+    };
+    expect(() => recordIndustryWorkflowExecution({ ...submission, toolRecords: conflictingRecords }))
+      .toThrow(/conflicting industry tool receipt reused an existing record id/i);
+    expect((readDB().conversationActionReceipts || [])
+      .filter((receipt: any) => trackedActionTaskIds.has(receipt.taskId))).toHaveLength(actionReceiptCount);
   });
 
   it('routes spoken project creation to the durable project tool before stage execution', () => {

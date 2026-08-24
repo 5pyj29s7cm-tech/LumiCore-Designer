@@ -16,8 +16,15 @@ beforeAll(async () => {
   await initDatabase();
 });
 
-function verifiedRecord(name: string, result: string): ToolExecutionRecord {
+function verifiedRecord(name: string, result: string, binding?: {
+  task: { id: string };
+  conversationTaskId: string;
+  requestId: string;
+}): ToolExecutionRecord {
   return {
+    id: binding ? `${name}-${binding.requestId}` : undefined,
+    taskId: binding?.conversationTaskId,
+    requestId: binding?.requestId,
     name,
     arguments: {},
     result,
@@ -71,8 +78,8 @@ describe('industry workflow server autocomplete', () => {
         error: 'Transient invalid arguments',
         terminalVerification: { status: 'failed', strategy: 'terminal_receipt', reason: 'failed test attempt' },
       },
-      verifiedRecord('mcp_design-studio-pack_interior_project_brief', PROJECT_RESULT),
-      verifiedRecord('mcp_design-studio-pack_space_planning_checklist', PROJECT_RESULT),
+      verifiedRecord('mcp_design-studio-pack_interior_project_brief', PROJECT_RESULT, setup.started),
+      verifiedRecord('mcp_design-studio-pack_space_planning_checklist', PROJECT_RESULT, setup.started),
     ];
 
     const completed = await completeIndustryWorkflowFromVerifiedReceipts({
@@ -81,7 +88,8 @@ describe('industry workflow server autocomplete', () => {
       context: {
         userId: setup.userId,
         domain: 'personal',
-        requestId: `complete_${setup.suffix}`,
+        taskId: setup.started.conversationTaskId,
+        requestId: setup.started.requestId,
         industryWorkflowEntryId: 'project',
         industryWorkflowProductLine: 'design',
       },
@@ -102,11 +110,12 @@ describe('industry workflow server autocomplete', () => {
     const setup = setupProjectWorkflow();
     const completed = await completeIndustryWorkflowFromVerifiedReceipts({
       registry: setup.registry,
-      records: [verifiedRecord('mcp_design-studio-pack_interior_project_brief', PROJECT_RESULT)],
+      records: [verifiedRecord('mcp_design-studio-pack_interior_project_brief', PROJECT_RESULT, setup.started)],
       context: {
         userId: setup.userId,
         domain: 'personal',
-        requestId: `incomplete_${setup.suffix}`,
+        taskId: setup.started.conversationTaskId,
+        requestId: setup.started.requestId,
         industryWorkflowTaskId: setup.started.task.id,
         industryWorkflowEntryId: 'project',
         industryWorkflowProductLine: 'design',
@@ -120,6 +129,9 @@ describe('industry workflow server autocomplete', () => {
   it('settles the durable ledger after every required capability was attempted and one failed', async () => {
     const setup = setupProjectWorkflow();
     const failed: ToolExecutionRecord = {
+      id: `mcp_design-studio-pack_space_planning_checklist-${setup.started.requestId}`,
+      taskId: setup.started.conversationTaskId,
+      requestId: setup.started.requestId,
       name: 'mcp_design-studio-pack_space_planning_checklist',
       arguments: {},
       result: '',
@@ -129,13 +141,14 @@ describe('industry workflow server autocomplete', () => {
     const settled = await completeIndustryWorkflowFromVerifiedReceipts({
       registry: setup.registry,
       records: [
-        verifiedRecord('mcp_design-studio-pack_interior_project_brief', PROJECT_RESULT),
+        verifiedRecord('mcp_design-studio-pack_interior_project_brief', PROJECT_RESULT, setup.started),
         failed,
       ],
       context: {
         userId: setup.userId,
         domain: 'personal',
-        requestId: `failed_${setup.suffix}`,
+        taskId: setup.started.conversationTaskId,
+        requestId: setup.started.requestId,
         industryWorkflowTaskId: setup.started.task.id,
         industryWorkflowEntryId: 'project',
         industryWorkflowProductLine: 'design',
@@ -152,8 +165,8 @@ describe('industry workflow server autocomplete', () => {
   it('does not repeat a failed completion attempt unless newer required evidence arrives', async () => {
     const setup = setupProjectWorkflow();
     const required = [
-      verifiedRecord('mcp_design-studio-pack_interior_project_brief', PROJECT_RESULT),
-      verifiedRecord('mcp_design-studio-pack_space_planning_checklist', PROJECT_RESULT),
+      verifiedRecord('mcp_design-studio-pack_interior_project_brief', PROJECT_RESULT, setup.started),
+      verifiedRecord('mcp_design-studio-pack_space_planning_checklist', PROJECT_RESULT, setup.started),
     ];
     const priorFailedCompletion: ToolExecutionRecord = {
       name: 'industry_workflow_complete',
@@ -169,6 +182,8 @@ describe('industry workflow server autocomplete', () => {
       context: {
         userId: setup.userId,
         domain: 'personal',
+        taskId: setup.started.conversationTaskId,
+        requestId: setup.started.requestId,
         industryWorkflowTaskId: setup.started.task.id,
         industryWorkflowEntryId: 'project',
         industryWorkflowProductLine: 'design',

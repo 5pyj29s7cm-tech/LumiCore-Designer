@@ -156,9 +156,16 @@ describe('REST chat remote execution boundary', () => {
       'mcp_design-studio-pack_space_planning_checklist',
     ].map((name, index) => ({
       id: `native-design-receipt-${index}`,
+      taskId: started.conversationTaskId,
+      requestId: started.requestId,
       name,
       arguments: {},
-      result: JSON.stringify({ ok: true, status: 'verified', summary: receiptText }),
+      result: JSON.stringify({
+        ok: true,
+        status: 'verified',
+        taskId: started.task.id,
+        summary: receiptText,
+      }),
       terminalVerification: {
         status: 'verified' as const,
         strategy: 'terminal_receipt' as const,

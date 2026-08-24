@@ -120,6 +120,21 @@ function sha256(value: unknown): string {
   return crypto.createHash('sha256').update(String(value ?? '')).digest('hex');
 }
 
+function canonicalJson(value: unknown): string {
+  const normalize = (candidate: unknown): unknown => {
+    if (Array.isArray(candidate)) return candidate.map(normalize);
+    if (!candidate || typeof candidate !== 'object') return candidate;
+    return Object.keys(candidate as Record<string, unknown>)
+      .sort()
+      .reduce<Record<string, unknown>>((result, key) => {
+        const child = (candidate as Record<string, unknown>)[key];
+        if (child !== undefined) result[key] = normalize(child);
+        return result;
+      }, {});
+  };
+  return JSON.stringify(normalize(value));
+}
+
 export function validateIndustryWorkflowSourceInput(task: WorkTakeoverTask, value: unknown): string {
   const sourceInput = compact(value, 12_000);
   if (!sourceInput) return '';
@@ -421,6 +436,72 @@ function parseRecordPayload(record: ToolExecutionRecord): unknown {
   return value;
 }
 
+function recordIdentityDigest(record: ToolExecutionRecord): string {
+  return sha256(canonicalJson({
+    id: record.id,
+    taskId: record.taskId,
+    requestId: record.requestId,
+    name: record.name,
+    arguments: record.arguments,
+    result: record.result,
+    receipt: record.receipt,
+    adapterStarted: record.adapterStarted,
+    error: record.error,
+    evidence: record.evidence,
+    capability: record.capability,
+    terminalVerification: record.terminalVerification,
+    envelope: record.envelope,
+  }));
+}
+
+function payloadTaskBindings(record: ToolExecutionRecord): Array<{
+  taskId: string;
+  conversationTaskId: string;
+  requestId: string;
+}> {
+  const payloads: Record<string, unknown>[] = [];
+  if (record.receipt && typeof record.receipt === 'object' && !Array.isArray(record.receipt)) {
+    payloads.push(record.receipt as Record<string, unknown>);
+  }
+  let resultPayload: unknown = record.result;
+  for (let depth = 0; depth < 3 && typeof resultPayload === 'string'; depth += 1) {
+    try { resultPayload = JSON.parse(resultPayload); } catch { break; }
+  }
+  if (resultPayload && typeof resultPayload === 'object' && !Array.isArray(resultPayload)) {
+    payloads.push(resultPayload as Record<string, unknown>);
+  }
+  return payloads.map(payload => {
+    const payloadTask = parseObject(payload.task);
+    return {
+      taskId: compact(payload.taskId || payload.workTakeoverTaskId || payloadTask.id, 200),
+      conversationTaskId: compact(payload.conversationTaskId, 200),
+      requestId: compact(payload.requestId, 200),
+    };
+  });
+}
+
+function recordMatchesWorkflowBinding(task: WorkTakeoverTask, record: ToolExecutionRecord): boolean {
+  const correlation = correlationFor(task);
+  if (
+    !correlation.conversationTaskId
+    || !correlation.requestId
+    || compact(record.taskId, 200) !== correlation.conversationTaskId
+    || compact(record.requestId, 200) !== correlation.requestId
+  ) return false;
+  if (
+    record.envelope
+    && (
+      compact(record.envelope.taskId, 200) !== correlation.conversationTaskId
+      || compact(record.envelope.requestId, 200) !== correlation.requestId
+    )
+  ) return false;
+  return payloadTaskBindings(record).every(payloadBinding => (
+    (!payloadBinding.taskId || payloadBinding.taskId === task.id)
+    && (!payloadBinding.conversationTaskId || payloadBinding.conversationTaskId === correlation.conversationTaskId)
+    && (!payloadBinding.requestId || payloadBinding.requestId === correlation.requestId)
+  ));
+}
+
 function recordCanProduceFileArtifact(record: ToolExecutionRecord): boolean {
   if (record.error || record.terminalVerification?.status !== 'verified') return false;
   if (record.capability?.sideEffects?.some(effect => effect.type === 'local_write')) return true;
@@ -436,29 +517,83 @@ function recordFilePaths(records: ToolExecutionRecord[], contract: IndustryWorkf
   return safeFilePaths(candidates, contract);
 }
 
-function toolRunHistory(task: WorkTakeoverTask, records: ToolExecutionRecord[]): any[] {
-  const current = Array.isArray(task.metadata?.workTakeoverToolRuns) ? task.metadata.workTakeoverToolRuns : [];
-  const appended = records.slice(-30).map(record => ({
+function persistedToolRun(record: ToolExecutionRecord): Record<string, any> {
+  return {
     id: compact(record.id || `industry_run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, 200),
     toolName: compact(record.name, 200),
     status: record.error || !String(record.result || '').trim() ? 'failed' : 'completed',
     error: compact(record.error, 1000),
     argumentsDigest: sha256(JSON.stringify(record.arguments || {})),
+    toolArgs: record.arguments && typeof record.arguments === 'object' ? record.arguments : {},
     result: compact(record.result, 3000),
     resultDigest: sha256(record.result),
+    receipt: record.receipt && typeof record.receipt === 'object' ? record.receipt : undefined,
+    terminalVerification: record.terminalVerification,
+    envelope: record.envelope,
     taskId: record.taskId || '',
     requestId: record.requestId || '',
+    recordIdentityDigest: recordIdentityDigest(record),
     recordedAt: new Date().toISOString(),
-  }));
-  return [...current.slice(-60), ...appended].slice(-60);
+  };
 }
 
-function verifiedToolNames(records: ToolExecutionRecord[]): Set<string> {
+function toolRunMatchesRecord(run: Record<string, any>, record: ToolExecutionRecord): boolean {
+  return Boolean(compact(run.recordIdentityDigest, 128))
+    && compact(run.id, 200) === compact(record.id, 200)
+    && compact(run.recordIdentityDigest, 128) === recordIdentityDigest(record);
+}
+
+function toolRecordReplayState(task: WorkTakeoverTask, records: ToolExecutionRecord[]): 'none' | 'exact' | 'conflict' {
+  if (!records.length || records.some(record => !compact(record.id, 200))) return 'none';
+  const current = Array.isArray(task.metadata?.workTakeoverToolRuns) ? task.metadata.workTakeoverToolRuns : [];
+  const incoming = new Map<string, string>();
+  let matched = 0;
+  for (const record of records) {
+    const recordId = compact(record.id, 200);
+    const identity = recordIdentityDigest(record);
+    const duplicateIdentity = incoming.get(recordId);
+    if (duplicateIdentity && duplicateIdentity !== identity) return 'conflict';
+    if (duplicateIdentity) continue;
+    incoming.set(recordId, identity);
+    const existing = current.find((run: any) => compact(run?.id, 200) === recordId);
+    if (!existing) continue;
+    if (!toolRunMatchesRecord(existing, record)) return 'conflict';
+    matched += 1;
+  }
+  return matched === incoming.size ? 'exact' : 'none';
+}
+
+function toolRunHistory(task: WorkTakeoverTask, records: ToolExecutionRecord[]): any[] {
+  const current = Array.isArray(task.metadata?.workTakeoverToolRuns)
+    ? task.metadata.workTakeoverToolRuns.slice(-60)
+    : [];
+  const merged = [...current];
+  for (const record of records.slice(-30)) {
+    const appended = persistedToolRun(record);
+    const sameId = compact(record.id, 200)
+      ? merged.find((run: any) => compact(run?.id, 200) === compact(record.id, 200))
+      : undefined;
+    if (sameId) {
+      if (!toolRunMatchesRecord(sameId, record)) {
+        throw new Error('A conflicting industry tool receipt reused an existing record id.');
+      }
+      continue;
+    }
+    const duplicateWithoutId = !compact(record.id, 200) && merged.some((run: any) => (
+      compact(run?.recordIdentityDigest, 128) === appended.recordIdentityDigest
+    ));
+    if (!duplicateWithoutId) merged.push(appended);
+  }
+  return merged.slice(-60);
+}
+
+function verifiedToolNames(task: WorkTakeoverTask, records: ToolExecutionRecord[]): Set<string> {
   return new Set(records
     .filter(record => (
       !record.error
       && record.terminalVerification?.status === 'verified'
       && String(record.result || '').trim().length > 0
+      && recordMatchesWorkflowBinding(task, record)
     ))
     .map(record => record.name));
 }
@@ -468,8 +603,20 @@ function persistedCompletedToolNames(task: WorkTakeoverTask): Set<string> {
     ? task.metadata.workTakeoverToolRuns
     : [];
   return new Set(history
-    .filter((record: any) => record?.status === 'completed' && String(record?.result || '').trim())
-    .map((record: any) => String(record.toolName || '')));
+    .filter((run: any) => run?.status === 'completed' && String(run?.result || '').trim())
+    .map((run: any) => ({
+      id: run.id,
+      name: String(run.toolName || ''),
+      arguments: run.toolArgs && typeof run.toolArgs === 'object' ? run.toolArgs : {},
+      result: String(run.result || ''),
+      receipt: run.receipt,
+      terminalVerification: run.terminalVerification,
+      taskId: run.taskId,
+      requestId: run.requestId,
+      envelope: run.envelope,
+    } as ToolExecutionRecord))
+    .filter(record => record.terminalVerification?.status === 'verified' && recordMatchesWorkflowBinding(task, record))
+    .map(record => record.name));
 }
 
 function missingFileArtifactBlocker(
@@ -533,7 +680,7 @@ function missingRequiredToolReceipts(
   records: ToolExecutionRecord[],
   includePersisted = false,
 ): string[] {
-  const names = verifiedToolNames(records);
+  const names = verifiedToolNames(task, records);
   if (includePersisted) {
     for (const name of persistedCompletedToolNames(task)) names.add(name);
   }
@@ -1152,12 +1299,40 @@ export function recordIndustryWorkflowExecution(input: RecordIndustryWorkflowInp
   const explicitPaths = safeFilePaths(input.filePaths || [], contract);
   const discoveredPaths = recordFilePaths(toolRecords, contract);
   const filePaths = Array.from(new Set([...explicitPaths, ...discoveredPaths]));
+  const submissionDigest = sha256(canonicalJson({
+    resultText,
+    files: filePaths.map(filePath => {
+      const stat = fs.statSync(filePath);
+      return { path: filePath, size: stat.size, modifiedAtMs: stat.mtimeMs };
+    }),
+    toolRecords: toolRecords.map(recordIdentityDigest),
+  }));
 
   if (!resultText && filePaths.length === 0 && toolRecords.length === 0) {
     throw new Error('No result, file, or tool receipt was supplied for verification.');
   }
 
   const previousVerification = existing.metadata?.workTakeoverVerification as WorkTakeoverResultVerification | undefined;
+  const replayState = toolRecordReplayState(existing, toolRecords);
+  if (replayState === 'conflict') {
+    throw new Error('A conflicting industry tool receipt reused an existing record id.');
+  }
+  if (replayState === 'exact' && previousVerification) {
+    const previousSubmissionDigest = compact(existing.metadata?.industryWorkflowLastAttempt?.submissionDigest, 128);
+    if (previousSubmissionDigest && previousSubmissionDigest !== submissionDigest) {
+      throw new Error('An industry workflow replay reused the same tool receipt with a different submission.');
+    }
+    const previousResultDigest = compact(existing.metadata?.industryWorkflowLastAttempt?.resultDigest, 128);
+    if (!previousSubmissionDigest && resultText && previousResultDigest && previousResultDigest !== sha256(resultText)) {
+      throw new Error('An industry workflow replay reused the same tool receipt with a different result.');
+    }
+    return {
+      task: existing,
+      verification: previousVerification,
+      conversationTaskId: conversationTaskIdFor(existing),
+      archivedFilePaths: safeFilePaths(existing.artifacts.map(artifact => artifact.path || ''), contract),
+    };
+  }
   if (
     existing.status === 'delivered'
     && previousVerification?.passed === true
@@ -1194,7 +1369,13 @@ export function recordIndustryWorkflowExecution(input: RecordIndustryWorkflowInp
       result: resultText || blocker,
       metadata: {
         workTakeoverToolRuns: toolRunHistory(existing, toolRecords),
-        industryWorkflowLastAttempt: { status: 'blocked', reason: blocker, at: new Date().toISOString() },
+        industryWorkflowLastAttempt: {
+          status: 'blocked',
+          reason: blocker,
+          resultDigest: sha256(resultText),
+          submissionDigest,
+          at: new Date().toISOString(),
+        },
       },
       note: blocker,
     }) || existing;
@@ -1220,9 +1401,24 @@ export function recordIndustryWorkflowExecution(input: RecordIndustryWorkflowInp
       toolRecords,
       blockedVerification,
     ));
-    settleBoundDesignProjectStage(blocked, verification, toolRecords);
-    settleIndustryWorkflowConversationTask(blocked, verification);
-    return { task: blocked, verification, conversationTaskId: conversationTaskIdFor(blocked), archivedFilePaths: [] };
+    const verifiedBlocked = updateWorkTakeoverTask(input.userId, blocked.id, {
+      metadata: {
+        workTakeoverVerification: verification,
+        industryWorkflowLastAttempt: {
+          ...(blocked.metadata?.industryWorkflowLastAttempt || {}),
+          status: verification.status,
+          verificationId: verification.verificationId,
+        },
+      },
+    }) || blocked;
+    settleBoundDesignProjectStage(verifiedBlocked, verification, toolRecords);
+    settleIndustryWorkflowConversationTask(verifiedBlocked, verification);
+    return {
+      task: verifiedBlocked,
+      verification,
+      conversationTaskId: conversationTaskIdFor(verifiedBlocked),
+      archivedFilePaths: [],
+    };
   }
 
   let updated = updateWorkTakeoverTask(input.userId, existing.id, {
@@ -1235,6 +1431,7 @@ export function recordIndustryWorkflowExecution(input: RecordIndustryWorkflowInp
         status: 'verifying',
         source: input.source || 'industry_client',
         resultDigest: sha256(resultText),
+        submissionDigest,
         fileDigests: filePaths.map(filePath => ({ path: filePath, digest: sha256(`${filePath}:${fs.statSync(filePath).size}`) })),
         at: new Date().toISOString(),
       },
