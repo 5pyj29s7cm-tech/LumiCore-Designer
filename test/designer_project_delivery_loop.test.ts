@@ -140,6 +140,69 @@ describe('designer project delivery loop', () => {
     expect(getActiveInteriorProject(scopeId, other)).toBeNull();
   });
 
+  it('requires explicit standalone mode and never advances the active project from an independent stage task', () => {
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const userId = `design_standalone_continuity_${suffix}`;
+    const scopeId = personalInteriorProjectScope(userId);
+    const project = createInteriorProject(scopeId, userId, { name: 'Protected continuity project' });
+    setActiveInteriorProject(scopeId, userId, project.id);
+    const scope = { userId, domain: 'personal' as const, orgId: '' };
+    const independentUserId = `${userId}_without_project`;
+
+    expect(() => startIndustryWorkflow({
+      userId: independentUserId,
+      domain: 'personal',
+      orgId: '',
+      entryId: 'cad',
+      source: 'chat',
+    })).toThrow(/requires a bound project.*explicit independent task/i);
+
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi-design-standalone-'));
+    try {
+      const standalone = startIndustryWorkflow({
+        ...scope,
+        entryId: 'cad',
+        sourceInput: 'Create an independent CAD geometry check without attaching it to the active project.',
+        source: 'designer_standalone_workspace',
+        context: { mode: 'standalone' },
+      });
+      expect(standalone.project).toBeUndefined();
+      expect(standalone.projectWorkflow).toBeUndefined();
+      expect(standalone.task.metadata.industryWorkflow.context).toMatchObject({ mode: 'standalone' });
+      expect(standalone.task.metadata.industryWorkflow.context).not.toHaveProperty('projectId');
+      expect(standalone.handoffPrompt).toMatch(/explicit standalone independent task/i);
+
+      const delivered = recordIndustryWorkflowExecution({
+        ...scope,
+        taskId: standalone.task.id,
+        resultText: stageResult('cad'),
+        filePaths: stageFile(directory, 'cad'),
+        toolRecords: stageToolRecords('cad'),
+      });
+      expect(delivered.verification.passed).toBe(true);
+      expect(delivered.task.status).toBe('delivered');
+      const protectedWorkflow = getInteriorProjectWorkflow(scopeId, project.id)!;
+      expect(protectedWorkflow.rootTaskId).toBe('');
+      expect(protectedWorkflow.activeStage).toBe('');
+      expect(Object.values(protectedWorkflow.stages).every(stage => (
+        stage.status === 'not_started'
+        && stage.taskIds.length === 0
+        && stage.receiptIds.length === 0
+      ))).toBe(true);
+      expect(getActiveInteriorProject(scopeId, userId)).toMatchObject({
+        id: project.id,
+        status: 'brief',
+      });
+      const actionTask = readDB().conversationActionTasks.find(
+        (task: any) => task.id === standalone.conversationTaskId,
+      );
+      expect(actionTask?.parentTaskId || '').not.toBe(`design_project_${project.id}`);
+      expect(JSON.parse(actionTask.context).industryWorkflow).toMatchObject({ mode: 'standalone' });
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('rebinds a reused blocked stage to the current conversation action task', () => {
     const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const userId = `design_rebind_${suffix}`;

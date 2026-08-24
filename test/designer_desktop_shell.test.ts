@@ -22,6 +22,7 @@ describe('Designer desktop shell', () => {
     const hub = read('src/components/org/DesignHub.tsx');
     expect(hub).toContain('startIndustryWorkflow');
     expect(hub).toContain('workflowTaskId');
+    expect(hub).toContain("'x-lumi-desktop-session': desktopSessionProof");
     expect(hub).toContain("initialView = 'project'");
   });
 
@@ -34,6 +35,9 @@ describe('Designer desktop shell', () => {
     expect(hub).toContain("props.entryId === 'visualization') return <VisualizationWorkspace");
     expect(hub).toContain("props.entryId === 'presentation') return <PresentationWorkspace");
     expect(hub).toContain('return <HandoffWorkspace');
+    expect(hub).toContain('VIEW_PRESENTATION');
+    expect(hub).toContain('data-design-workspace={view}');
+    expect(hub).toContain("view === 'project' ? (");
     for (const workspace of ['项目驾驶舱', '图纸校核台', '效果图制作台', '提案编排台', '交付核验台']) {
       expect(workspaceCopy).toContain(workspace);
     }

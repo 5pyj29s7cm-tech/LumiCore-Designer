@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { optionalAuth, resolveDomain } from '../middleware/auth';
 import {
   getIndustryWorkflowTask,
+  IndustryWorkflowContinuityError,
   listCurrentIndustryWorkflowContracts,
   listIndustryWorkflowTasks,
   recordIndustryWorkflowExecution,
@@ -38,14 +39,21 @@ export function mountIndustryWorkflowRoutes(router: Router) {
   router.post('/industry/workflows', optionalAuth, asyncHandler((req, res) => {
     const entryId = String(req.body?.entryId || '').trim();
     if (!entryId) return res.status(400).json({ error: 'entryId is required' });
-    const result = startIndustryWorkflow({
-      ...scope(req),
-      entryId,
-      sourceInput: String(req.body?.sourceInput || ''),
-      source: String(req.body?.source || 'industry_client'),
-      context: req.body?.context && typeof req.body.context === 'object' ? req.body.context : undefined,
-    });
-    return res.status(201).json(result);
+    try {
+      const result = startIndustryWorkflow({
+        ...scope(req),
+        entryId,
+        sourceInput: String(req.body?.sourceInput || ''),
+        source: String(req.body?.source || 'industry_client'),
+        context: req.body?.context && typeof req.body.context === 'object' ? req.body.context : undefined,
+      });
+      return res.status(201).json(result);
+    } catch (error) {
+      if (error instanceof IndustryWorkflowContinuityError) {
+        return res.status(error.statusCode).json({ error: error.message, code: 'DESIGN_PROJECT_CONTINUITY_REQUIRED' });
+      }
+      throw error;
+    }
   }));
 
   router.post('/industry/workflows/:taskId/verify', optionalAuth, asyncHandler((req, res) => {

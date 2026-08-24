@@ -66,7 +66,9 @@ describe('finalized output paths', () => {
     expect(rest).toContain('const restIndustryToolPolicy = industryWorkflowTask');
     expect(rest).toContain('const restModelToolPolicy = restrictToolPolicyForExecutionBoundary(');
     expect(rest).toContain('buildModelCapabilityPolicy(restExecutionDecision)');
-    expect(rest).toContain("'remote_restricted'");
+    expect(rest).toContain('buildHttpToolSecurityContext(req)');
+    expect(rest).toContain('desktopProofPresented && !httpToolSecurityContext.localExecution');
+    expect(rest).toContain('httpToolSecurityContext.executionBoundary');
     expect(rest).toContain('toolPolicy: restModelToolPolicy');
     expect(rest).toContain('restModelToolPolicy.maxIterations ?? 3');
     expect(rest).toContain('source: \'rest_chat_stream\'');

@@ -11,6 +11,13 @@ vi.mock('../server/llm/adapter', () => ({
 import jwt from 'jsonwebtoken';
 import { makeApp, JWT_SECRET } from './helpers';
 import { mountChatRoutes } from '../server/routes/chat_routes';
+import { issueDesktopSessionProof } from '../server/config/desktop_bootstrap';
+import { buildHttpToolSecurityContext } from '../server/runtime/http_execution_boundary';
+import {
+  getIndustryWorkflowTask,
+  recordIndustryWorkflowExecution,
+  startIndustryWorkflow,
+} from '../server/industry/workflow_service';
 
 let baseUrl = '';
 let cleanup: (() => void) | undefined;
@@ -86,5 +93,140 @@ describe('REST chat remote execution boundary', () => {
       'run_command',
       'credential_get',
     ]));
+  });
+
+  it('fails closed for an invalid proof and never trusts a valid proof from a non-loopback peer', async () => {
+    const invalidResponse = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userToken}`,
+        'x-lumi-desktop-session': 'invalid-native-proof-that-is-long-enough-to-be-presented',
+      },
+      body: JSON.stringify({ message: 'hello' }),
+    });
+    expect(invalidResponse.status).toBe(403);
+    expect(await invalidResponse.json()).toMatchObject({ code: 'DESKTOP_SESSION_PROOF_REQUIRED' });
+    expect(mocks.runWithTools).not.toHaveBeenCalled();
+
+    const validProof = issueDesktopSessionProof('remote-chat-user').proof;
+    expect(buildHttpToolSecurityContext({
+      user: { uid: 'remote-chat-user', username: 'remote', role: 'user' },
+      headers: { 'x-lumi-desktop-session': validProof },
+      socket: { remoteAddress: '192.0.2.10' },
+    } as any)).toMatchObject({
+      authenticated: true,
+      desktopProofPresented: true,
+      localExecution: false,
+      executionBoundary: 'remote_restricted',
+    });
+  });
+
+  it('accepts the native desktop proof as trusted local and persists the bound industry receipt', async () => {
+    const sourceInput = 'Review the project scope, fixed conditions, evidence gaps, design direction, room relationships, professional boundaries, risks, and next implementation actions.';
+    const started = startIndustryWorkflow({
+      userId: 'remote-chat-user',
+      domain: 'personal',
+      orgId: '',
+      entryId: 'project',
+      sourceInput,
+      source: 'designer_standalone_workspace',
+      context: { mode: 'standalone' },
+    });
+    const receiptText = [
+      'Concept layout risk implementation brief reviewed and archived.',
+      'The project scope, fixed conditions, evidence gaps, design direction, room relationships,',
+      'professional review boundaries, and next implementation actions are recorded for accountable review.',
+    ].join(' ');
+    const requiredReceipts = [
+      'mcp_design-studio-pack_interior_project_brief',
+      'mcp_design-studio-pack_space_planning_checklist',
+    ].map((name, index) => ({
+      id: `native-design-receipt-${index}`,
+      name,
+      arguments: {},
+      result: JSON.stringify({ ok: true, status: 'verified', summary: receiptText }),
+      terminalVerification: {
+        status: 'verified' as const,
+        strategy: 'terminal_receipt' as const,
+        reason: 'Verified native desktop industry receipt.',
+      },
+    }));
+    const toolCalls = [
+      ...requiredReceipts,
+      {
+        id: 'native-design-completion',
+        name: 'industry_workflow_complete',
+        arguments: { taskId: started.task.id },
+        result: JSON.stringify({
+          ok: true,
+          status: 'verified',
+          persisted: true,
+          task: { id: started.task.id },
+          verification: { passed: true },
+        }),
+        terminalVerification: {
+          status: 'verified' as const,
+          strategy: 'terminal_receipt' as const,
+          reason: 'Canonical industry workflow completion receipt.',
+        },
+      },
+    ];
+    mocks.runWithTools.mockImplementationOnce(async () => {
+      const canonicalReceipt = recordIndustryWorkflowExecution({
+        userId: 'remote-chat-user',
+        domain: 'personal',
+        orgId: '',
+        taskId: started.task.id,
+        resultText: receiptText,
+        toolRecords: requiredReceipts,
+        source: 'native_desktop_tool_loop',
+      });
+      expect(canonicalReceipt.verification.passed).toBe(true);
+      return {
+        text: receiptText,
+        toolCalls,
+        usageRecords: [],
+      };
+    });
+    const desktopProof = issueDesktopSessionProof('remote-chat-user').proof;
+
+    const response = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userToken}`,
+        'x-lumi-desktop-session': desktopProof,
+      },
+      body: JSON.stringify({
+        industryWorkflowTaskId: started.task.id,
+        industryWorkflowSourceInput: sourceInput,
+        messages: [{ role: 'user', content: `${started.handoffPrompt}\n\nComplete this independent design brief.` }],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const payload = await response.json();
+    expect(mocks.runWithTools).toHaveBeenCalledTimes(1);
+    const context = mocks.runWithTools.mock.calls[0][11] as any;
+    expect(context).toMatchObject({
+      userId: 'remote-chat-user',
+      authenticated: true,
+      authRole: 'user',
+      localExecution: true,
+      executionBoundary: 'trusted_local',
+      source: 'rest_chat',
+      industryWorkflowTaskId: started.task.id,
+    });
+    expect(payload.industryWorkflow, JSON.stringify(payload.industryWorkflow?.verification)).toMatchObject({
+      taskId: started.task.id,
+      status: 'delivered',
+      verification: { passed: true },
+    });
+    expect(getIndustryWorkflowTask({
+      userId: 'remote-chat-user',
+      domain: 'personal',
+      orgId: '',
+    }, started.task.id)).toMatchObject({ status: 'delivered' });
   });
 });

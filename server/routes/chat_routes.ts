@@ -24,6 +24,7 @@ import type { ToolExecutionRecord } from "../tools/types";
 import {
   getIndustryWorkflowTask,
   getIndustryWorkflowPrerequisiteStatus,
+  IndustryWorkflowContinuityError,
   listIndustryWorkflowTasks,
   recordIndustryWorkflowExecution,
   startIndustryWorkflow,
@@ -42,6 +43,7 @@ import {
   mergeIndustryWorkflowFinalState,
 } from '../industry/user_facing';
 import { bindIndustryWorkflowToolPolicy } from '../industry/execution_policy';
+import { buildHttpToolSecurityContext } from '../runtime/http_execution_boundary';
 
 export { bindIndustryWorkflowToolPolicy } from '../industry/execution_policy';
 import { restrictToolPolicyForExecutionBoundary } from "../tools/remote_policy";
@@ -323,6 +325,16 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
     const requestScope = req.user ? resolveDomain(req.user) : { domain: 'personal' as const, orgId: '' };
     const domain = requestScope.domain;
     const orgId = requestScope.orgId;
+    const {
+      desktopProofPresented,
+      ...httpToolSecurityContext
+    } = buildHttpToolSecurityContext(req);
+    if (desktopProofPresented && !httpToolSecurityContext.localExecution) {
+      return res.status(403).json({
+        error: 'Native desktop session proof expired or is invalid',
+        code: 'DESKTOP_SESSION_PROOF_REQUIRED',
+      });
+    }
     const routeText = buildRestChatRouteText(messages, prompt);
     const restTurnDispatch = buildLumiTurnDispatch({
       userId,
@@ -343,15 +355,25 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
       return res.status(404).json({ error: 'Industry workflow task not found in the current user scope.' });
     }
     if (!industryWorkflowTask && restTurnDispatch.flow.industryWorkflowEntryId) {
-      industryWorkflowTask = startIndustryWorkflow({
-        userId,
-        domain,
-        orgId,
-        entryId: restTurnDispatch.flow.industryWorkflowEntryId,
-        sourceInput: routeText,
-        source: 'rest_chat',
-        context: { source: 'rest_chat', autoBound: true },
-      }).task;
+      try {
+        industryWorkflowTask = startIndustryWorkflow({
+          userId,
+          domain,
+          orgId,
+          entryId: restTurnDispatch.flow.industryWorkflowEntryId,
+          sourceInput: routeText,
+          source: 'rest_chat',
+          context: { source: 'rest_chat', autoBound: true },
+        }).task;
+      } catch (error) {
+        if (error instanceof IndustryWorkflowContinuityError) {
+          return res.status(error.statusCode).json({
+            error: error.message,
+            code: 'DESIGN_PROJECT_CONTINUITY_REQUIRED',
+          });
+        }
+        throw error;
+      }
     }
     const industryWorkflow = industryWorkflowTask?.metadata?.industryWorkflow || {};
     const industryWorkflowRequiredToolReceipts = Array.isArray(industryWorkflow?.contract?.requiredToolReceipts)
@@ -418,7 +440,7 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
       : buildModelCapabilityPolicy(restExecutionDecision);
     const restModelToolPolicy = restrictToolPolicyForExecutionBoundary(
       restIndustryToolPolicy,
-      'remote_restricted',
+      httpToolSecurityContext.executionBoundary,
     );
     const deferRestStream =
       Boolean(industryWorkflowTask)
@@ -429,11 +451,7 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
       });
     const toolContext = {
       userId,
-      authenticated: Boolean(req.user),
-      authRole: req.user?.role,
-      orgRole: req.user?.orgRole,
-      localExecution: false,
-      executionBoundary: 'remote_restricted' as const,
+      ...httpToolSecurityContext,
       domain,
       orgId,
       llmGetters: llm,

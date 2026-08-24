@@ -235,7 +235,9 @@ describe('model-owned main chat architecture', () => {
 
     expect(rest).toContain('const restModelToolPolicy = restrictToolPolicyForExecutionBoundary(');
     expect(rest).toContain('buildModelCapabilityPolicy(restExecutionDecision)');
-    expect(rest).toContain("'remote_restricted'");
+    expect(rest).toContain('buildHttpToolSecurityContext(req)');
+    expect(rest).toContain('desktopProofPresented && !httpToolSecurityContext.localExecution');
+    expect(rest).toContain('httpToolSecurityContext.executionBoundary');
     expect(rest).toContain('toolPolicy: restModelToolPolicy');
     expect(rest).toContain('isSanctuary: !req.user');
 

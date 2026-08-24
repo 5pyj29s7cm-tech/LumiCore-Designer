@@ -163,6 +163,37 @@ function designProjectScope(scope: IndustryWorkflowScope): string {
   return scope.domain === 'work' ? String(scope.orgId || '') : personalInteriorProjectScope(scope.userId);
 }
 
+const PROJECT_CONTINUITY_STAGE_IDS = new Set<InteriorDesignStageId>([
+  'cad',
+  'visualization',
+  'presentation',
+  'handoff',
+]);
+
+type DesignWorkflowMode = '' | 'project' | 'standalone';
+
+export class IndustryWorkflowContinuityError extends Error {
+  readonly statusCode = 409;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'IndustryWorkflowContinuityError';
+  }
+}
+
+function designWorkflowMode(
+  input: StartIndustryWorkflowInput,
+  contract: IndustryWorkflowContract,
+): DesignWorkflowMode {
+  if (contract.productLine !== 'design') return '';
+  const rawMode = compact(input.context?.mode, 40).toLowerCase();
+  if (!rawMode) return '';
+  if (rawMode !== 'project' && rawMode !== 'standalone') {
+    throw new IndustryWorkflowContinuityError('Design workflow mode must be either project or standalone.');
+  }
+  return rawMode;
+}
+
 function designProjectForInput(
   input: StartIndustryWorkflowInput,
   contract: IndustryWorkflowContract,
@@ -170,13 +201,33 @@ function designProjectForInput(
   if (contract.productLine !== 'design') return null;
   const scopeId = designProjectScope(input);
   if (!scopeId) throw new Error('Organization scope is required for organization design projects.');
+  const mode = designWorkflowMode(input, contract);
   const requestedProjectId = compact(input.context?.projectId, 200);
+  if (mode === 'standalone') {
+    if (requestedProjectId) {
+      throw new IndustryWorkflowContinuityError('A standalone design task cannot also bind a project.');
+    }
+    return null;
+  }
   if (requestedProjectId) {
     const requested = getInteriorProject(scopeId, requestedProjectId);
     if (!requested) throw new Error('The requested design project was not found in the active user scope.');
     return requested;
   }
-  return getActiveInteriorProject(scopeId, input.userId);
+  const activeProject = getActiveInteriorProject(scopeId, input.userId);
+  if (!activeProject && mode === 'project') {
+    throw new IndustryWorkflowContinuityError('Project mode requires an active or explicitly selected design project.');
+  }
+  if (
+    !activeProject
+    && isInteriorDesignStageId(contract.entryId)
+    && PROJECT_CONTINUITY_STAGE_IDS.has(contract.entryId)
+  ) {
+    throw new IndustryWorkflowContinuityError(
+      `Design stage ${contract.entryId} requires a bound project. Set context.mode to standalone only for an explicit independent task; standalone work never advances a project stage.`,
+    );
+  }
+  return activeProject;
 }
 
 function designProjectBinding(task: WorkTakeoverTask): {
@@ -231,6 +282,13 @@ function buildTaskSummary(contract: IndustryWorkflowContract, sourceInput: strin
 
 function buildHandoffPrompt(task: WorkTakeoverTask, contract: IndustryWorkflowContract): string {
   const binding = designProjectBinding(task);
+  const metadata = workflowMetadata(task);
+  const metadataContext = metadata.context && typeof metadata.context === 'object' && !Array.isArray(metadata.context)
+    ? metadata.context
+    : {};
+  const standaloneContext = contract.productLine === 'design' && metadataContext.mode === 'standalone'
+    ? 'Execution mode: explicit standalone independent task. Do not read, bind, mutate, or advance any active design project or project-stage ledger.'
+    : '';
   const projectWorkflow = binding
     ? getInteriorProjectWorkflow(binding.scopeId, binding.projectId)
     : null;
@@ -261,6 +319,7 @@ function buildHandoffPrompt(task: WorkTakeoverTask, contract: IndustryWorkflowCo
       ? `Completion requires verified current-loop receipts from every one of these tools: ${contract.requiredToolReceipts.join(', ')}.`
       : '',
     'Preserve user-provided dimensions, paths, quantities, constraints, and unknown fields exactly. Do not translate, reformat, infer, or replace missing values with zero.',
+    standaloneContext,
     'Never call a file-reading tool without an exact bound source-asset path. If no path is bound, use the structured source facts or report the missing asset once; do not guess paths or repeat failed reads.',
     `Required local artifact labels: ${contract.requiredArtifactLabels.join(', ')}.`,
     `Required evidence terms: ${contract.expectedContentTerms.join(', ')}.`,
@@ -752,16 +811,25 @@ export function listCurrentIndustryWorkflowContracts(): IndustryWorkflowContract
 export function startIndustryWorkflow(input: StartIndustryWorkflowInput): IndustryWorkflowStartResult {
   const contract = contractForCurrentProduct(input.entryId);
   const sourceInput = compact(input.sourceInput, 12_000);
+  const requestedDesignMode = designWorkflowMode(input, contract);
   const designProject = designProjectForInput(input, contract);
   const resolvedContext = designProject
-    ? { ...(input.context || {}), projectId: designProject.id, projectName: designProject.name }
-    : (input.context || {});
+    ? { ...(input.context || {}), mode: 'project', projectId: designProject.id, projectName: designProject.name }
+    : requestedDesignMode === 'standalone'
+      ? { ...(input.context || {}), mode: 'standalone' }
+      : (input.context || {});
   const idempotencyKey = compact(input.idempotencyKey, 300);
   if (idempotencyKey) {
     const existing = listIndustryWorkflowTasks(input, 200).find(task => (
       workflowMetadata(task).idempotencyKey === idempotencyKey
       && workflowMetadata(task).entryId === contract.entryId
-      && (!designProject || compact(workflowMetadata(task).context?.projectId, 200) === designProject.id)
+      && (designProject
+        ? compact(workflowMetadata(task).context?.projectId, 200) === designProject.id
+        : requestedDesignMode === 'standalone'
+          ? workflowMetadata(task).context?.mode === 'standalone'
+            && !compact(workflowMetadata(task).context?.projectId, 200)
+          : !compact(workflowMetadata(task).context?.projectId, 200)
+            && workflowMetadata(task).context?.mode !== 'standalone')
     ));
     if (existing) {
       const correlation = correlationFor(existing);
@@ -941,6 +1009,7 @@ export function startIndustryWorkflow(input: StartIndustryWorkflowInput): Indust
     productLine: contract.productLine,
     entryId: contract.entryId,
     inputDigest: sha256(sourceInput),
+    ...(requestedDesignMode === 'standalone' ? { mode: 'standalone' } : {}),
     ...(designProject ? { projectId: designProject.id, projectName: designProject.name } : {}),
   };
   if (existingConversationTaskId) {

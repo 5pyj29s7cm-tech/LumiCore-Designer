@@ -29,6 +29,7 @@ import { InteriorProjectPanel } from './InteriorProjectPanel';
 import { InteriorProjectAssets } from './InteriorProjectAssets';
 import { startIndustryWorkflow } from '../../lib/industryWorkflowClient';
 import { useApp } from '../../contexts/AppContext';
+import { getDesktopSessionProof } from '../../services/authService';
 
 export type DesignView =
   | 'project'
@@ -54,6 +55,56 @@ interface ToolConfig {
   chips: string[];
   icon: React.ReactNode;
 }
+
+const VIEW_PRESENTATION: Record<DesignView, {
+  shell: string;
+  sidebar: string;
+  canvas: string;
+  brand: string;
+  activeNav: string;
+  context: string;
+}> = {
+  project: {
+    shell: 'bg-[#071116]',
+    sidebar: 'bg-[linear-gradient(180deg,rgba(8,47,73,0.34),rgba(0,0,0,0.24))]',
+    canvas: 'bg-[radial-gradient(circle_at_18%_0%,rgba(34,211,238,0.08),transparent_36%),rgba(0,0,0,0.10)]',
+    brand: 'border-cyan-300/20 bg-cyan-400/12 text-cyan-100',
+    activeNav: 'border-cyan-300/25 bg-cyan-400/12 text-cyan-50 shadow-[0_12px_30px_rgba(8,145,178,0.08)]',
+    context: 'border-cyan-300/14 bg-cyan-400/[0.055]',
+  },
+  cad: {
+    shell: 'bg-[#12100a]',
+    sidebar: 'bg-[linear-gradient(180deg,rgba(120,53,15,0.24),rgba(0,0,0,0.26))]',
+    canvas: 'bg-[linear-gradient(rgba(251,191,36,0.025)_1px,transparent_1px),linear-gradient(90deg,rgba(251,191,36,0.025)_1px,transparent_1px),rgba(0,0,0,0.10)] bg-[size:28px_28px]',
+    brand: 'border-amber-300/20 bg-amber-400/12 text-amber-100',
+    activeNav: 'border-amber-300/25 bg-amber-400/12 text-amber-50 shadow-[0_12px_30px_rgba(217,119,6,0.08)]',
+    context: 'border-amber-300/14 bg-amber-400/[0.055]',
+  },
+  visualization: {
+    shell: 'bg-[#110a15]',
+    sidebar: 'bg-[linear-gradient(180deg,rgba(112,26,117,0.24),rgba(0,0,0,0.28))]',
+    canvas: 'bg-[radial-gradient(circle_at_72%_8%,rgba(217,70,239,0.12),transparent_34%),radial-gradient(circle_at_20%_45%,rgba(124,58,237,0.07),transparent_30%),rgba(0,0,0,0.08)]',
+    brand: 'border-fuchsia-300/20 bg-fuchsia-400/12 text-fuchsia-100',
+    activeNav: 'border-fuchsia-300/25 bg-fuchsia-400/12 text-fuchsia-50 shadow-[0_12px_30px_rgba(192,38,211,0.09)]',
+    context: 'border-fuchsia-300/14 bg-fuchsia-400/[0.055]',
+  },
+  presentation: {
+    shell: 'bg-[#0a101a]',
+    sidebar: 'bg-[linear-gradient(180deg,rgba(30,64,175,0.22),rgba(0,0,0,0.27))]',
+    canvas: 'bg-[radial-gradient(circle_at_50%_-10%,rgba(59,130,246,0.13),transparent_34%),rgba(0,0,0,0.08)]',
+    brand: 'border-blue-300/20 bg-blue-400/12 text-blue-100',
+    activeNav: 'border-blue-300/25 bg-blue-400/12 text-blue-50 shadow-[0_12px_30px_rgba(37,99,235,0.09)]',
+    context: 'border-blue-300/14 bg-blue-400/[0.055]',
+  },
+  handoff: {
+    shell: 'bg-[#07120f]',
+    sidebar: 'bg-[linear-gradient(180deg,rgba(6,95,70,0.24),rgba(0,0,0,0.28))]',
+    canvas: 'bg-[radial-gradient(circle_at_82%_0%,rgba(16,185,129,0.11),transparent_34%),rgba(0,0,0,0.08)]',
+    brand: 'border-emerald-300/20 bg-emerald-400/12 text-emerald-100',
+    activeNav: 'border-emerald-300/25 bg-emerald-400/12 text-emerald-50 shadow-[0_12px_30px_rgba(5,150,105,0.09)]',
+    context: 'border-emerald-300/14 bg-emerald-400/[0.055]',
+  },
+};
 
 function parseSseEvent(block: string): Record<string, unknown> | null {
   const data = block
@@ -182,13 +233,14 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
     desc: tools[id].desc,
     icon: tools[id].icon,
   }));
+  const presentation = VIEW_PRESENTATION[view];
 
   return (
-    <div className="flex h-full min-h-0">
-      <aside className="flex w-64 shrink-0 flex-col border-r border-white/[0.08] bg-black/20">
+    <div className={`flex h-full min-h-0 transition-colors duration-300 ${presentation.shell}`} data-design-workspace={view}>
+      <aside className={`flex w-64 shrink-0 flex-col border-r border-white/[0.08] ${presentation.sidebar}`}>
         <div className="border-b border-white/[0.08] p-4">
           <h3 className="flex items-center gap-2 text-sm font-black uppercase tracking-[0.12em] text-white/85">
-            <span className="flex h-8 w-8 items-center justify-center rounded-xl border border-cyan-300/15 bg-cyan-400/10 text-cyan-200">
+            <span className={`flex h-8 w-8 items-center justify-center rounded-xl border ${presentation.brand}`}>
               <Layout size={16} />
             </span>
             <span className="min-w-0 truncate">{m('workspaceTitle')}</span>
@@ -205,7 +257,7 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
               onClick={() => setView(item.id)}
               className={`flex w-full items-start gap-2 rounded-xl border px-3 py-2.5 text-left transition-colors ${
                 view === item.id
-                  ? 'border-cyan-400/20 bg-cyan-500/10 text-cyan-100'
+                  ? presentation.activeNav
                   : 'border-transparent text-white/50 hover:border-white/[0.08] hover:bg-white/[0.05] hover:text-white/80'
               }`}
             >
@@ -232,15 +284,32 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
           ))}
         </nav>
       </aside>
-      <main className="custom-scrollbar min-w-0 flex-1 overflow-y-auto bg-black/10">
-        <InteriorProjectPanel
-          domain={workDomain}
-          locale={locale}
-          onProjectChange={project => {
-            setActiveProject(project);
-            setProjectAssets([]);
-          }}
-        />
+      <main className={`custom-scrollbar min-w-0 flex-1 overflow-y-auto ${presentation.canvas}`}>
+        {view === 'project' ? (
+          <InteriorProjectPanel
+            domain={workDomain}
+            locale={locale}
+            onProjectChange={project => {
+              setActiveProject(project);
+              setProjectAssets([]);
+            }}
+          />
+        ) : (
+          <section className={`flex flex-wrap items-center justify-between gap-3 border-b px-6 py-3 ${presentation.context}`}>
+            <div className="min-w-0">
+              <p className="text-[10px] font-black uppercase tracking-[0.16em] text-white/35">{designerWorkspaceText(locale, 'Project cockpit')}</p>
+              <p className="mt-1 truncate text-sm font-black text-white/75">{activeProject?.name || designerWorkspaceText(locale, 'No project bound')}</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="rounded-full border border-white/[0.08] bg-black/15 px-3 py-1.5 text-[11px] font-bold text-white/45">
+                {activeProject ? `${projectAssets.length} ${designerWorkspaceText(locale, 'files')}` : designerWorkspaceText(locale, 'Standalone')}
+              </span>
+              <button type="button" onClick={() => setView('project')} className="rounded-xl border border-white/10 bg-white/[0.06] px-3 py-2 text-xs font-black text-white/65 transition-colors hover:bg-white/10 hover:text-white">
+                {m('designProjectTitle')}
+              </button>
+            </div>
+          </section>
+        )}
         {activeProject && view === 'project' && (
           <InteriorProjectAssets key={`${workDomain}:${activeProject.id}`} domain={workDomain} project={activeProject} locale={locale} onAssetsChange={setProjectAssets} />
         )}
@@ -304,9 +373,13 @@ function useDesignChat(locale: InteriorDesignLocale, onWorkflowChange?: () => vo
       setWorkflowTaskId(started.task.id);
       setWorkflowStatus('in_progress');
       await onWorkflowChange?.();
+      const desktopSessionProof = getDesktopSessionProof();
       const res = await fetch('/api/chat?stream=true', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(desktopSessionProof ? { 'x-lumi-desktop-session': desktopSessionProof } : {}),
+        },
         credentials: 'include',
         signal: controller.signal,
         body: JSON.stringify({

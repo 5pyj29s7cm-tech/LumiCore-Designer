@@ -192,6 +192,7 @@ describe('industry workflow contracts', () => {
       orgId: '',
       entryId,
       sourceInput: 'Create a reviewable delivery with sources, period, risks, and approval notes.',
+      ...(PRODUCT_VARIANT.productLine === 'design' ? { context: { mode: 'standalone' } } : {}),
     });
 
     const missing = recordIndustryWorkflowExecution({
