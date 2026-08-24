@@ -19,6 +19,7 @@ export type HttpToolSecurityContext = Pick<
 export function buildHttpToolSecurityContext(req: Request): HttpToolSecurityContext {
   const userId = String(req.user?.uid || '').trim();
   const header = req.headers[DESKTOP_SESSION_HEADER];
+  const desktopProofPresented = Object.prototype.hasOwnProperty.call(req.headers, DESKTOP_SESSION_HEADER);
   const presentedProof = Array.isArray(header) ? String(header[0] || '').trim() : String(header || '').trim();
   const authenticated = Boolean(userId);
   const localExecution = authenticated
@@ -31,6 +32,6 @@ export function buildHttpToolSecurityContext(req: Request): HttpToolSecurityCont
     orgRole: req.user?.orgRole || undefined,
     localExecution,
     executionBoundary: localExecution ? 'trusted_local' : 'remote_restricted',
-    desktopProofPresented: Boolean(presentedProof),
+    desktopProofPresented,
   };
 }

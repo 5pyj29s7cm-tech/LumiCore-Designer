@@ -109,6 +109,19 @@ describe('REST chat remote execution boundary', () => {
     expect(await invalidResponse.json()).toMatchObject({ code: 'DESKTOP_SESSION_PROOF_REQUIRED' });
     expect(mocks.runWithTools).not.toHaveBeenCalled();
 
+    const emptyResponse = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userToken}`,
+        'x-lumi-desktop-session': '',
+      },
+      body: JSON.stringify({ message: 'hello' }),
+    });
+    expect(emptyResponse.status).toBe(403);
+    expect(await emptyResponse.json()).toMatchObject({ code: 'DESKTOP_SESSION_PROOF_REQUIRED' });
+    expect(mocks.runWithTools).not.toHaveBeenCalled();
+
     const validProof = issueDesktopSessionProof('remote-chat-user').proof;
     expect(buildHttpToolSecurityContext({
       user: { uid: 'remote-chat-user', username: 'remote', role: 'user' },
