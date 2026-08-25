@@ -501,9 +501,20 @@ describe('client self tools', () => {
     expect(summary).toMatchObject({ detail: 'summary', inventoryTool: 'client_capability_manifest' });
     expect(summary).not.toHaveProperty('capabilities');
     expect(summary).not.toHaveProperty('interfaceSurfaces');
+    expect(summary.industryCapabilityProfile).toMatchObject({
+      variantId: 'designer-client',
+      productLine: 'design',
+      entries: expect.any(Array),
+    });
+    expect(summary.industryCapabilityProfile).not.toHaveProperty('automaticActions');
+    expect(summary.industryCapabilityProfile).not.toHaveProperty('reviewRequiredActions');
+    expect(summary.industryCapabilityProfile.entries.every((entry: Record<string, unknown>) => (
+      Object.keys(entry).every(key => ['entryId', 'displayName', 'automationLevel'].includes(key))
+    ))).toBe(true);
     expect(full.detail).toBe('full');
     expect(Array.isArray(full.capabilities)).toBe(true);
     expect(Array.isArray(full.interfaceSurfaces)).toBe(true);
+    expect(full.industryCapabilityProfile.entries[0]).toHaveProperty('contract');
     expect(summaryRaw.length).toBeLessThan(fullRaw.length);
   });
 
