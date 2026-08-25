@@ -11,7 +11,10 @@ vi.mock('../server/llm/adapter', () => ({
 import jwt from 'jsonwebtoken';
 import { makeApp, JWT_SECRET } from './helpers';
 import { mountChatRoutes } from '../server/routes/chat_routes';
-import { issueDesktopSessionProof } from '../server/config/desktop_bootstrap';
+import {
+  DESKTOP_SESSION_HEADER,
+  issueDesktopSessionProof,
+} from '../server/config/desktop_bootstrap';
 import { buildHttpToolSecurityContext } from '../server/runtime/http_execution_boundary';
 import {
   getIndustryWorkflowTask,
@@ -70,7 +73,7 @@ describe('REST chat remote execution boundary', () => {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${userToken}`,
       },
-      body: JSON.stringify({ message: 'read a local file and inspect running processes' }),
+      body: JSON.stringify({ message: '读取 D:\\work\\brief.txt 并告诉我唯一风险，但不要修改文件' }),
     });
     expect(response.status).toBe(200);
     expect(mocks.runWithTools).toHaveBeenCalledTimes(1);
@@ -101,7 +104,7 @@ describe('REST chat remote execution boundary', () => {
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${userToken}`,
-        'x-lumi-desktop-session': 'invalid-native-proof-that-is-long-enough-to-be-presented',
+        [DESKTOP_SESSION_HEADER]: 'invalid-native-proof-that-is-long-enough-to-be-presented',
       },
       body: JSON.stringify({ message: 'hello' }),
     });
@@ -114,7 +117,7 @@ describe('REST chat remote execution boundary', () => {
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${userToken}`,
-        'x-lumi-desktop-session': '',
+        [DESKTOP_SESSION_HEADER]: '',
       },
       body: JSON.stringify({ message: 'hello' }),
     });
@@ -125,7 +128,7 @@ describe('REST chat remote execution boundary', () => {
     const validProof = issueDesktopSessionProof('remote-chat-user').proof;
     expect(buildHttpToolSecurityContext({
       user: { uid: 'remote-chat-user', username: 'remote', role: 'user' },
-      headers: { 'x-lumi-desktop-session': validProof },
+      headers: { [DESKTOP_SESSION_HEADER]: validProof },
       socket: { remoteAddress: '192.0.2.10' },
     } as any)).toMatchObject({
       authenticated: true,
@@ -210,13 +213,12 @@ describe('REST chat remote execution boundary', () => {
       };
     });
     const desktopProof = issueDesktopSessionProof('remote-chat-user').proof;
-
     const response = await fetch(`${baseUrl}/api/chat`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${userToken}`,
-        'x-lumi-desktop-session': desktopProof,
+        [DESKTOP_SESSION_HEADER]: desktopProof,
       },
       body: JSON.stringify({
         industryWorkflowTaskId: started.task.id,
@@ -235,7 +237,7 @@ describe('REST chat remote execution boundary', () => {
       authRole: 'user',
       localExecution: true,
       executionBoundary: 'trusted_local',
-      source: 'rest_chat',
+      source: 'rest_chat_local',
       industryWorkflowTaskId: started.task.id,
     });
     expect(payload.industryWorkflow, JSON.stringify(payload.industryWorkflow?.verification)).toMatchObject({

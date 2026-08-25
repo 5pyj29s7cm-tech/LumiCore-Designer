@@ -19,6 +19,7 @@ import { buildInteractionModeOverlay } from "../cognition/turn_flow";
 import {
   buildLumiCapabilitySelection,
   buildModelCapabilityPolicy,
+  buildModelToolProjection,
 } from "../cognition/capability_selection";
 import { buildLumiExecutionPipeline } from "../cognition/execution_pipeline";
 import { isCurrentIndustryGuidanceRequest } from "../industry/user_guidance";
@@ -128,7 +129,10 @@ import {
   classifyConversationActionFollowupIntent,
   formatConversationActionTaskStatus,
 } from "../cognition/action_continuation";
-import { normalizeActionIntent } from "../cognition/normalized_action_intent";
+import {
+  isPriorTurnToolReceiptQuestion,
+  normalizeActionIntent,
+} from "../cognition/normalized_action_intent";
 import {
   coalesceToolExecutionRecords,
   confirmedStepNeedsContinuation,
@@ -777,19 +781,44 @@ export function registerChatHandler(
       return;
     }
     let selectedConversationId = selectedConversation.id;
-    let confirmationScope = buildConversationConfirmationChannelScope({
+    let confirmationChannelScope = buildConversationConfirmationChannelScope({
       source: eventSource,
       domain: resolvedDomain,
       orgId: resolvedOrgId,
       conversationId: selectedConversationId,
     });
+    let confirmationScope = buildConversationConfirmationChannelScope({
+      source: eventSource,
+      domain: resolvedDomain,
+      orgId: resolvedOrgId,
+      conversationId: selectedConversationId,
+      taskId: selectedConversation.actionContinuationState?.taskId,
+      originRequestId: selectedConversation.actionContinuationState?.activeRequestId,
+    });
     const confirmationCancellationRequested = isConfirmationCancellation(visibleUserText);
+    const explicitConfirmationReply = isExplicitConfirmationReply(visibleUserText);
+    const unrelatedToPendingConfirmation = !explicitConfirmationReply
+      && !confirmationCancellationRequested
+      && classifyConversationActionFollowupIntent(
+        visibleUserText,
+        selectedConversation.actionContinuationState,
+      ) === 'none';
     const pendingConfirmationCleared = confirmationCancellationRequested
+      || unrelatedToPendingConfirmation
       ? clearPendingConfirmation(uid, confirmationScope)
+        || clearPendingConfirmation(uid, confirmationChannelScope)
       : false;
-    pendingConfirmation = isExplicitConfirmationReply(visibleUserText)
+    pendingConfirmation = explicitConfirmationReply
       ? getPendingConfirmation(uid, confirmationScope)
+        || getPendingConfirmation(uid, confirmationChannelScope)
       : null;
+    // A fresh model-owned action has no durable task id until its first
+    // canonical receipt is persisted. If that receipt creates the task before
+    // the user's next utterance, retain the taskless channel scope solely for
+    // consuming the exact pending action created by the originating request.
+    if (pendingConfirmation && !pendingConfirmation.taskId) {
+      confirmationScope = confirmationChannelScope;
+    }
     pendingConfirmationPrompt = pendingConfirmation
       ? formatPendingConfirmationPrompt(pendingConfirmation)
       : '';
@@ -1101,8 +1130,15 @@ export function registerChatHandler(
     );
     const conversation = conversationTurn.conversation;
     if (conversation.id !== selectedConversationId) {
-      clearPendingConfirmation(uid, confirmationScope);
+      clearPendingConfirmation(uid, confirmationScope)
+        || clearPendingConfirmation(uid, confirmationChannelScope);
       selectedConversationId = conversation.id;
+      confirmationChannelScope = buildConversationConfirmationChannelScope({
+        source: eventSource,
+        domain: resolvedDomain,
+        orgId: resolvedOrgId,
+        conversationId: selectedConversationId,
+      });
       confirmationScope = buildConversationConfirmationChannelScope({
         source: eventSource,
         domain: resolvedDomain,
@@ -1198,18 +1234,28 @@ export function registerChatHandler(
         && acceptedNormalizedIntent.kind === 'status_query'
         && acceptedNormalizedIntent.target === 'previous_action'
       ) {
-        const statusText = getConversationActionStatus(
-          conversation.id,
-          uid,
-          visibleUserText,
-          conversation.actionContinuationState,
-        );
+        const priorToolReceiptQuestion = isPriorTurnToolReceiptQuestion(visibleUserText);
+        const statusText = priorToolReceiptQuestion
+          ? formatConversationExecutionFactAnswer(getConversationExecutionFacts({
+              conversationId: conversation.id,
+              userId: uid,
+              domain: resolvedDomain,
+              orgId: resolvedOrgId,
+              currentRequestId: requestId,
+            }), visibleUserText)
+          : getConversationActionStatus(
+              conversation.id,
+              uid,
+              visibleUserText,
+              conversation.actionContinuationState,
+            );
+        const responseIntent = priorToolReceiptQuestion ? 'execution_facts' : 'task_status';
         const committed = emitAgent('agent:response', {
           text: statusText,
           agentName: 'Lumi',
           finalized: true,
           blocked: false,
-          reason: 'task_status',
+          reason: responseIntent,
         });
         if (committed) {
           addMessageIdempotent({
@@ -1220,16 +1266,16 @@ export function registerChatHandler(
             content: statusText,
             domain: resolvedDomain,
             orgId: resolvedOrgId,
-            source: 'chat_task_status',
+            source: priorToolReceiptQuestion ? 'chat_conversation_execution_facts' : 'chat_task_status',
             channel: 'chat',
-            cognitiveIntent: 'task_status',
+            cognitiveIntent: responseIntent,
             llmWasCalled: false,
             requestId,
           });
           emitConversationUpdated({
             conversationId: conversation.id,
             agentId: conversationAgentId,
-            source: 'chat_task_status',
+            source: priorToolReceiptQuestion ? 'chat_conversation_execution_facts' : 'chat_task_status',
             rolledOver: conversationTurn.rolledOver,
             previousConversationId: conversationTurn.previousConversationId,
           });
@@ -1662,6 +1708,7 @@ export function registerChatHandler(
           userId: uid,
           domain: resolvedDomain,
           orgId: resolvedOrgId,
+          currentRequestId: requestId,
         }), visibleUserText)
         : '';
       const exactCorrectionText = conversationId
@@ -1765,6 +1812,7 @@ export function registerChatHandler(
 
       let pendingConfirmationCreatedThisTurn: ReturnType<typeof recordPendingConfirmation> | null = null;
       const requestToolConfirmation = async (toolName: string, args: Record<string, any>): Promise<boolean> => {
+        if (pendingConfirmationCreatedThisTurn) return false;
         if (
           pendingConfirmation
           && consumePendingConfirmation(uid, pendingConfirmation.id, toolName, args, confirmationScope)
@@ -1773,11 +1821,31 @@ export function registerChatHandler(
           return true;
         }
         if (canAutoApproveAction(toolName, args, { actionIntent: visibleUserText })) return true;
+        // The model-owned chat lane creates fresh durable task state from the
+        // resulting canonical tool receipt. Before that receipt exists, bind
+        // the immutable confirmation to this request and conversation (plus
+        // an existing task only when this is a genuine continuation).
+        const confirmationTaskId = actionTaskExecution.state?.taskId;
+        confirmationScope = buildConversationConfirmationChannelScope({
+          source: eventSource,
+          domain: resolvedDomain,
+          orgId: resolvedOrgId,
+          conversationId: conversationId || selectedConversationId,
+          taskId: confirmationTaskId,
+          originRequestId: requestId,
+        });
+        confirmationChannelScope = buildConversationConfirmationChannelScope({
+          source: eventSource,
+          domain: resolvedDomain,
+          orgId: resolvedOrgId,
+          conversationId: conversationId || selectedConversationId,
+        });
         const pending = recordPendingConfirmation(uid, toolName, args, eventSource, {
           domain: resolvedDomain,
           orgId: resolvedOrgId,
           channelId: confirmationScope.channelId,
-          taskId: conversation?.actionContinuationState?.taskId,
+          taskId: confirmationTaskId,
+          originRequestId: requestId,
           actionIntent: visibleUserText,
         });
         pendingConfirmationCreatedThisTurn = pending;
@@ -1824,6 +1892,7 @@ export function registerChatHandler(
       // Natural-language chat does not create or freeze a new conversation task
       // before the model chooses an action. An explicit continuation may reuse
       // the existing pointer; fresh task state is derived from canonical receipts.
+      const modelToolProjection = buildModelToolProjection(executionDecision);
       const existingActionState = conversation?.actionContinuationState;
       const actionTaskExecution = existingActionState?.taskId
         && Boolean(pendingConfirmation || actionFollowupIntent === 'execute')
@@ -2143,6 +2212,7 @@ export function registerChatHandler(
             actionIntent: confirmedTask,
             routedTaskText: confirmedTask,
             toolPolicy: modelCapabilityPolicy,
+            modelToolProjection,
           },
           preflight: () => consumed
             ? { allowed: true, arguments: confirmedArgs }
@@ -2234,6 +2304,7 @@ export function registerChatHandler(
               actionIntent: confirmedTask,
               routedTaskText: confirmedTask,
               toolPolicy: modelCapabilityPolicy,
+              modelToolProjection,
               priorToolRecords: [confirmedRecord],
               desktopExecutionTracker,
             },
@@ -2695,6 +2766,7 @@ export function registerChatHandler(
                 }
               },
               toolPolicy: modelCapabilityPolicy,
+              modelToolProjection,
               actionIntent: visibleUserText,
               routedTaskText: turnFlow.routeText,
               ...(turnFlow.industryWorkflowEntryId ? {
@@ -2862,6 +2934,7 @@ export function registerChatHandler(
                 });
               },
               toolPolicy: modelCapabilityPolicy,
+              modelToolProjection,
               actionIntent: visibleUserText,
               routedTaskText: turnFlow.routeText,
               priorToolRecords,

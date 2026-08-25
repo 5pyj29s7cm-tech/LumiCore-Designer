@@ -138,7 +138,7 @@ describe('chat and voice tool-call stability', () => {
     const chatPrerequisiteEnd = socketChat.indexOf('effectiveSystemPrompt +=', chatPrerequisiteStart);
     const chatPrerequisiteGuard = socketChat.slice(chatPrerequisiteStart, chatPrerequisiteEnd);
     expect(chatPrerequisiteGuard).toContain('requestId, deferActionPreparation: true');
-    expect(voice).toContain("conversationTurn.conversation.id,\n        session.userId,\n        'blocked'");
+    expect(voice.replace(/\r\n/g, '\n')).toContain("conversationTurn.conversation.id,\n        session.userId,\n        'blocked'");
     expect(voice).toContain('voice_design_project_status');
     expect(voice).toContain('bindIndustryWorkflowToolPolicy');
   });

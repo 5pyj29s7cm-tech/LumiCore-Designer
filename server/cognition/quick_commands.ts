@@ -512,7 +512,10 @@ export function buildDeterministicClientNavigationCommand(
     matched: true,
     toolCall: {
       name: 'client_action',
-      arguments: { action: normalizedIntent.clientAction },
+      arguments: {
+        action: normalizedIntent.clientAction,
+        ...(normalizedIntent.clientActionArguments || {}),
+      },
     },
     formatToolResult: (raw, error) => {
       if (error) return '\u672a\u80fd\u6253\u5f00' + label + '\uff1a' + error; // i18n-allow: receipt-grounded client-navigation failure.

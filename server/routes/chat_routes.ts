@@ -14,7 +14,10 @@ import { buildUnifiedLegalEntryPrompt } from "../cognition/legal_entry";
 import { finalizeLumiResponse } from "../cognition/result_finalizer";
 import { buildLumiTurnDispatch } from "../cognition/turn_dispatch";
 import { buildLumiExecutionDecision } from "../cognition/execution_decision";
-import { buildModelCapabilityPolicy } from "../cognition/capability_selection";
+import {
+  buildModelCapabilityPolicy,
+  buildModelToolProjection,
+} from "../cognition/capability_selection";
 import {
   createPreFinalizationTextGate,
   shouldDeferModelOutputUntilFinalized,
@@ -442,6 +445,7 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
       restIndustryToolPolicy,
       httpToolSecurityContext.executionBoundary,
     );
+    const restModelToolProjection = buildModelToolProjection(restExecutionDecision);
     const deferRestStream =
       Boolean(industryWorkflowTask)
       || restExecutionDecision.allowToolUse
@@ -455,10 +459,11 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
       domain,
       orgId,
       llmGetters: llm,
-      source: 'rest_chat',
+      source: httpToolSecurityContext.localExecution ? 'rest_chat_local' : 'rest_chat',
       actionIntent: routeText,
       routedTaskText: restTurnDispatch.flow.routeText,
       toolPolicy: restModelToolPolicy,
+      modelToolProjection: restModelToolProjection,
       allowLocalFileWrites,
       localWriteIntentReason,
       ...(industryWorkflowTask
