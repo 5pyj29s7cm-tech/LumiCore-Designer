@@ -7,9 +7,13 @@ import iconv from 'iconv-lite';
 
 const sqlite3 = sqlite3Package.verbose();
 const apply = process.argv.includes('--apply');
+const variantMetadata = JSON.parse(
+  fs.readFileSync(new URL('../.lumi/variant.json', import.meta.url), 'utf8'),
+);
 
 function dataRoot() {
-  return process.env.LUMI_DATA_DIR || path.join(os.homedir(), 'LumiOS');
+  return process.env.LUMI_DATA_DIR
+    || path.join(os.homedir(), variantMetadata.runtime.dataDirectoryName);
 }
 
 function stamp() {

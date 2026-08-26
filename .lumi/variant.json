@@ -8,7 +8,8 @@
     "desktopTitle": "Lumi Designer",
     "appIdentifier": "com.lumiai.designer",
     "mobileAppIdentifier": "com.lumiai.designer",
-    "dataDirectoryName": "LumiOS-Designer",
+    "dataDirectoryName": "LumiCore-Designer",
+    "legacyDataDirectoryName": "LumiOS-Designer",
     "updaterChannel": "lumi-designer",
     "defaultSkills": [
       "design-studio-pack",

@@ -97,6 +97,7 @@ describe('desktop startup shell', () => {
     expect(packagedSmoke).toContain('socket.io/?EIO=4&transport=polling');
     expect(packagedSmoke).toContain("path.join(dataRoot, 'data', 'lumi.db')");
     expect(packagedSmoke).toContain('Packaged runtime wrote into its resource directory');
+    expect(packagedSmoke).toContain("waitFor('packaged database startup persistence', 15_000, 250");
   });
 
   it('filters release artifacts by the current version and embeds runtime identity', () => {
@@ -122,10 +123,18 @@ describe('desktop startup shell', () => {
     expect(releaseCheck).toContain('artifact.updater-signature');
     expect(releaseCheck).toContain('LUMI_RELEASE_TAURI_CONFIG');
     const publicCi = fs.readFileSync(path.join(process.cwd(), '.github/workflows/ci.yml'), 'utf8');
+    const variant = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.lumi/variant.json'), 'utf8')) as {
+      repository: string;
+    };
+    const repositorySlug = new URL(variant.repository).pathname
+      .replace(/^\//, '')
+      .replace(/\.git$/, '');
     const releaseGuide = fs.readFileSync(path.join(process.cwd(), 'COMMERCIAL_RELEASE.md'), 'utf8');
     expect(publicCi).toContain('Run complete Vitest suite');
     expect(publicCi).toContain('Build desktop and mobile frontends');
-    expect(publicCi.match(/github\.repository == '5pyj29s7cm-tech\/LumiOS'/g)).toHaveLength(2);
+    expect(publicCi.match(new RegExp(`github\\.repository == '${repositorySlug}'`, 'g'))).toHaveLength(2);
+    expect(publicCi).not.toContain('5pyj29s7cm-tech/LumiCore');
+    expect(publicCi).not.toContain('5pyj29s7cm-tech/LumiOS');
     expect(publicCi).not.toContain('github.repository_owner');
     expect(releaseGuide).toContain('Source availability and signed binary distribution are separate release decisions.');
     expect(releaseGuide).toContain('npm run release:check -- --strict-publish');

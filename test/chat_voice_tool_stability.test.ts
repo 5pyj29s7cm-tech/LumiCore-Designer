@@ -138,7 +138,13 @@ describe('chat and voice tool-call stability', () => {
     const chatPrerequisiteEnd = socketChat.indexOf('effectiveSystemPrompt +=', chatPrerequisiteStart);
     const chatPrerequisiteGuard = socketChat.slice(chatPrerequisiteStart, chatPrerequisiteEnd);
     expect(chatPrerequisiteGuard).toContain('requestId, deferActionPreparation: true');
-    expect(voice.replace(/\r\n/g, '\n')).toContain("conversationTurn.conversation.id,\n        session.userId,\n        'blocked'");
+    const voicePrerequisiteStart = voice.indexOf('if (voiceIndustryWorkflowTask && voiceIndustryPrerequisite)');
+    const voicePrerequisiteEnd = voice.indexOf('if (userObservedCompletion)', voicePrerequisiteStart);
+    const voicePrerequisiteGuard = voice.slice(voicePrerequisiteStart, voicePrerequisiteEnd);
+    expect(voicePrerequisiteGuard).toContain('await commitVoiceTerminal({');
+    expect(voicePrerequisiteGuard).toContain("source: 'voice_industry_prerequisite_guard'");
+    expect(voicePrerequisiteGuard).toContain('persistTerminalState: () => {');
+    expect(voicePrerequisiteGuard).toMatch(/setConversationActionExecutionStatus\([\s\S]*?'blocked'/);
     expect(voice).toContain('voice_design_project_status');
     expect(voice).toContain('bindIndustryWorkflowToolPolicy');
   });

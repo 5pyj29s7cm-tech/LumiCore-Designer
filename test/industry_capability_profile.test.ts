@@ -189,6 +189,7 @@ describe('industry capability profile and channel routing', () => {
     expect(second.status).toBe('reused');
     expect(second.task.id).toBe(first.task.id);
     const definition = registry.get('industry_workflow_start')!;
+    expect(definition.localIdempotencyReplay).toBe('durable_handler');
     expect(definition.parameters.properties).not.toHaveProperty('sourceInput');
     expect(definition.parameters.properties).not.toHaveProperty('context');
     const db = readDB();
