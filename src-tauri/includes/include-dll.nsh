@@ -5,6 +5,7 @@
 !macro NSIS_HOOK_PREINSTALL
 !macroend
 
+; Installs WebView2Loader.dll alongside the new EXE.
 !macro NSIS_HOOK_POSTINSTALL
   File "/oname=$INSTDIR\WebView2Loader.dll" "${LUMI_INSTALLER_HOOK_DIR}\..\..\desktop-resources\WebView2Loader.dll"
 !macroend

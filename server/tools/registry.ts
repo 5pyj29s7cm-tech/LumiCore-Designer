@@ -262,6 +262,15 @@ function externalCommitUnknownError(name: string, detail: string): Error {
   return error;
 }
 
+function localSideEffectFenceKey(name: string, context?: ToolContext): string {
+  const idempotencyKey = String(context?.idempotencyKey || '').trim();
+  if (!idempotencyKey) return '';
+  const userId = String(context?.userId || '').trim() || 'anonymous';
+  const domain = String(context?.domain || '').trim() || 'personal';
+  const orgId = String(context?.orgId || '').trim();
+  return JSON.stringify([name, userId, domain, orgId, idempotencyKey]);
+}
+
 export class ToolHandlerSettledAfterTimeoutError extends Error {
   readonly toolExecutionTimedOut = true;
   readonly handlerSettlement = 'rejected' as const;
@@ -957,15 +966,8 @@ export class ToolRegistry {
         'none',
       ].includes(effect.type));
     const idempotencyKey = externalCommit ? executionIdempotencyKey(name, args, context) : '';
-    const sideEffectScope = {
-      userId: String(context?.userId || '').trim(),
-      domain: String(context?.domain || 'personal').trim() || 'personal',
-      orgId: String(context?.domain || 'personal').trim() === 'work'
-        ? String(context?.orgId || '').trim()
-        : '',
-    };
-    const sideEffectFenceKey = !externalCommit && hasSideEffect && context?.idempotencyKey
-      ? `${JSON.stringify(sideEffectScope)}\0${name}\0${context.idempotencyKey}`
+    const sideEffectFenceKey = !externalCommit && hasSideEffect
+      ? localSideEffectFenceKey(name, context)
       : '';
     const sideEffectInputDigest = sideEffectFenceKey ? externalCommitInputDigest(name, args) : '';
     const inputDigest = externalCommit ? externalCommitInputDigest(name, args) : '';
