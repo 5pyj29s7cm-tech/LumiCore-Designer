@@ -1,10 +1,11 @@
-# LumiCore Commercial Release
+# Lumi Designer Commercial Release
 
-This repository contains the public source track for LumiCore 3.x. Source availability and signed binary distribution are separate release decisions.
+This repository contains the independent source and release track for Lumi Designer 3.x. Lumi Designer shares the LumiCore kernel, but its installer, application identity, updater channel, user-data root, and release artifacts are isolated from the main product and every other industry variant. Source availability and signed binary distribution are separate release decisions.
 
 ## Positioning
 
-- The public repository is the canonical source and community collaboration track.
+- `5pyj29s7cm-tech/lumi-designer-client` is the canonical source and delivery repository for Lumi Designer.
+- Lumi Designer installers and update artifacts must be built from this repository; a LumiCore or another variant installer is never a substitute.
 - A commit or pull request is not a signed public installer by itself.
 - Official binaries are published only after the platform-specific release gates below pass.
 
@@ -37,7 +38,7 @@ The desktop client currently has no Free / Light / Pro / Org runtime plan gate.
 
 Any future billing or managed-service entitlement system must be introduced as a separate, explicit product decision. It must not silently create a default plan or intercept local model execution.
 
-## Public Binary Checklist
+## Lumi Designer Binary Checklist
 
 Before a build is offered as a public download on the official website:
 
@@ -80,23 +81,23 @@ The automated packaged smoke test must prove:
 The Windows installer smoke test must prove:
 
 - The NSIS installer can silently install to an isolated temporary directory.
-- The installed `lumi-core.exe` starts the bundled backend.
+- The installed Lumi Designer application (whose current internal Rust binary name is `lumi-core.exe`) starts the bundled backend.
 - A temporary new-user profile can install a bundled skill.
 - The installed bundled skill connects as an MCP server.
 - The silent uninstaller can remove the temporary install.
 
-## LumiCore Rename Upgrade Gate
+## Lumi Designer Identity and Upgrade Gate
 
-- Keep the bundle identifier `com.lumiai.os` stable so an upgrade retains the existing WebView profile and macOS privacy grants.
-- On Windows, the LumiCore NSIS pre-install hook never executes an uninstall command read from the registry. If a legacy `Lumi OS` registration exists, installation stops and asks the user to uninstall the old application through Windows Settings before retrying.
-- User data is never deleted by the installer. The backend moves the legacy `~/LumiOS/` root to `~/LumiCore/` under an exclusive data lease on first start.
-- On macOS, launch and verify `LumiCore.app` before manually removing the legacy `Lumi OS.app`; a DMG cannot safely delete another app bundle during drag-install.
+- Keep the Lumi Designer bundle identifier `com.lumiai.designer` stable so an upgrade retains this variant's WebView profile and macOS privacy grants without sharing them with LumiCore.
+- The Windows artifact is the independently named `Lumi Designer_<version>_x64-setup.exe`, built with product name `Lumi Designer` and updater channel `lumi-designer`.
+- User data is never deleted by the installer. The backend moves the legacy `~/LumiOS-Designer/` root to `~/LumiCore-Designer/` under an exclusive data lease on first start; it must never import from or write to `~/LumiOS/` or `~/LumiCore/`.
+- On macOS, install and launch `Lumi Designer.app`, verify its bundle identifier is `com.lumiai.designer`, and confirm it uses `~/LumiCore-Designer/`. A DMG cannot safely delete or replace an unrelated LumiCore or industry-variant app bundle during drag-install.
 
 Manual clean Windows user gate:
 
 1. If Windows still lists the legacy application, uninstall that application through Windows Settings; user data remains outside the application directory.
 2. Install the NSIS setup file.
-3. Launch LumiCore from the installed app shortcut.
+3. Launch Lumi Designer from the installed app shortcut.
 4. Confirm the main window appears without a console window.
 5. Confirm the local backend starts and the UI leaves loading state.
 6. Open Skill Center.
@@ -107,7 +108,7 @@ Manual clean Windows user gate:
 11. Confirm installed bundled skills connect or show clear setup requirements.
 12. Try a no-key skill action.
 13. Try a key-required skill and confirm the setup message is clear.
-14. Quit and relaunch LumiCore.
+14. Quit and relaunch Lumi Designer.
 15. Confirm installed skills and user data persist.
 
 Conversation gate prompts:

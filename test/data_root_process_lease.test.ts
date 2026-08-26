@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
 import { afterAll, describe, expect, it } from 'vitest';
+import { PRODUCT_VARIANT } from '../shared/product_variant';
 
 interface ManagedChild {
   child: ChildProcess;
@@ -231,8 +232,8 @@ describe.sequential('cross-process Lumi data-root lease', () => {
 
   it('blocks a live post-rename migration owner and recovers its target-bound lease after a crash', async () => {
     const home = path.join(tempRoot, 'migration-crash-home');
-    const sourceRoot = path.join(home, 'LumiOS');
-    const targetRoot = path.join(home, 'LumiCore');
+    const sourceRoot = path.join(home, PRODUCT_VARIANT.runtime.legacyDataDirectoryName);
+    const targetRoot = path.join(home, PRODUCT_VARIANT.runtime.dataDirectoryName);
     fs.mkdirSync(path.join(sourceRoot, 'data'), { recursive: true });
     fs.writeFileSync(path.join(sourceRoot, 'data', '.migration_skip'), '', { flag: 'wx' });
 

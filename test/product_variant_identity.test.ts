@@ -10,6 +10,7 @@ describe('designer product identity', () => {
       plugins: { updater: { endpoints: string[] } };
     };
     const dataPath = fs.readFileSync('server/config/data_path.ts', 'utf8');
+    const localWhisper = fs.readFileSync('server/stt/providers/local-whisper.ts', 'utf8');
     const nativeBootstrap = fs.readFileSync('src-tauri/src/local_bootstrap.rs', 'utf8');
     const serverEntry = fs.readFileSync('server.ts', 'utf8');
     expect(PRODUCT_VARIANT.runtime.productName).toBe('Lumi Designer');
@@ -24,6 +25,8 @@ describe('designer product identity', () => {
     ]);
     expect(dataPath).toContain('PRODUCT_VARIANT.runtime.dataDirectoryName');
     expect(dataPath).toContain('PRODUCT_VARIANT.runtime.legacyDataDirectoryName');
+    expect(localWhisper).toContain('PRODUCT_VARIANT.runtime.legacyDataDirectoryName');
+    expect(localWhisper).not.toContain("path.join(os.homedir(), 'LumiOS'");
     expect(nativeBootstrap).toContain(`PRODUCT_DATA_DIRECTORY: &str = "${PRODUCT_VARIANT.runtime.dataDirectoryName}"`);
     expect(serverEntry).toContain('PRODUCT_VARIANT.runtime.dataDirectoryName');
   });

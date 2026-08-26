@@ -1,13 +1,13 @@
-# LumiCore
+# Lumi Designer
 
 面向个人与组织的私有化本地智能体系统。
 
 **浙江灵序科技有限公司 · [lumiai.asia](https://lumiai.asia)**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-orange.svg)](./LICENSE)
-[![LumiCore CI](https://github.com/5pyj29s7cm-tech/LumiCore/actions/workflows/ci.yml/badge.svg)](https://github.com/5pyj29s7cm-tech/LumiCore/actions/workflows/ci.yml)
+[![Lumi Designer CI](https://github.com/5pyj29s7cm-tech/lumi-designer-client/actions/workflows/ci.yml/badge.svg)](https://github.com/5pyj29s7cm-tech/lumi-designer-client/actions/workflows/ci.yml)
 
-> LumiCore 不只是一个聊天助手。
+> Lumi Designer 不只是一个聊天助手。
 >
 > 它把模型、语音、记忆、知识、人格、技能、工具、桌面程序和外部智能体组织成一套可持续工作的个人 AI 系统。
 
@@ -15,15 +15,15 @@
 
 当前版本：`3.1.0`
 
-本仓库是 LumiCore 的公开源码与社区协作仓库，目前仅提供源码，不提供公开安装包、Release 或构建产物。Windows 和 macOS 安装包只有通过签名、冒烟、生命周期与发布门禁后，才会作为独立发行物提供。
+本仓库是 Lumi Designer 的独立源码与交付仓库。它共享 LumiCore 底层，但使用独立的安装器、更新通道、应用标识和用户数据目录。Windows 和 macOS 安装包只有通过签名、冒烟、生命周期与发布门禁后，才会作为 Lumi Designer 发行物提供。
 
 LumiCore 仍在快速迭代。统一意图、风险决策、任务账本、工具回执和多模型配置已经形成底层主干；桌面控制、连续语音、外部平台协作和行业软件自动化仍会受到操作系统、模型能力、第三方界面、账号权限与网络环境影响。
 
 任何“完成”结论都应来自真实工具回执或可核验结果。未经验证的自动化能力应视为开发者预览，而不是无条件交付承诺。
 
-## LumiCore 是什么
+## Lumi Designer 是什么
 
-LumiCore 是一款以用户行为为导向、以语音和自然语言交互为主要入口的本地智能体产品。它可以：
+Lumi Designer 是一款面向设计工作流、以语音和自然语言交互为主要入口的本地智能体产品。它可以：
 
 - 使用云端模型、本地模型或自定义 OpenAI 兼容服务；
 - 保存用户自己的会话、记忆、知识库、任务和人格配置；
@@ -177,8 +177,8 @@ LumiCore 把行业能力放在技能层，把具体执行放在工具和适配�
 ### 获取源码
 
 ```bash
-git clone https://github.com/5pyj29s7cm-tech/LumiCore.git
-cd LumiCore
+git clone https://github.com/5pyj29s7cm-tech/lumi-designer-client.git
+cd lumi-designer-client
 npm ci
 ```
 
@@ -235,14 +235,14 @@ DOUBAO_SPEECH_KEY=
 
 ## 数据与隐私
 
-默认用户数据目录为 `~/LumiCore/`，与源码仓库分离。升级时会在独占数据租约下将旧版 `~/LumiOS/` 原地迁移，不复制会话或凭据。
+默认用户数据目录为 `~/LumiCore-Designer/`，与源码仓库分离。升级时会在独占数据租约下将旧版 `~/LumiOS-Designer/` 原地迁移到 `~/LumiCore-Designer/`，不复制会话或凭据。
 
 | 路径 | 内容 |
 | --- | --- |
-| `~/LumiCore/data/lumi.db` | 会话、记忆、任务、回执与智能体数据 |
-| `~/LumiCore/data/keys.json` | 本地凭证存储 |
-| `~/LumiCore/data/knowledge/` | 知识库文件与索引 |
-| `~/LumiCore/data/voice_samples/` | 用户授权保存的语音样本 |
+| `~/LumiCore-Designer/data/lumi.db` | 会话、记忆、任务、回执与智能体数据 |
+| `~/LumiCore-Designer/data/keys.json` | 本地凭证存储 |
+| `~/LumiCore-Designer/data/knowledge/` | 知识库文件与索引 |
+| `~/LumiCore-Designer/data/voice_samples/` | 用户授权保存的语音样本 |
 | `~/lumi_skills/` | 用户安装的 MCP 技能包 |
 
 提交 Issue 或 Pull Request 时，不要上传 API Key、访问令牌、客户资料、个人数据库、语音样本或可识别真实账号的配置。发现安全问题请先阅读 [安全策略](./SECURITY.md)。
@@ -293,7 +293,7 @@ npm run release:check
 **使命：让人类本身得以延伸。**
 
 - 官网：[lumiai.asia](https://lumiai.asia)
-- GitHub：[5pyj29s7cm-tech/LumiCore](https://github.com/5pyj29s7cm-tech/LumiCore)
+- GitHub：[5pyj29s7cm-tech/lumi-designer-client](https://github.com/5pyj29s7cm-tech/lumi-designer-client)
 - 邮箱：3565286431@qq.com
 
 ## 许可证
