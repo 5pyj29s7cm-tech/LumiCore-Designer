@@ -36,6 +36,7 @@ import {
 } from './capability_execution_plan';
 import { recordRoutingShadowComparison } from '../runtime/capability_metrics';
 import { hasExplicitNoMutationInstruction } from './tool_intent';
+import type { PendingAssistantOfferContext } from './pending_assistant_offer';
 
 export interface LumiCapabilityPlan extends LumiCapabilitySelection {
   schemaVersion: 1;
@@ -73,6 +74,7 @@ export interface BuildLumiExecutionPipelineInput {
   source?: string;
   /** Durable task identity supplied by non-conversation entrances such as scheduler/agent execution. */
   taskId?: string;
+  pendingAssistantOfferContext?: PendingAssistantOfferContext;
 }
 
 function applyAdditionalForbiddenTools(
@@ -280,10 +282,12 @@ export function buildLumiExecutionPipeline(
   const legacyExecution = buildLumiExecutionDecision({
     flow: turnIntent.flow,
     text: decisionText,
+    currentTurnText: input.dispatch.text,
     toolDeclarations: input.registry.getToolDeclarations(),
     toolRegistry: input.registry,
     personalityToolPolicy: input.personalityToolPolicy,
     actionTaskState: input.actionTaskState,
+    pendingAssistantOfferContext: input.pendingAssistantOfferContext,
     isSanctuary: input.isSanctuary,
   });
   const unrestrictedManifest = input.registry.getCapabilityManifest(legacyExecution.toolPolicy);

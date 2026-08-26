@@ -56,6 +56,7 @@ import {
   waitForChatExecutionPersistence,
 } from "../socket/chat_execution_registry";
 import { installRuntimeFileLogger } from './file_logger';
+import { ensurePendingConfirmationPersistenceInitialized } from '../tools/pending_confirmation_repository';
 
 interface BootstrapContext {
   server: any;
@@ -159,9 +160,13 @@ export async function bootstrap(ctx: BootstrapContext) {
       );
     }
     const recoveredChatReceipts = await initializeChatExecutionRegistryPersistence();
+    const recoveredPendingConfirmations = await ensurePendingConfirmationPersistenceInitialized();
     console.log('Database initialized successfully');
     if (recoveredChatReceipts > 0) {
       console.log(`[Bootstrap] Recovered ${recoveredChatReceipts} terminal chat execution receipt(s)`);
+    }
+    if (recoveredPendingConfirmations > 0) {
+      console.log(`[Bootstrap] Recovered ${recoveredPendingConfirmations} encrypted pending confirmation(s)`);
     }
     const recoveredBackgroundTasks = hydrateBackgroundTasksFromDb(true);
     const recoveredAutonomousTasks = hydrateAutonomousTasksFromDb(true);

@@ -24,6 +24,7 @@ import { listWebLoginSitePresets } from '../web_login/legal_presets';
 import { formatKnownLoginOpening, formatKnownLoginResult } from '../i18n/naturalness_messages';
 import { CN_TASK_LEDGER_MESSAGES } from '../i18n/task_ledger_messages';
 import { classifyRuntimeWorkIntent } from './runtime_work_intent';
+import type { PendingAssistantOfferContext } from './pending_assistant_offer';
 import {
   extractCurrentAppTarget,
   extractExplicitArtifactTextRequirements,
@@ -365,10 +366,14 @@ export interface QuickCommandOptions {
   orgId?: string;
   surface?: WorkTakeoverTurnSurface;
   currentAppTarget?: string;
+  pendingAssistantOfferContext?: PendingAssistantOfferContext;
 }
 
-export function buildDeterministicRuntimeWorkCommand(text: string): QuickCommandResult | null {
-  const intent = classifyRuntimeWorkIntent(text);
+export function buildDeterministicRuntimeWorkCommand(
+  text: string,
+  pendingAssistantOfferContext?: PendingAssistantOfferContext,
+): QuickCommandResult | null {
+  const intent = classifyRuntimeWorkIntent(text, pendingAssistantOfferContext);
   if (intent === 'none') return null;
   const cancelling = intent === 'cancel';
   const taskId = String(text || '').match(/\b(?:bg|wt_task)_[a-zA-Z0-9_-]+\b/)?.[0] || '';
@@ -773,7 +778,10 @@ const patterns: QuickPattern[] = [
   },
   {
     patterns: [/[\s\S]+/u],
-    handler: (match) => buildDeterministicRuntimeWorkCommand(match[0])
+    handler: (match, _userId, options) => buildDeterministicRuntimeWorkCommand(
+      match[0],
+      options?.pendingAssistantOfferContext,
+    )
       || { responseText: '', matched: false },
   },
   {
@@ -1056,7 +1064,7 @@ const patterns: QuickPattern[] = [
     patterns: [/^(系统信息|system\s*info|sysinfo|内存|CPU|磁盘|电脑配置)[。！？.!?]*$/i],
     handler: () => ({
       responseText: '正在获取系统信息...',
-      toolCall: { name: 'desktop_run_command', arguments: { command: 'systeminfo | findstr /B /C:"OS Name" /C:"Total Physical Memory" /C:"Available Physical Memory"' } },
+      toolCall: { name: 'desktop_system_info', arguments: {} },
       matched: true,
     }),
   },

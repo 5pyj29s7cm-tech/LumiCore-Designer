@@ -663,7 +663,7 @@ describe('recent action continuation', () => {
     expect(state).toMatchObject({
       taskId: 'task_presentation_guard',
       status: 'blocked',
-      activeRequestId: 'request_presentation_guard',
+      activeRequestId: undefined,
       latestBlocker: expect.stringContaining('visualization'),
     });
   });

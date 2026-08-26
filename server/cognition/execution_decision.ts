@@ -34,17 +34,22 @@ import {
   formatIndustryUserGuidancePrompt,
   isIndustryGuidancePreferenceRequest,
 } from '../industry/user_guidance';
+import { classifyRuntimeWorkIntent } from './runtime_work_intent';
+import type { PendingAssistantOfferContext } from './pending_assistant_offer';
 
 type ToolDeclaration = ReturnType<ToolRegistry['getToolDeclarations']>[number];
 
 export interface LumiExecutionDecisionInput {
   flow: LumiTurnFlow;
   text: string;
+  /** Raw text from this accepted user turn, without recovered task context. */
+  currentTurnText?: string;
   toolDeclarations: ToolDeclaration[];
   toolRegistry?: ToolRegistry;
   personalityToolPolicy?: ToolPolicy;
   isSanctuary?: boolean;
   actionTaskState?: ConversationActionContinuationState | null;
+  pendingAssistantOfferContext?: PendingAssistantOfferContext;
 }
 
 export interface LumiExecutionDecision {
@@ -590,9 +595,26 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
   const recoveredCurrentAppEdit = isRecoveredCurrentAppEditingContinuation(input.flow.routeText || input.text);
   const statusOnlyContinuation =
     /Recovered structured action state:[\s\S]{0,500}- followupIntent:\s*status\b/i.test(input.flow.routeText || input.text);
+  const currentTurnText = input.currentTurnText || input.text;
+  // Recovered context can contain task-status labels and old negative clauses.
+  // Runtime task control is therefore classified only from the accepted turn,
+  // and a concrete edition route keeps ownership of its own durable ledger.
+  const specializedEditionTurn = Boolean(
+    input.flow.industryGuidanceRequest
+    || input.flow.industryWorkflowEntryId
+    || isDesignProjectStatusRequest(currentTurnText),
+  );
+  const runtimeWorkIntent = specializedEditionTurn
+    ? 'none'
+    : classifyRuntimeWorkIntent(currentTurnText, input.pendingAssistantOfferContext);
+  const taskControlIntent = !specializedEditionTurn && (
+    runtimeWorkIntent !== 'none'
+    || buildActionContract(currentTurnText).kind === 'task_control'
+  );
   const allowToolUse = (
     input.flow.allowToolUseForTurn
     || input.flow.modelToolAccess === 'manifest'
+    || taskControlIntent
   ) && !input.isSanctuary && !statusOnlyContinuation;
   const selfRepairToolPolicy = input.flow.selfRepairTurn && !statusOnlyContinuation && !modelOwnedMainChat
     ? buildSelfRepairToolPolicy(input.flow.routeText || input.text, input.toolRegistry)
@@ -659,7 +681,9 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
         : allowToolUse
           ? fallbackPolicy(input.flow, input.personalityToolPolicy, input.toolRegistry)
           : NO_TOOLS_POLICY;
-  const rawToolRoute = allowToolUse && shouldRouteTools(input.flow, input.isSanctuary)
+  const rawToolRoute = allowToolUse && (
+    taskControlIntent || shouldRouteTools(input.flow, input.isSanctuary)
+  )
     ? routeToolsForTurn(input.flow.routeText || input.text, input.toolDeclarations, {
         // Permission to use the full registry is not a reason to inject the
         // full registry into every model turn. A narrow per-turn manifest
@@ -667,6 +691,9 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
         // routing on the turn that actually needs it.
         maxTools: input.flow.channel === 'voice' ? 24 : 32,
         capabilityManifest: input.toolRegistry?.getCapabilityManifest(baseToolPolicy),
+        pendingAssistantOfferContext: input.pendingAssistantOfferContext,
+        runtimeWorkIntent,
+        taskControlIntent,
       })
     : null;
   const toolRoute = rawToolRoute

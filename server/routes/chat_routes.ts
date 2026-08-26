@@ -12,6 +12,10 @@ import { getUserPreferredLLMConfig } from "../llm/user_preferences";
 import { recordTokenUsage } from "../llm/token_tracker";
 import { buildUnifiedLegalEntryPrompt } from "../cognition/legal_entry";
 import { finalizeLumiResponse } from "../cognition/result_finalizer";
+import {
+  finalizeExecutionForOutboundDelivery,
+  type ExecutionGuardRecoveryRunInput,
+} from "../cognition/execution_guard_recovery";
 import { buildLumiTurnDispatch } from "../cognition/turn_dispatch";
 import { buildLumiExecutionDecision } from "../cognition/execution_decision";
 import {
@@ -128,19 +132,39 @@ function buildRestChatSystemInstruction(input: {
   ].filter(Boolean).join('\n\n');
 }
 
-function finalizeRestChatResponse(input: {
+type RestChatFinalization = ReturnType<typeof finalizeLumiResponse>;
+
+async function finalizeRestChatResponse(input: {
   taskText: string;
   responseText: string;
   toolRecords?: ToolExecutionRecord[];
   source: string;
   flow?: LumiTurnFlow;
+  allowToolUse?: boolean;
+  attempt?: ExecutionGuardRecoveryRunInput<RestChatFinalization>['attempt'];
 }) {
-  return finalizeLumiResponse({
+  const toolRecords = input.toolRecords || [];
+  const finalization = finalizeLumiResponse({
     taskText: input.taskText,
     responseText: input.responseText,
-    toolRecords: input.toolRecords || [],
+    toolRecords,
     source: input.source,
     flow: input.flow,
+  });
+  return finalizeExecutionForOutboundDelivery({
+    task: input.taskText,
+    responseText: input.responseText,
+    finalization,
+    allowToolUse: input.allowToolUse === true,
+    toolRecords,
+    attempt: input.attempt,
+    finalize: (candidateText, records) => finalizeLumiResponse({
+      taskText: input.taskText,
+      responseText: candidateText,
+      toolRecords: records,
+      source: `${input.source}_guard_recovery`,
+      flow: input.flow,
+    }),
   });
 }
 
@@ -319,6 +343,8 @@ export function formatMeetingTranscriptForAnalysis(notes: unknown[]): string {
 
 export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
   getDeepSeek: any; getGemini: any; getOpenAI: any; getAnthropic: any; getQwen: any;
+  getOllama?: any; getLmStudio?: any; getArk?: any; getXiaomi?: any;
+  getKimi?: any; getGlm?: any; getRelay?: any;
 }) {
   const asyncHandler = (fn: (req: any, res: any, next?: any) => Promise<any>) =>
     (req: any, res: any, next: any) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -607,12 +633,13 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
           });
           responseText = response.choices[0].message.content || '';
         }
-        const finalized = finalizeRestChatResponse({
+        const outbound = await finalizeRestChatResponse({
           taskText: routeText,
           responseText,
           source: 'rest_chat',
           flow: restTurnDispatch.flow,
         });
+        const finalized = outbound.finalization;
         responseText = finalized.text;
         recordLatency('llm', Date.now() - llmStart);
         return res.json({
@@ -631,6 +658,79 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
           }))
         ];
 
+        const bindRestIndustryRecords = (records: ToolExecutionRecord[]) => (
+          industryWorkflowTask
+            ? bindIndustryToolRecords(records, {
+                workTakeoverTaskId: industryWorkflowTask.id,
+                conversationTaskId: String(industryWorkflow.conversationTaskId || ''),
+                requestId: String(industryWorkflow.requestId || ''),
+              })
+            : records
+        );
+
+        const runRestToolTurn = (
+          turnMessages: any[],
+          onToolRecord?: (record: ToolExecutionRecord) => void,
+          onChunk?: (chunk: string) => void,
+          source = toolContext.source,
+        ) => runWithTools(
+          turnMessages,
+          toolRegistry,
+          { provider, model, userId, domain, orgId },
+          onToolRecord,
+          restModelToolPolicy.maxIterations ?? 3,
+          llm.getDeepSeek,
+          llm.getGemini,
+          llm.getOpenAI,
+          llm.getAnthropic,
+          llm.getQwen,
+          onChunk,
+          { ...toolContext, source },
+        );
+
+        const finalizeRestToolResult = async (
+          candidateText: string,
+          result: Awaited<ReturnType<typeof runRestToolTurn>>,
+          source: string,
+        ) => {
+          const usageRecords = [...(result.usageRecords || [])];
+          const initialToolRecords = bindRestIndustryRecords(result.toolCalls);
+          const outbound = await finalizeRestChatResponse({
+            taskText: routeText,
+            responseText: candidateText,
+            toolRecords: initialToolRecords,
+            source,
+            flow: restTurnDispatch.flow,
+            allowToolUse: restExecutionDecision.allowToolUse,
+            attempt: async ({ instruction, recordTool }) => {
+              const recovery = await runRestToolTurn(
+                [
+                  ...normalizedMessages,
+                  ...(candidateText.trim()
+                    ? [{ role: 'assistant', content: candidateText }]
+                    : []),
+                  { role: 'user', content: instruction },
+                ],
+                recordTool,
+                undefined,
+                'rest_chat_guard_recovery',
+              );
+              usageRecords.push(...(recovery.usageRecords || []));
+              return {
+                text: recovery.text,
+                toolRecords: recovery.toolCalls,
+              };
+            },
+          });
+          return {
+            outbound: {
+              ...outbound,
+              toolRecords: bindRestIndustryRecords(outbound.toolRecords),
+            },
+            usageRecords,
+          };
+        };
+
         const stream = req.query.stream === 'true';
 
         if (stream) {
@@ -641,12 +741,9 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
           });
           const restTextGate = createPreFinalizationTextGate();
 
-          const result = await runWithTools(
+          const result = await runRestToolTurn(
             normalizedMessages,
-            toolRegistry,
-            { provider, model, userId, domain, orgId },
-            undefined, restModelToolPolicy.maxIterations ?? 3,
-            llm.getDeepSeek, llm.getGemini, llm.getOpenAI, llm.getAnthropic, llm.getQwen,
+            undefined,
             (chunk) => {
               if (!deferRestStream) {
                 const safeText = restTextGate.push(chunk);
@@ -655,29 +752,17 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
                 }
               }
             },
-            toolContext,
           );
           restTextGate.finish();
 
           responseText = result.text || '';
-          const boundRecords = industryWorkflowTask
-            ? bindIndustryToolRecords(result.toolCalls, {
-                workTakeoverTaskId: industryWorkflowTask.id,
-                conversationTaskId: String(industryWorkflow.conversationTaskId || ''),
-                requestId: String(industryWorkflow.requestId || ''),
-              })
-            : result.toolCalls;
-          const finalized = finalizeRestChatResponse({
-            taskText: routeText,
-            responseText,
-            toolRecords: boundRecords,
-            source: 'rest_chat_stream',
-            flow: restTurnDispatch.flow,
-          });
+          const delivery = await finalizeRestToolResult(responseText, result, 'rest_chat_stream');
+          const finalized = delivery.outbound.finalization;
+          const boundRecords = delivery.outbound.toolRecords;
           responseText = industryWorkflowTask
             ? humanizeIndustryWorkflowResponse(finalized.text)
             : finalized.text;
-          for (const u of result.usageRecords || []) {
+          for (const u of delivery.usageRecords) {
             recordTokenUsage(userId, u.provider, u.model, {
               promptTokens: u.promptTokens,
               completionTokens: u.completionTokens,
@@ -694,7 +779,7 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
           res.write(`data: ${JSON.stringify({
             done: true,
             text: responseText,
-            toolCalls: result.toolCalls.length,
+            toolCalls: boundRecords.length,
             finalized: true,
             blocked: mergedFinalState.blocked,
             reason: mergedFinalState.reason,
@@ -708,35 +793,16 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
           return res.end();
         }
 
-        const result = await runWithTools(
-          normalizedMessages,
-          toolRegistry,
-          { provider, model, userId, domain, orgId },
-          undefined, restModelToolPolicy.maxIterations ?? 3,
-          llm.getDeepSeek, llm.getGemini, llm.getOpenAI, llm.getAnthropic, llm.getQwen,
-          undefined,
-          toolContext,
-        );
+        const result = await runRestToolTurn(normalizedMessages);
 
         responseText = result.text || '';
-        const boundRecords = industryWorkflowTask
-          ? bindIndustryToolRecords(result.toolCalls, {
-              workTakeoverTaskId: industryWorkflowTask.id,
-              conversationTaskId: String(industryWorkflow.conversationTaskId || ''),
-              requestId: String(industryWorkflow.requestId || ''),
-            })
-          : result.toolCalls;
-        const finalized = finalizeRestChatResponse({
-          taskText: routeText,
-          responseText,
-          toolRecords: boundRecords,
-          source: 'rest_chat',
-          flow: restTurnDispatch.flow,
-        });
+        const delivery = await finalizeRestToolResult(responseText, result, 'rest_chat');
+        const finalized = delivery.outbound.finalization;
+        const boundRecords = delivery.outbound.toolRecords;
         responseText = industryWorkflowTask
           ? humanizeIndustryWorkflowResponse(finalized.text)
           : finalized.text;
-        for (const u of result.usageRecords || []) {
+        for (const u of delivery.usageRecords) {
           recordTokenUsage(userId, u.provider, u.model, {
             promptTokens: u.promptTokens,
             completionTokens: u.completionTokens,
@@ -744,8 +810,8 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
           }, `rest_chat_${Date.now()}`, 'chat');
         }
         const usage = {
-          totalTokens: result.usageRecords.reduce((sum, item) => sum + item.totalTokens, 0),
-          records: result.usageRecords.length,
+          totalTokens: delivery.usageRecords.reduce((sum, item) => sum + item.totalTokens, 0),
+          records: delivery.usageRecords.length,
         };
         const workflowRecord = industryWorkflowTask
           ? recordIndustryWorkflowExecution({
@@ -757,7 +823,7 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
         return res.json({
           text: responseText,
           usage,
-          toolCalls: result.toolCalls.length,
+          toolCalls: boundRecords.length,
           finalized: true,
           blocked: mergedFinalState.blocked,
           reason: mergedFinalState.reason,
@@ -770,12 +836,13 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
         });
       }
 
-      const finalized = finalizeRestChatResponse({
+      const outbound = await finalizeRestChatResponse({
         taskText: routeText,
         responseText,
         source: 'rest_chat',
         flow: restTurnDispatch.flow,
       });
+      const finalized = outbound.finalization;
       res.json({
         text: finalized.text,
         finalized: true,
@@ -1034,6 +1101,8 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
       [],
       { provider, model, maxTokens: 1800, userId },
       llm.getDeepSeek, llm.getGemini, llm.getOpenAI, llm.getAnthropic, llm.getQwen,
+      llm.getOllama, llm.getLmStudio, llm.getArk, llm.getXiaomi,
+      llm.getKimi, llm.getGlm, llm.getRelay,
     );
 
     const report = result.text || '';

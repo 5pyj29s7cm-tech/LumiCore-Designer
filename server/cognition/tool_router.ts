@@ -32,6 +32,11 @@ import {
   isExternalCommitConfirmationOnlyRequest,
 } from './normalized_action_intent';
 import { isReadOnlyKnowledgeBaseInspectionRequest } from './knowledge_intent';
+import {
+  classifyRuntimeWorkIntent,
+  type RuntimeWorkIntent,
+} from './runtime_work_intent';
+import type { PendingAssistantOfferContext } from './pending_assistant_offer';
 
 type ToolDeclaration = ReturnType<ToolRegistry['getToolDeclarations']>[number];
 
@@ -46,6 +51,23 @@ export interface ToolRoute {
   hardAllowlist?: boolean;
   forbiddenToolNames?: string[];
   maxIterations?: number;
+}
+
+export interface ToolRouteOptions {
+  maxTools?: number;
+  connectedMcpServers?: string[];
+  enableMcpHealthGate?: boolean;
+  capabilityManifest?: CapabilityManifestEntry[];
+  /**
+   * An already validated, immediately preceding assistant offer. Socket and
+   * conversation layers may persist and supply it later; the router itself
+   * remains transport-independent.
+   */
+  pendingAssistantOfferContext?: PendingAssistantOfferContext;
+  /** Authoritative classification from the raw accepted user turn. */
+  runtimeWorkIntent?: RuntimeWorkIntent;
+  /** Whether the raw accepted turn, rather than enriched context, controls runtime work. */
+  taskControlIntent?: boolean;
 }
 
 function unique(values: string[]): string[] {
@@ -683,12 +705,7 @@ function scoreDeclaration(text: string, declaration: ToolDeclaration): number {
 export function routeToolsForTurn(
   userText: string,
   declarations: ToolDeclaration[],
-  options?: {
-    maxTools?: number;
-    connectedMcpServers?: string[];
-    enableMcpHealthGate?: boolean;
-    capabilityManifest?: CapabilityManifestEntry[];
-  },
+  options?: ToolRouteOptions,
 ): ToolRoute {
   const maxTools = Math.max(8, Math.min(options?.maxTools ?? 64, 80));
   const text = String(userText || '').trim();
@@ -703,7 +720,13 @@ export function routeToolsForTurn(
   const categories: string[] = [];
   const reasons: string[] = [];
   const manifestPriorities: string[] = [];
+  const runtimeWorkIntent = options?.runtimeWorkIntent ?? classifyRuntimeWorkIntent(
+    text,
+    options?.pendingAssistantOfferContext,
+  );
   const actionContract = buildActionContract(text);
+  const taskControlIntent = options?.taskControlIntent
+    ?? (runtimeWorkIntent !== 'none' || actionContract.kind === 'task_control');
   const explicitArtifactCreation = isExplicitArtifactCreationText(text);
   const readOnlyKnowledgeInspection = isReadOnlyKnowledgeBaseInspectionRequest(text);
   const confirmationOnlyExternalCommit = actionContract.kind === 'messaging_send'
@@ -923,11 +946,22 @@ export function routeToolsForTurn(
     }
   }
 
-  if (actionContract.kind === 'task_control') {
-    for (const name of actionContract.preferredTools) addIfAvailable(selected, available, name);
-    addIfAvailable(selected, available, 'runtime_work_status');
-    categories.push('task_control');
-    reasons.push('runtime work status and cancellation use the unified task ledger');
+  if (taskControlIntent) {
+    const exactTool = runtimeWorkIntent === 'cancel'
+      ? 'runtime_work_cancel'
+      : 'runtime_work_status';
+    selected.clear();
+    addIfAvailable(selected, available, exactTool);
+    categories.splice(0, categories.length, 'task_control');
+    reasons.splice(
+      0,
+      reasons.length,
+      'runtime work status and cancellation use one exact unified-ledger tool without shell, process-list, or database fallbacks',
+    );
+    manifestPriorities.unshift(exactTool);
+    for (const name of availableNames) {
+      if (!selected.has(name)) forbiddenToolNames.add(name);
+    }
   }
 
   if (extensionRegistryOnly) {
@@ -1083,6 +1117,7 @@ export function routeToolsForTurn(
       || desktopLaunchRequest
       || cadGeometryExtractionOnly
       || extensionRegistryOnly
+      || taskControlIntent
       || selected.has('cad_draw_floorplan_in_autocad')
       || undefined,
     forbiddenToolNames: forbiddenToolNames.size > 0
@@ -1102,6 +1137,8 @@ export function routeToolsForTurn(
       ? desktopObservationToolNames.length + 1
       : extensionRegistryOnly
       ? Math.max(2, selected.size)
+      : taskControlIntent
+      ? 1
       : undefined,
   };
 }

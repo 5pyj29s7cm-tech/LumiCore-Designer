@@ -34,6 +34,7 @@ import {
   type BackgroundWorkflowTask,
   type WorkflowStep,
 } from './workflowTypes';
+import { TaskCompletionFeedbackDetails } from './TaskCompletionFeedbackDetails';
 import { WeChatSettings } from './WeChatSettings';
 import type { FileEntry } from './MemoryTree';
 import { formatUiMessage, uiMessage } from '../i18n/uiMessages';
@@ -1359,6 +1360,7 @@ export function AgentChatPage({
       }
 
       if (assistantText) {
+        const completionFeedback = normalizeTaskCompletionFeedback(m.completionFeedback);
         pushMessage({
           id: `${baseId}-assistant`,
           text: assistantText,
@@ -1366,6 +1368,7 @@ export function AgentChatPage({
           timestamp,
           type: 'agent',
           mode: m.mode,
+          ...(completionFeedback ? { completionFeedback } : {}),
         });
       }
     });
@@ -1704,6 +1707,7 @@ export function AgentChatPage({
       reason?: string;
       sidecar?: boolean;
       taskRelation?: unknown;
+      completionFeedback?: unknown;
     }) => {
       if (!isCurrentChatEvent(data)) return;
       recordTaskRelation(data);
@@ -1714,6 +1718,7 @@ export function AgentChatPage({
       const streamId = streamingMsgIdsRef.current.get(streamKey);
       const tracked = settleTrackedChatRequest(requestId);
       const hasRemainingRequests = tracked.remaining > 0;
+      const completionFeedback = normalizeTaskCompletionFeedback(data.completionFeedback);
       setIsTyping(hasRemainingRequests);
 
       const displayable = shouldDisplayAgentResponse(data);
@@ -1721,7 +1726,11 @@ export function AgentChatPage({
         if (displayable && data.text?.trim()) {
           // Capture the id before deleting its request bucket. React may run
           // this updater after the handler returns.
-          setMessages(prev => finalizeStreamedChatMessage(prev, streamId, data.text));
+          setMessages(prev => finalizeStreamedChatMessage(prev, streamId, data.text).map(message => (
+            message.id === streamId && completionFeedback
+              ? { ...message, completionFeedback }
+              : message
+          )));
         } else if (!displayable) {
           setMessages(prev => prev.filter(message => message.id !== streamId));
         }
@@ -1732,7 +1741,8 @@ export function AgentChatPage({
           text: data.text,
           userName: data.agentName,
           timestamp: new Date().toISOString(),
-          type: 'agent'
+          type: 'agent',
+          ...(completionFeedback ? { completionFeedback } : {}),
         }]);
       }
 
@@ -3712,6 +3722,14 @@ export function AgentChatPage({
                         {getDisplayText(msg)}
                       </Markdown>
                     </div>
+                    {msg.type === 'agent' && msg.completionFeedback && (
+                      <TaskCompletionFeedbackDetails
+                        feedback={msg.completionFeedback}
+                        locale={isZh ? 'zh' : 'en'}
+                        compact
+                        className="mt-3"
+                      />
+                    )}
                     {getDisplayText(msg) && (
                       <button
                         onMouseDown={(event) => event.preventDefault()}
