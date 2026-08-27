@@ -1,7 +1,12 @@
 import crypto from 'node:crypto';
 import type { ToolPolicy } from '../personality/types';
 import type { ToolExecutionRecord } from '../tools/types';
-import { buildActionContract, hasCoreActionEvidence } from './action_contract';
+import {
+  buildActionContract,
+  hasCoreActionEvidence,
+  requiresCurrentAppUiMutation,
+} from './action_contract';
+import type { TaskCapsuleV1 } from '../conversation/task_capsule';
 
 export type ConversationTaskStatus =
   | 'created'
@@ -72,6 +77,9 @@ export interface ConversationTaskReceipt {
   result: string;
   /** Exact machine receipt used by capability verification, bounded for persistence. */
   receipt?: unknown;
+  /** Exact persisted model call that selected this tool, when model-routed. */
+  modelRoutingReceiptId?: string;
+  executionOrigin?: ToolExecutionRecord['executionOrigin'];
   error: string;
   /** Handler success and task-level verification are deliberately separate. */
   outcome: 'success' | 'partial' | 'failure';
@@ -260,6 +268,12 @@ export function normalizeConversationTaskReceipt(value: unknown): ConversationTa
       : {},
     result: compact(candidate.result, 3000),
     ...(candidate.receipt !== undefined ? { receipt: stableValue(candidate.receipt) } : {}),
+    ...(compact(candidate.modelRoutingReceiptId, 180)
+      ? { modelRoutingReceiptId: compact(candidate.modelRoutingReceiptId, 180) }
+      : {}),
+    ...(['model_selected', 'confirmed_action_resume', 'deterministic_route'].includes(candidate.executionOrigin)
+      ? { executionOrigin: candidate.executionOrigin as ToolExecutionRecord['executionOrigin'] }
+      : {}),
     error: compact(candidate.error, 700),
     outcome: candidate.outcome === 'success'
       ? 'success'
@@ -324,6 +338,11 @@ export function toolRecordSucceeded(record: ToolExecutionRecord): boolean {
     const explicitlyFailedOutcome = SEMANTIC_FALSE_FIELDS.some(field => (
       !ignoredFalseFields.has(field) && payload[field] === false
     ));
+    const verifiedRuntimeCancellation = record.name === 'runtime_work_cancel'
+      && payload.ok === true
+      && Number(payload.failedCount || 0) === 0
+      && (status === 'idle' || status === 'cancelled');
+    if (verifiedRuntimeCancellation) return true;
     if (
       payload.ok === false
       || payload.success === false
@@ -505,6 +524,10 @@ export function recordsToTaskReceipts(
         : textReadbackMetadata
           ? { receipt: stableValue(textReadbackMetadata) }
         : {}),
+    ...(compact(record.modelRoutingReceiptId, 180)
+      ? { modelRoutingReceiptId: compact(record.modelRoutingReceiptId, 180) }
+      : {}),
+    ...(record.executionOrigin ? { executionOrigin: record.executionOrigin } : {}),
     error: toolRecordSucceeded(record) ? '' : toolRecordFailureDetail(record),
     outcome: !toolRecordSucceeded(record)
       ? 'failure'
@@ -553,6 +576,10 @@ export function taskReceiptsToRecords(receipts: ConversationTaskReceipt[] = []):
     arguments: receipt.arguments || {},
     result: receipt.result || '',
     ...(receipt.receipt !== undefined ? { receipt: stableValue(receipt.receipt) } : {}),
+    ...(receipt.modelRoutingReceiptId
+      ? { modelRoutingReceiptId: receipt.modelRoutingReceiptId }
+      : {}),
+    ...(receipt.executionOrigin ? { executionOrigin: receipt.executionOrigin } : {}),
     error: receipt.outcome === 'failure' ? receipt.error || 'Tool execution failed.' : undefined,
     terminalVerification: cloneTerminalVerification(receipt.terminalVerification),
     capability: cloneCapability(receipt.capability),
@@ -563,13 +590,14 @@ export function taskReceiptsToRecords(receipts: ConversationTaskReceipt[] = []):
 export function taskCompletionFromReceipts(
   goal: string,
   receipts: ConversationTaskReceipt[] = [],
+  taskCapsule?: TaskCapsuleV1 | null,
 ): { complete: boolean; blocker: string; records: ToolExecutionRecord[] } {
   const records = coalesceToolExecutionRecords(taskReceiptsToRecords(receipts));
   const contract = buildActionContract(goal);
   // Legacy desktop builds emitted this terminal adapter name before the
   // verified `wps_create_document_with_text` receipt was introduced. Keep
   // already-persisted tasks resumable without weakening generic UI evidence.
-  const legacyVerifiedWpsCreate = records.some(record => (
+  const legacyVerifiedWpsCreate = requiresCurrentAppUiMutation(goal) && records.some(record => (
     record.name === 'wps_create_document' && toolRecordSucceeded(record)
   ));
   // This server-side verifier only returns `verified` after it has archived
@@ -591,7 +619,7 @@ export function taskCompletionFromReceipts(
       && /^wt_task_[a-z0-9_-]+$/i.test(compact(payload.task?.id, 180));
   });
   const complete = verifiedIndustryWorkflowCompletion || (contract.applies
-    ? hasCoreActionEvidence(contract, records, goal) || legacyVerifiedWpsCreate
+    ? hasCoreActionEvidence(contract, records, goal, taskCapsule) || legacyVerifiedWpsCreate
     : records.some(toolRecordVerifiedForCompletion));
   const failures = [...records].reverse().filter(record => !toolRecordSucceeded(record));
   // A later policy/routing rejection is useful diagnostic evidence, but it

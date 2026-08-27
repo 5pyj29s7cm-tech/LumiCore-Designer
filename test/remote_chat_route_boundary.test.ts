@@ -29,6 +29,20 @@ const userToken = jwt.sign({
   username: 'remote',
   role: 'user',
 }, JWT_SECRET);
+const nativeClientIdentity = {
+  schemaVersion: 1 as const,
+  clientKind: 'tauri' as const,
+  pid: process.pid,
+  startedAtUnixMs: Math.floor((Date.now() - 10_000) / 1_000) * 1_000,
+  executablePath: process.execPath,
+  executableSha256: 'd'.repeat(64),
+  binaryHashUnavailable: false,
+  buildId: 'c'.repeat(40),
+  buildIdSemantics: 'baseline_commit' as const,
+  sourceFingerprint: 'e'.repeat(64),
+  sourceDirty: false,
+  appVersion: '3.1.0',
+};
 
 describe('REST chat remote execution boundary', () => {
   beforeAll(async () => {
@@ -98,6 +112,28 @@ describe('REST chat remote execution boundary', () => {
     ]));
   });
 
+  it('accepts the backend-issued native proof on loopback without weakening ordinary REST chat', async () => {
+    const desktopSession = issueDesktopSessionProof('remote-chat-user', nativeClientIdentity);
+    const response = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userToken}`,
+        [DESKTOP_SESSION_HEADER]: desktopSession.proof,
+      },
+      body: JSON.stringify({ message: '读取 D:\\work\\brief.txt 并告诉我唯一风险，但不要修改文件' }),
+    });
+    expect(response.status).toBe(200);
+    const context = mocks.runWithTools.mock.calls[0][11] as any;
+    expect(context).toMatchObject({
+      userId: 'remote-chat-user',
+      authenticated: true,
+      localExecution: true,
+      executionBoundary: 'trusted_local',
+      source: 'rest_chat_local',
+    });
+  });
+
   it('fails closed for an invalid proof and never trusts a valid proof from a non-loopback peer', async () => {
     const invalidResponse = await fetch(`${baseUrl}/api/chat`, {
       method: 'POST',
@@ -125,7 +161,7 @@ describe('REST chat remote execution boundary', () => {
     expect(await emptyResponse.json()).toMatchObject({ code: 'DESKTOP_SESSION_PROOF_REQUIRED' });
     expect(mocks.runWithTools).not.toHaveBeenCalled();
 
-    const validProof = issueDesktopSessionProof('remote-chat-user').proof;
+    const validProof = issueDesktopSessionProof('remote-chat-user', nativeClientIdentity).proof;
     expect(buildHttpToolSecurityContext({
       user: { uid: 'remote-chat-user', username: 'remote', role: 'user' },
       headers: { [DESKTOP_SESSION_HEADER]: validProof },
@@ -212,7 +248,7 @@ describe('REST chat remote execution boundary', () => {
         usageRecords: [],
       };
     });
-    const desktopProof = issueDesktopSessionProof('remote-chat-user').proof;
+    const desktopProof = issueDesktopSessionProof('remote-chat-user', nativeClientIdentity).proof;
     const response = await fetch(`${baseUrl}/api/chat`, {
       method: 'POST',
       headers: {

@@ -694,6 +694,7 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
         pendingAssistantOfferContext: input.pendingAssistantOfferContext,
         runtimeWorkIntent,
         taskControlIntent,
+        actionTaskState: input.actionTaskState,
       })
     : null;
   const toolRoute = rawToolRoute

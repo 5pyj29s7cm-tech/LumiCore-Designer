@@ -18,6 +18,11 @@ import {
   type ModelRoutingTrace,
 } from './model_routing_receipts';
 import {
+  buildProviderOutboundMessagesEvidence,
+  normalizeProviderOutboundMessagesEvidence,
+  type ProviderOutboundMessagesEvidence,
+} from './outbound_message_evidence';
+import {
   assertRegisteredProviderModel,
   getRegisteredOpenAIClient,
   isExtensionProviderId,
@@ -44,6 +49,15 @@ export interface LLMCallConfig {
   orgId?: string;
   conversationId?: string;
   requestId?: string;
+  nativeDeviceId?: string;
+  executionSessionId?: string;
+  nativeClientIdentitySha256?: string;
+  audioInputKind?: 'physical_microphone' | 'synthetic_accepted_transcript';
+  syntheticAudio?: boolean;
+  captureSessionId?: string;
+  sttReceiptId?: string;
+  contextChainId?: string;
+  previousRequestId?: string;
   interactionId?: string;
   source?: string;
   responseFormat?: LLMResponseFormat;
@@ -66,6 +80,8 @@ export interface LLMCallConfig {
   noImplicitFailover?: boolean;
   /** True only for a candidate compiled from the user's stored route policy. */
   authorizedRoutingCandidate?: boolean;
+  /** Local-only declaration names that preflight must retain or fail closed. */
+  localRequiredToolNames?: string[];
 }
 
 export interface ModelAttemptTimeouts {
@@ -142,6 +158,8 @@ export function resolveModelAttemptTimeouts(config?: Partial<ModelAttemptTimeout
 export interface NormalizedMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: MessageContent;
+  /** Server-only durable transcript provenance; never serialized to a provider. */
+  sourceMessageId?: string;
   toolCalls?: ParsedToolCall[];
   toolCallId?: string;
   name?: string;
@@ -308,6 +326,28 @@ type OpenAICompatibleMessage = {
   name?: string;
   reasoning_content?: string;
 };
+
+const providerSourceUserSlots = new WeakMap<object, string>();
+
+function markProviderSourceUserSlot<T extends object>(message: T, sourceMessageId: unknown): T {
+  const durableId = String(sourceMessageId || '').trim();
+  if (durableId) providerSourceUserSlots.set(message, durableId);
+  return message;
+}
+
+function providerSourceUserSlot(messages: object[]): {
+  sourceMessageId?: string;
+  sourceMessageIndex: number | null;
+} {
+  let found: { sourceMessageId: string; sourceMessageIndex: number } | null = null;
+  messages.forEach((message, sourceMessageIndex) => {
+    const sourceMessageId = providerSourceUserSlots.get(message);
+    if (!sourceMessageId) return;
+    if (found) throw new Error('provider_outbound_multiple_source_messages');
+    found = { sourceMessageId, sourceMessageIndex };
+  });
+  return found || { sourceMessageIndex: null };
+}
 
 function contentToText(content: MessageContent): string {
   if (typeof content === 'string') return content;
@@ -541,14 +581,17 @@ function buildOpenAICompatibleMessages(
 
     if (!hasMeaningfulContent(m.content) && validToolCalls.length === 0) continue;
 
-    raw.push({
+    const formattedMessage: OpenAICompatibleMessage = {
       role,
       content: m.content ?? '',
       ...(validToolCalls.length > 0 ? { tool_calls: validToolCalls } : {}),
       ...(role === 'assistant' && options.includeAssistantReasoning && m.reasoningContent
         ? { reasoning_content: m.reasoningContent }
         : {}),
-    });
+    };
+    raw.push(m.role === 'user' && m.sourceMessageId
+      ? markProviderSourceUserSlot(formattedMessage, m.sourceMessageId)
+      : formattedMessage);
   }
 
   const sanitized: OpenAICompatibleMessage[] = [];
@@ -799,10 +842,13 @@ export function formatGeminiRequest(params: {
     }
 
     // user messages
-    contents.push({
+    const userContent = {
       role: 'user',
       parts: geminiPartsFromContent(m.content),
-    });
+    };
+    contents.push(m.sourceMessageId
+      ? markProviderSourceUserSlot(userContent, m.sourceMessageId)
+      : userContent);
   }
 
   const hasTools = params.toolDeclarations.length > 0;
@@ -930,7 +976,10 @@ export function formatAnthropicRequest(params: {
       }
       anthropicMessages.push({ role: 'assistant', content });
     } else {
-      anthropicMessages.push({ role: 'user', content: m.content || '' });
+      const userMessage = { role: 'user', content: m.content || '' };
+      anthropicMessages.push(m.sourceMessageId
+        ? markProviderSourceUserSlot(userMessage, m.sourceMessageId)
+        : userMessage);
     }
   }
 
@@ -997,32 +1046,140 @@ function directRoutingTrace(config: LLMCallConfig, status: 'succeeded' | 'failed
   };
 }
 
+type ResponseWithProviderOutboundEvidence = NormalizedLLMResponse & {
+  _providerOutboundMessagesEvidence?: ProviderOutboundMessagesEvidence;
+};
+
+type ErrorWithProviderOutboundEvidence = Error & {
+  providerOutboundMessagesEvidence?: ProviderOutboundMessagesEvidence;
+};
+
+function attachProviderOutboundEvidence(
+  response: NormalizedLLMResponse,
+  evidence: ProviderOutboundMessagesEvidence,
+): ResponseWithProviderOutboundEvidence {
+  return { ...response, _providerOutboundMessagesEvidence: evidence };
+}
+
+function providerOutboundEvidenceFrom(value: unknown): ProviderOutboundMessagesEvidence | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  return normalizeProviderOutboundMessagesEvidence(
+    (value as ResponseWithProviderOutboundEvidence)._providerOutboundMessagesEvidence
+      || (value as ErrorWithProviderOutboundEvidence).providerOutboundMessagesEvidence,
+  ) || undefined;
+}
+
+function attachProviderOutboundEvidenceToError(
+  error: unknown,
+  evidence: ProviderOutboundMessagesEvidence,
+): Error {
+  const target = error instanceof Error ? error : new Error(String(error));
+  try {
+    Object.defineProperty(target, 'providerOutboundMessagesEvidence', {
+      configurable: true,
+      enumerable: false,
+      value: evidence,
+      writable: false,
+    });
+    return target;
+  } catch {
+    const wrapped = new Error(target.message, { cause: target });
+    wrapped.name = target.name;
+    Object.defineProperty(wrapped, 'providerOutboundMessagesEvidence', {
+      configurable: false,
+      enumerable: false,
+      value: evidence,
+      writable: false,
+    });
+    return wrapped;
+  }
+}
+
+async function executeWithProviderOutboundEvidence(
+  evidence: ProviderOutboundMessagesEvidence,
+  operation: () => Promise<NormalizedLLMResponse>,
+): Promise<ResponseWithProviderOutboundEvidence> {
+  try {
+    return attachProviderOutboundEvidence(await operation(), evidence);
+  } catch (error) {
+    throw attachProviderOutboundEvidenceToError(error, evidence);
+  }
+}
+
+function withoutPrivateProviderOutboundEvidence(
+  response: ResponseWithProviderOutboundEvidence,
+): NormalizedLLMResponse {
+  const result = { ...response };
+  delete result._providerOutboundMessagesEvidence;
+  return result;
+}
+
+function traceWithProviderOutboundEvidence(
+  trace: ModelRoutingTrace,
+  evidence: ProviderOutboundMessagesEvidence | undefined,
+  status: 'succeeded' | 'failed',
+): ModelRoutingTrace {
+  if (!evidence) return trace;
+  let attached = false;
+  const attempts = trace.attempts.map(attempt => {
+    const matches = attempt.provider === evidence.provider
+      && attempt.model === evidence.model
+      && attempt.status === status;
+    if (!matches || attached) return attempt;
+    attached = true;
+    return { ...attempt, outboundMessagesEvidence: evidence };
+  });
+  if (!attached) {
+    // Never mint a new routing attempt from evidence alone. A provider payload
+    // without the matching real attempt remains intentionally unpersisted.
+    return trace;
+  }
+  return { ...trace, attempts };
+}
+
 function persistRoutingTrace(
   config: LLMCallConfig,
   trace: ModelRoutingTrace,
   status: 'succeeded' | 'failed',
   startedAtMs: number,
-): void {
+  outboundMessagesEvidence?: ProviderOutboundMessagesEvidence,
+): string | undefined {
   try {
-    persistModelRoutingReceipt({
+    const persistedTrace = traceWithProviderOutboundEvidence(
+      trace,
+      outboundMessagesEvidence,
+      status,
+    );
+    const receipt = persistModelRoutingReceipt({
       userId: config.userId || 'anonymous',
       domain: config.domain || 'personal',
       orgId: config.orgId || '',
       conversationId: config.conversationId || '',
       requestId: config.requestId || '',
+      nativeDeviceId: config.nativeDeviceId || '',
+      executionSessionId: config.executionSessionId || '',
+      nativeClientIdentitySha256: config.nativeClientIdentitySha256 || '',
+      audioInputKind: config.audioInputKind,
+      syntheticAudio: config.syntheticAudio,
+      captureSessionId: config.captureSessionId || '',
+      sttReceiptId: config.sttReceiptId || '',
+      contextChainId: config.contextChainId || '',
+      previousRequestId: config.previousRequestId || '',
       interactionId: config.interactionId || '',
       source: config.source || '',
       status,
-      ...trace,
+      ...persistedTrace,
       startedAt: new Date(startedAtMs).toISOString(),
       completedAt: new Date().toISOString(),
       durationMs: Math.max(0, Date.now() - startedAtMs),
     });
+    return receipt.id;
   } catch (error) {
     // Production initializes the durable database before serving calls. Some
     // isolated provider harnesses intentionally omit it; never replace a real
     // model result with a fabricated receipt in that environment.
     console.warn('[ModelRouting] Could not persist routing receipt:', (error as Error)?.message || error);
+    return undefined;
   }
 }
 
@@ -1098,13 +1255,30 @@ export async function makeLLMCall(
         getRelay,
       );
     }
+    const outboundMessagesEvidence = providerOutboundEvidenceFrom(result);
     const trace = result.routing || directRoutingTrace(config, 'succeeded');
-    persistRoutingTrace(config, trace, 'succeeded', startedAt);
-    return { ...result, routing: trace };
+    const routingReceiptId = persistRoutingTrace(
+      config,
+      trace,
+      'succeeded',
+      startedAt,
+      outboundMessagesEvidence,
+    );
+    return {
+      ...withoutPrivateProviderOutboundEvidence(result),
+      routing: trace,
+      ...(routingReceiptId ? { routingReceiptId } : {}),
+    };
   } catch (error) {
     const trace = (error as any)?.routing as ModelRoutingTrace | undefined
       || directRoutingTrace(config, 'failed', error);
-    persistRoutingTrace(config, trace, 'failed', startedAt);
+    persistRoutingTrace(
+      config,
+      trace,
+      'failed',
+      startedAt,
+      providerOutboundEvidenceFrom(error),
+    );
     throw error;
   }
 }
@@ -1177,12 +1351,18 @@ export async function makeLLMCallDirect(
         ? formatDeepSeekRequest
         : formatOpenAIRequest;
     const localRequest = isLocal
-      ? prepareLocalModelRequest({ messages, toolDeclarations, maxTokens })
+      ? prepareLocalModelRequest({
+          messages,
+          toolDeclarations,
+          maxTokens,
+          compactToolDeclarations: true,
+          requiredToolNames: config.localRequiredToolNames,
+        })
       : null;
     const params: any = fmt({
       model: config.model,
       messages: localRequest?.messages || messages,
-      toolDeclarations,
+      toolDeclarations: localRequest?.toolDeclarations || toolDeclarations,
       maxTokens: localRequest?.maxTokens || maxTokens,
       responseFormat: config.responseFormat,
       ...(isLocal ? {} : { userId: config.userId }),
@@ -1191,6 +1371,16 @@ export async function makeLLMCallDirect(
       if (params.max_tokens !== undefined) params.max_completion_tokens = params.max_tokens;
       delete params.max_tokens;
     }
+
+    const outboundSourceSlot = providerSourceUserSlot(params.messages);
+    const outboundEvidence = buildProviderOutboundMessagesEvidence({
+      provider: config.provider,
+      model: config.model,
+      requestFormat: 'openai_compatible',
+      messages: params.messages,
+      toolDeclarations: params.tools || [],
+      ...outboundSourceSlot,
+    });
 
     const attemptTimeouts = resolveModelAttemptTimeouts(config.attemptTimeouts);
     const execute = () => withCloudResilience(
@@ -1206,16 +1396,18 @@ export async function makeLLMCallDirect(
           timeoutMs: attemptTimeouts.absoluteMs,
         },
       );
-    let response: any;
-    try {
-      response = supervisedLocal
-        ? await runLocalModelInference(config.provider as LocalModelProvider, execute, { signal: config.signal })
-        : await execute();
-    } catch (error) {
-      if (extensionProvider) throw extensionProviderFailure(config.provider, error);
-      throw error;
-    }
-    return parseDeepSeekResponse(response, toolDeclarations);
+    return executeWithProviderOutboundEvidence(outboundEvidence, async () => {
+      let response: any;
+      try {
+        response = supervisedLocal
+          ? await runLocalModelInference(config.provider as LocalModelProvider, execute, { signal: config.signal })
+          : await execute();
+      } catch (error) {
+        if (extensionProvider) throw extensionProviderFailure(config.provider, error);
+        throw error;
+      }
+      return parseDeepSeekResponse(response, toolDeclarations);
+    });
   }
 
   if (config.provider === 'gemini') {
@@ -1230,20 +1422,33 @@ export async function makeLLMCallDirect(
       responseFormat: config.responseFormat,
     });
 
+    const outboundSourceSlot = providerSourceUserSlot(contents);
+    const outboundEvidence = buildProviderOutboundMessagesEvidence({
+      provider: config.provider,
+      model: config.model,
+      requestFormat: 'gemini',
+      messages: contents,
+      toolDeclarations: modelConfig.tools || [],
+      system: modelConfig.systemInstruction,
+      ...outboundSourceSlot,
+    });
+
     const modelInstance = client.getGenerativeModel(modelConfig);
-    const result = await withCloudResilience(
-      operationSignal => (modelInstance as any).generateContent(
-        { contents },
-        operationSignal ? { signal: operationSignal } : undefined,
-      ),
-      {
-        provider: 'gemini',
-        model: config.model,
-        signal: config.signal,
-        timeoutMs: resolveModelAttemptTimeouts(config.attemptTimeouts).absoluteMs,
-      },
-    );
-    return parseGeminiResponse(result);
+    return executeWithProviderOutboundEvidence(outboundEvidence, async () => {
+      const result = await withCloudResilience(
+        operationSignal => (modelInstance as any).generateContent(
+          { contents },
+          operationSignal ? { signal: operationSignal } : undefined,
+        ),
+        {
+          provider: 'gemini',
+          model: config.model,
+          signal: config.signal,
+          timeoutMs: resolveModelAttemptTimeouts(config.attemptTimeouts).absoluteMs,
+        },
+      );
+      return parseGeminiResponse(result);
+    });
   }
 
   if (config.provider === 'openai') {
@@ -1263,19 +1468,31 @@ export async function makeLLMCallDirect(
       delete params.max_tokens;
     }
 
-    const response = await withCloudResilience(
-      operationSignal => client.chat.completions.create(
-        params,
-        operationSignal ? { signal: operationSignal } : undefined,
-      ),
-      {
-        provider: 'openai',
-        model: config.model,
-        signal: config.signal,
-        timeoutMs: resolveModelAttemptTimeouts(config.attemptTimeouts).absoluteMs,
-      },
-    );
-    return parseOpenAIResponse(response);
+    const outboundSourceSlot = providerSourceUserSlot(params.messages);
+    const outboundEvidence = buildProviderOutboundMessagesEvidence({
+      provider: config.provider,
+      model: config.model,
+      requestFormat: 'openai_compatible',
+      messages: params.messages,
+      toolDeclarations: params.tools || [],
+      ...outboundSourceSlot,
+    });
+
+    return executeWithProviderOutboundEvidence(outboundEvidence, async () => {
+      const response = await withCloudResilience(
+        operationSignal => client.chat.completions.create(
+          params,
+          operationSignal ? { signal: operationSignal } : undefined,
+        ),
+        {
+          provider: 'openai',
+          model: config.model,
+          signal: config.signal,
+          timeoutMs: resolveModelAttemptTimeouts(config.attemptTimeouts).absoluteMs,
+        },
+      );
+      return parseOpenAIResponse(response);
+    });
   }
 
   if (config.provider === 'anthropic') {
@@ -1289,19 +1506,32 @@ export async function makeLLMCallDirect(
       maxTokens: maxTokens,
     });
 
-    const response = await withCloudResilience(
-      operationSignal => client.messages.create(
-        params,
-        operationSignal ? { signal: operationSignal } : undefined,
-      ),
-      {
-        provider: 'anthropic',
-        model: config.model,
-        signal: config.signal,
-        timeoutMs: resolveModelAttemptTimeouts(config.attemptTimeouts).absoluteMs,
-      },
-    );
-    return parseAnthropicResponse(response);
+    const outboundSourceSlot = providerSourceUserSlot(params.messages);
+    const outboundEvidence = buildProviderOutboundMessagesEvidence({
+      provider: config.provider,
+      model: config.model,
+      requestFormat: 'anthropic',
+      messages: params.messages,
+      toolDeclarations: params.tools || [],
+      system: params.system,
+      ...outboundSourceSlot,
+    });
+
+    return executeWithProviderOutboundEvidence(outboundEvidence, async () => {
+      const response = await withCloudResilience(
+        operationSignal => client.messages.create(
+          params,
+          operationSignal ? { signal: operationSignal } : undefined,
+        ),
+        {
+          provider: 'anthropic',
+          model: config.model,
+          signal: config.signal,
+          timeoutMs: resolveModelAttemptTimeouts(config.attemptTimeouts).absoluteMs,
+        },
+      );
+      return parseAnthropicResponse(response);
+    });
   }
 
   throw new Error(`Unsupported provider: ${config.provider}`);
@@ -1539,13 +1769,30 @@ export async function makeLLMCallStreaming(
         getRelay,
       );
     }
+    const outboundMessagesEvidence = providerOutboundEvidenceFrom(result);
     const trace = result.routing || directRoutingTrace(config, 'succeeded');
-    persistRoutingTrace(config, trace, 'succeeded', startedAt);
-    return { ...result, routing: trace };
+    const routingReceiptId = persistRoutingTrace(
+      config,
+      trace,
+      'succeeded',
+      startedAt,
+      outboundMessagesEvidence,
+    );
+    return {
+      ...withoutPrivateProviderOutboundEvidence(result),
+      routing: trace,
+      ...(routingReceiptId ? { routingReceiptId } : {}),
+    };
   } catch (error) {
     const trace = (error as any)?.routing as ModelRoutingTrace | undefined
       || directRoutingTrace(config, 'failed', error);
-    persistRoutingTrace(config, trace, 'failed', startedAt);
+    persistRoutingTrace(
+      config,
+      trace,
+      'failed',
+      startedAt,
+      providerOutboundEvidenceFrom(error),
+    );
     throw error;
   }
 }
@@ -1622,12 +1869,18 @@ export async function makeLLMCallStreamingDirect(
         ? formatDeepSeekRequest
         : formatOpenAIRequest;
     const localRequest = isLocal
-      ? prepareLocalModelRequest({ messages, toolDeclarations, maxTokens })
+      ? prepareLocalModelRequest({
+          messages,
+          toolDeclarations,
+          maxTokens,
+          compactToolDeclarations: true,
+          requiredToolNames: config.localRequiredToolNames,
+        })
       : null;
     const params: any = fmt({
       model: config.model,
       messages: localRequest?.messages || messages,
-      toolDeclarations,
+      toolDeclarations: localRequest?.toolDeclarations || toolDeclarations,
       maxTokens: localRequest?.maxTokens || maxTokens,
       ...(isLocal ? {} : { userId: config.userId }),
     });
@@ -1636,6 +1889,16 @@ export async function makeLLMCallStreamingDirect(
       delete params.max_tokens;
     }
     params.stream = true;
+
+    const outboundSourceSlot = providerSourceUserSlot(params.messages);
+    const outboundEvidence = buildProviderOutboundMessagesEvidence({
+      provider: config.provider,
+      model: config.model,
+      requestFormat: 'openai_compatible',
+      messages: params.messages,
+      toolDeclarations: params.tools || [],
+      ...outboundSourceSlot,
+    });
 
     const consumeStream = async (operationSignal?: AbortSignal): Promise<NormalizedLLMResponse> => {
       const supervisor = new ModelAttemptSupervisor(operationSignal, config.attemptTimeouts);
@@ -1724,14 +1987,16 @@ export async function makeLLMCallStreamingDirect(
         signal: config.signal,
       },
     );
-    try {
-      return supervisedLocal
-        ? await runLocalModelInference(config.provider as LocalModelProvider, executeStream, { signal: config.signal })
-        : await executeStream();
-    } catch (error) {
-      if (extensionProvider) throw extensionProviderFailure(config.provider, error);
-      throw error;
-    }
+    return executeWithProviderOutboundEvidence(outboundEvidence, async () => {
+      try {
+        return supervisedLocal
+          ? await runLocalModelInference(config.provider as LocalModelProvider, executeStream, { signal: config.signal })
+          : await executeStream();
+      } catch (error) {
+        if (extensionProvider) throw extensionProviderFailure(config.provider, error);
+        throw error;
+      }
+    });
   }
 
   // ── Gemini streaming ──
@@ -1746,8 +2011,19 @@ export async function makeLLMCallStreamingDirect(
       maxTokens: maxTokens,
     });
 
+    const outboundSourceSlot = providerSourceUserSlot(contents);
+    const outboundEvidence = buildProviderOutboundMessagesEvidence({
+      provider: config.provider,
+      model: config.model,
+      requestFormat: 'gemini',
+      messages: contents,
+      toolDeclarations: modelConfig.tools || [],
+      system: modelConfig.systemInstruction,
+      ...outboundSourceSlot,
+    });
+
     const modelInstance = client.getGenerativeModel(modelConfig);
-    return withCloudResilience(
+    return executeWithProviderOutboundEvidence(outboundEvidence, async () => withCloudResilience(
       async operationSignal => {
         const supervisor = new ModelAttemptSupervisor(operationSignal, config.attemptTimeouts);
         const accumulatedText: string[] = [];
@@ -1800,7 +2076,7 @@ export async function makeLLMCallStreamingDirect(
         }
       },
       { provider: 'gemini', model: config.model, maxRetries: 0, signal: config.signal },
-    );
+    ));
   }
 
   // ── Anthropic streaming ──
@@ -1815,7 +2091,18 @@ export async function makeLLMCallStreamingDirect(
       maxTokens: maxTokens,
     });
 
-    return withCloudResilience(
+    const outboundSourceSlot = providerSourceUserSlot(params.messages);
+    const outboundEvidence = buildProviderOutboundMessagesEvidence({
+      provider: config.provider,
+      model: config.model,
+      requestFormat: 'anthropic',
+      messages: params.messages,
+      toolDeclarations: params.tools || [],
+      system: params.system,
+      ...outboundSourceSlot,
+    });
+
+    return executeWithProviderOutboundEvidence(outboundEvidence, async () => withCloudResilience(
       async operationSignal => {
         const supervisor = new ModelAttemptSupervisor(operationSignal, config.attemptTimeouts);
         const textParts: string[] = [];
@@ -1882,7 +2169,7 @@ export async function makeLLMCallStreamingDirect(
         }
       },
       { provider: 'anthropic', model: config.model, maxRetries: 0, signal: config.signal },
-    );
+    ));
   }
 
   throw new Error(`Unsupported streaming provider: ${config.provider}`);

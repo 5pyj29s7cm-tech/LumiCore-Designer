@@ -43,6 +43,10 @@ import type { UserLLMFallbackCandidate, UserLLMSelectionMode } from './user_pref
 import { CN_DURABLE_EXECUTION_MESSAGES } from '../i18n/durable_execution_messages';
 import { CN_EXECUTION_EVIDENCE_MESSAGES } from '../regions/packs/cn/execution_evidence_messages';
 import { redactDiagnosticSecrets } from '../client/diagnostic_sanitizer';
+import {
+  buildDeterministicExplicitToolRecoveryCall,
+  validateRuntimeOwnedDeterministicToolRecoveryCall,
+} from '../cognition/deterministic_tool_recovery';
 
 export { isConfirmationBlockedToolRecord } from '../tools/confirmation_block';
 
@@ -83,6 +87,11 @@ export interface LLMConfig {
   noImplicitFailover?: boolean;
   /** Candidate was compiled by a trusted routing/orchestration policy. */
   authorizedRoutingCandidate?: boolean;
+  /**
+   * Server-internal schema names that a small local candidate must retain.
+   * This never changes executor authorization or the cloud candidate payload.
+   */
+  localRequiredToolNames?: string[];
 }
 
 export interface LLMResult {
@@ -336,6 +345,52 @@ function resolveModelVisibleToolNames(
   return visible;
 }
 
+function taskExplicitlyNamesTool(task: string, toolName: string): boolean {
+  const escaped = String(toolName || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!escaped) return false;
+  return new RegExp(`(?:^|[^A-Za-z0-9_])${escaped}(?=$|[^A-Za-z0-9_])`, 'i')
+    .test(String(task || ''));
+}
+
+/**
+ * Identify schemas a local 4096-token attempt may not discard. The already
+ * ordered declaration array remains authoritative: hard projections retain
+ * every declaration, while a dynamic route retains its semantic winner,
+ * explicitly requested/previously executed tools, and discovery.
+ */
+function resolveLocalRequiredToolNames(
+  context: ToolContext | undefined,
+  primaryTask: string,
+  declarations: Array<{ function: { name: string } }>,
+  records: ToolExecutionRecord[],
+): string[] {
+  const orderedNames = declarations
+    .map(declaration => String(declaration.function.name || '').trim())
+    .filter(Boolean);
+  if (orderedNames.length === 0) return [];
+  const declared = new Set(orderedNames);
+  const required = new Set<string>();
+  const projection = context?.modelToolProjection;
+
+  if (projection && projection.allowDynamicDiscovery !== true) {
+    for (const name of orderedNames) required.add(name);
+  } else {
+    required.add(orderedNames[0]);
+    for (const name of orderedNames) {
+      if (taskExplicitlyNamesTool(primaryTask, name)) required.add(name);
+    }
+    for (const record of records) {
+      const name = String(record?.name || '').trim();
+      if (declared.has(name)) required.add(name);
+    }
+    const discovery = String(
+      projection?.discoveryToolName || 'client_capability_manifest',
+    ).trim();
+    if (declared.has(discovery)) required.add(discovery);
+  }
+  return orderedNames.filter(name => required.has(name));
+}
+
 const UNTRUSTED_OUTPUT_TOOL_RE = /(?:^mcp_|web|browser|url_|fetch|search|read_file|read_files|list_directory|grep_files|extract_document|read_pdf|read_docx|ocr_|clipboard_read|ui_snapshot|capture_screen|email|message_intake|external|authority_research|company_lookup)/i;
 
 export function isUntrustedToolOutput(toolName: string): boolean {
@@ -445,9 +500,17 @@ export function formatToolRecordForModel(record: ToolExecutionRecord): string {
 export function buildConfirmedStepContinuationMessages(
   goal: string,
   record: ToolExecutionRecord,
+  acceptedSource?: {
+    messageId: string;
+    text: string;
+  },
 ): NormalizedMessage[] {
   const toolCallId = String(record.id || `confirmed_${Date.now().toString(36)}`);
+  const sourceMessageId = String(acceptedSource?.messageId || '').trim();
+  const sourceText = String(acceptedSource?.text || '').trim();
   return [
+    // The original task is runtime-owned continuation context. It must not be
+    // attributed to the newly accepted confirmation transcript row.
     { role: 'user', content: String(goal || '').trim() },
     {
       role: 'assistant',
@@ -464,6 +527,11 @@ export function buildConfirmedStepContinuationMessages(
       name: record.name,
       content: formatToolRecordForModel(record),
     },
+    ...(sourceMessageId && sourceText ? [{
+      role: 'user' as const,
+      content: sourceText,
+      sourceMessageId,
+    }] : []),
     {
       role: 'system',
       content: buildConfirmedStepContinuationNote(record),
@@ -471,8 +539,24 @@ export function buildConfirmedStepContinuationMessages(
   ];
 }
 
+function stableToolCallValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableToolCallValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map(key => [key, stableToolCallValue((value as Record<string, unknown>)[key])]),
+  );
+}
+
 function toolCallSignature(call: Pick<ToolExecutionRecord, 'name' | 'arguments'>): string {
-  return `${call.name}\u0000${JSON.stringify(call.arguments || {})}`;
+  return `${call.name}\u0000${JSON.stringify(stableToolCallValue(call.arguments || {}))}`;
+}
+
+function withoutRuntimeOwnedRecoveryCall(context?: ToolContext): ToolContext | undefined {
+  if (!context?.runtimeOwnedDeterministicRecoveryCall) return context;
+  const { runtimeOwnedDeterministicRecoveryCall: _runtimePrivate, ...toolContext } = context;
+  return toolContext;
 }
 
 function isVerifiedToolSuccess(record: ToolExecutionRecord | undefined): boolean {
@@ -1532,7 +1616,7 @@ export async function runWithTools(
           context?.toolPolicy,
           {
             failClosedWithoutPolicy: context?.source === 'orchestrator',
-            context,
+            context: withoutRuntimeOwnedRecoveryCall(context),
             visibleToolNames: resolveModelVisibleToolNames(context, checkpointRecords),
           },
         );
@@ -1633,6 +1717,10 @@ async function runWithToolsInternal(
     .filter(record => Boolean(record?.name))
     .slice(-40);
   const executionLog: ToolExecutionRecord[] = [...priorExecutionRecords];
+  // Exact content recovered from a revoked confirmation is adapter-private.
+  // No registry declaration hook or tool handler may observe that hidden
+  // payload unless it becomes the validated arguments of write_file itself.
+  const toolExecutionContext = withoutRuntimeOwnedRecoveryCall(context);
   const usageRecords: LLMUsageRecord[] = usageRecordSink || [];
   const invocationBudget: ToolInvocationBudgetState = invocationBudgetState || newToolInvocationBudget();
   invocationBudget.lastTouchedAt = Date.now();
@@ -1680,6 +1768,7 @@ async function runWithToolsInternal(
   let forcedRequiredIndustryTool = '';
   let industryAssessmentFinalResponseReserved = false;
   const identicalRecoveryRetries = new Map<string, number>();
+  const deterministicRecoveryToolCallIds = new Set<string>();
   let recoveryReplans = 0;
   let verificationObligationReplans = 0;
   for (let iteration = 0; iteration < Math.max(loopLimit, effectiveMaxIterations); iteration++) {
@@ -1695,8 +1784,8 @@ async function runWithToolsInternal(
       context?.toolPolicy,
       {
         failClosedWithoutPolicy: context?.source === 'orchestrator',
-        context,
-        visibleToolNames: resolveModelVisibleToolNames(context, executionLog),
+        context: toolExecutionContext,
+        visibleToolNames: resolveModelVisibleToolNames(toolExecutionContext, executionLog),
       },
     );
     const toolDeclarations = forceVerifiedIndustryFinalResponse
@@ -1712,6 +1801,12 @@ async function runWithToolsInternal(
         ...config,
         signal: attempt.signal,
         attemptTimeouts: attempt.attemptTimeouts,
+        localRequiredToolNames: resolveLocalRequiredToolNames(
+          context,
+          primaryTask,
+          toolDeclarations,
+          executionLog,
+        ),
       };
       return attempt.onChunk
         ? makeLLMCallStreaming(
@@ -1787,19 +1882,51 @@ async function runWithToolsInternal(
       });
     }
 
-    if (!response.toolCalls || response.toolCalls.length === 0) {
-      const unknownRequiredIndustryOutcome = hasUnknownRequiredIndustryOutcome(
-        context?.industryWorkflowRequiredToolReceipts,
-        executionLog,
-      );
-      const missingRequiredIndustryTool = firstMissingVerifiedIndustryReceipt(
-        context?.industryWorkflowRequiredToolReceipts,
-        executionLog,
-      );
-      const requiredIndustryReceiptsComplete = (
-        (context?.industryWorkflowRequiredToolReceipts?.length || 0) > 0
-        && !missingRequiredIndustryTool
-      );
+    let plannedToolCalls = response.toolCalls || [];
+    const noNewExecutionRecord = executionLog.length === priorExecutionRecords.length;
+    const runtimeRecovery = noNewExecutionRecord
+      ? validateRuntimeOwnedDeterministicToolRecoveryCall(
+          context?.runtimeOwnedDeterministicRecoveryCall,
+          context,
+          exposedToolNames,
+        )
+      : null;
+    const runtimeRecoveryAlreadyRecorded = runtimeRecovery
+      ? priorExecutionRecords.some(record => (
+          toolCallSignature(record) === toolCallSignature({
+            name: runtimeRecovery.name,
+            arguments: runtimeRecovery.arguments,
+          })
+        ))
+      : false;
+    const unknownRequiredIndustryOutcome = hasUnknownRequiredIndustryOutcome(
+      context?.industryWorkflowRequiredToolReceipts,
+      executionLog,
+    );
+    const missingRequiredIndustryTool = firstMissingVerifiedIndustryReceipt(
+      context?.industryWorkflowRequiredToolReceipts,
+      executionLog,
+    );
+    const industryReceiptsCompleteBeforePlanning = (
+      (context?.industryWorkflowRequiredToolReceipts?.length || 0) > 0
+      && !missingRequiredIndustryTool
+    );
+
+    if (runtimeRecovery) {
+      // The accepted correction has one server-owned exact action. Model tool
+      // output cannot change its path/content or substitute another tool.
+      if (runtimeRecoveryAlreadyRecorded) {
+        plannedToolCalls = [];
+      } else {
+        const id = `deterministic_correction_${iteration}_${Date.now().toString(36)}`;
+        deterministicRecoveryToolCallIds.add(id);
+        plannedToolCalls = [{
+          id,
+          name: runtimeRecovery.name,
+          arguments: runtimeRecovery.arguments,
+        }];
+      }
+    } else if (plannedToolCalls.length === 0) {
       if (
         missingRequiredIndustryTool
         && !unknownRequiredIndustryOutcome
@@ -1871,10 +1998,25 @@ async function runWithToolsInternal(
           continue;
         }
       }
+      const explicitRecoveryCandidate = noNewExecutionRecord
+        ? buildDeterministicExplicitToolRecoveryCall(primaryTask, exposedToolNames)
+        : null;
+      const explicitRecovery = explicitRecoveryCandidate && !priorExecutionRecords.some(record => (
+        toolCallSignature(record) === toolCallSignature({
+          name: explicitRecoveryCandidate.name,
+          arguments: explicitRecoveryCandidate.arguments,
+        })
+      ))
+        ? explicitRecoveryCandidate
+        : null;
       if (
         iteration === 0
-        && executionLog.length === 0
-        && hasRelevantEvidenceTool(toolRegistry, primaryTask, exposedToolNames)
+        && noNewExecutionRecord
+        && (
+          hasRelevantEvidenceTool(toolRegistry, primaryTask, exposedToolNames)
+          || Boolean(explicitRecovery)
+        )
+        && iteration + 1 < effectiveMaxIterations
       ) {
         conversationHistory.push({
           role: 'system',
@@ -1882,7 +2024,18 @@ async function runWithToolsInternal(
         });
         continue;
       }
-      const missingVerification = requiredIndustryReceiptsComplete
+      if (explicitRecovery) {
+        const id = `deterministic_recovery_${iteration}_${Date.now().toString(36)}`;
+        deterministicRecoveryToolCallIds.add(id);
+        plannedToolCalls = [{
+          id,
+          name: explicitRecovery.name,
+          arguments: explicitRecovery.arguments,
+        }];
+      }
+    }
+    if (plannedToolCalls.length === 0) {
+      const missingVerification = industryReceiptsCompleteBeforePlanning
         ? ''
         : buildMissingVerificationObligationPrompt(
             primaryTask,
@@ -1910,7 +2063,7 @@ async function runWithToolsInternal(
         continue;
       }
       if (
-        !requiredIndustryReceiptsComplete
+        !industryReceiptsCompleteBeforePlanning
         && hasUnverifiedToolOutcome(executionLog)
         && exposedToolNames.size > 0
         && recoveryReplans < MAX_TOOL_RECOVERY_REPLANS
@@ -1943,7 +2096,7 @@ async function runWithToolsInternal(
       };
     }
 
-    const rawToolCalls = response.toolCalls.map((tc, index) => ({
+    const rawToolCalls = plannedToolCalls.map((tc, index) => ({
       ...tc,
       id: tc.id || `call_${iteration}_${index}_${Date.now().toString(36)}`,
     }));
@@ -1958,7 +2111,7 @@ async function runWithToolsInternal(
         messages,
         config,
         usageRecords,
-        context,
+        context: toolExecutionContext,
         onToolCall,
       });
     }
@@ -1981,7 +2134,7 @@ async function runWithToolsInternal(
         messages,
         config,
         usageRecords,
-        context,
+        context: toolExecutionContext,
         onToolCall,
       });
     }
@@ -2112,7 +2265,7 @@ async function runWithToolsInternal(
         messages,
         config,
         usageRecords,
-        context,
+        context: toolExecutionContext,
         onToolCall,
       });
     }
@@ -2124,7 +2277,9 @@ async function runWithToolsInternal(
 
     conversationHistory.push({
       role: 'assistant',
-      content: response.text,
+      content: normalizedToolCalls.some(call => deterministicRecoveryToolCallIds.has(call.id || ''))
+        ? 'Server-owned recovery of the explicit, fully specified tool request.'
+        : response.text,
       toolCalls: normalizedToolCalls,
       reasoningContent: response.reasoningContent,
     });
@@ -2213,7 +2368,7 @@ async function runWithToolsInternal(
         id: tc.id,
         name: tc.name,
         arguments: executionArguments,
-        context,
+        context: toolExecutionContext,
         preflight: () => {
           if (!currentAppGuard.allowed) {
             return { allowed: false, reason: currentAppGuard.reason, arguments: executionArguments };
@@ -2228,6 +2383,12 @@ async function runWithToolsInternal(
           return { allowed: true, arguments: executionArguments };
         },
       });
+      if (deterministicRecoveryToolCallIds.has(tc.id || '')) {
+        record.executionOrigin = 'deterministic_route';
+      } else if (response.routingReceiptId) {
+        record.modelRoutingReceiptId = response.routingReceiptId;
+        record.executionOrigin = 'model_selected';
+      }
       executionLog.push(record);
       await onToolCall?.(record);
 
