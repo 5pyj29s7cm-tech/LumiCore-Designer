@@ -223,8 +223,10 @@ describe('conversation action continuation state', () => {
       }],
     });
 
+    // Terminal design work remains queryable from the durable task ledger but
+    // no longer occupies the live foreground pointer after its request closes.
     expect(getOrCreateActiveConversation(userId, 'lumi', 'personal', '').actionContinuationState)
-      .toMatchObject({ taskId, status: 'completed', unfinished: false, activeRequestId: undefined });
+      .toBeUndefined();
     expect((readDB().conversationActionTasks || []).find((task: any) => task.id === taskId))
       .toMatchObject({ status: 'completed', activeRequestId: '', completionSource: 'tool_receipt' });
   });
