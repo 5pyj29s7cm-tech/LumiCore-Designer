@@ -239,7 +239,7 @@ describe('task-center control wiring', () => {
     const autonomousFeed = source('src/components/AutonomousFeed.tsx');
 
     expect(panel).toContain("apiFetch('/api/autonomy/work')");
-    expect(panel).toContain('backgroundTasks.filter(commandCenterTaskIsActive)');
+    expect(panel).toContain('const activeTasks = useMemo(() => tasks.filter(commandCenterTaskIsActive), [tasks])');
     expect(panel).toContain('data-command-center-task-controls');
     expect(panel).toContain('data-task-cancel-requested');
     expect(planner).toContain('data-command-center-plan-run-status');

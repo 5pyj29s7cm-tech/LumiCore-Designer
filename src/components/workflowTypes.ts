@@ -57,14 +57,16 @@ export function normalizeTaskCompletionFeedback(value: unknown): TaskCompletionF
   };
 }
 
-export interface BackgroundWorkflowTask {
+export interface WorkflowTask {
   id: string;
   title?: string;
   status: 'queued' | 'running' | 'pausing' | 'paused' | 'cancelling' | 'completed' | 'failed' | 'blocked' | 'cancelled';
-  workerNames?: string[];
   toolCallsCount?: number;
   error?: string;
   resultPreview?: string;
   updatedAt?: string;
   completionFeedback?: TaskCompletionFeedback;
 }
+
+/** Legacy name retained for product variants that still consume the task feed. */
+export type BackgroundWorkflowTask = WorkflowTask & { workerNames?: string[] };

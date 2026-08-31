@@ -82,11 +82,11 @@ describe('task feedback frontend wiring', () => {
 
     expect(feed).toContain('completionFeedback: normalizeTaskCompletionFeedback(data.completionFeedback)');
     expect(feed).toContain('<TaskCompletionFeedbackDetails');
-    expect(panel).toContain('data-command-center-background-tasks');
+    expect(panel).toContain('data-command-center-tasks');
     expect(panel).toContain('<TaskCompletionFeedbackDetails feedback={task.completionFeedback}');
     expect(planner).toContain('data-command-center-task-details');
     expect(planner).toContain('completionFeedback: normalizeTaskCompletionFeedback(task.completionFeedback)');
-    expect(chat).toContain('normalizeTaskCompletionFeedback(raw?.completionFeedback || data?.completionFeedback)');
+    expect(chat).toContain('normalizeTaskCompletionFeedback(data.completionFeedback)');
     expect(desktop).toContain('normalizeTaskCompletionFeedback(raw?.completionFeedback || data?.completionFeedback)');
   });
 });
