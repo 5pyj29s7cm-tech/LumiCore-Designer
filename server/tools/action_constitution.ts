@@ -111,6 +111,20 @@ export function evaluateActionConstitution(
     return allow('external_app', 'Preparing a desktop AI prompt without submitting it does not create an external side effect');
   }
 
+  const currentIntent = String(context?.actionIntent || '').trim();
+  // i18n-allow: Reviewed multilingual internal-review intent recognition; not user-visible copy.
+  if (
+    /^(?:generate_image|generate_image_dalle)$/i.test(toolName)
+    // i18n-allow: Reviewed multilingual internal-review intent recognition; not user-visible copy.
+    && /(?:生成|制作|创建).{0,24}(?:图|效果图|图片)|\b(?:generate|create|make)\b.{0,24}\b(?:image|visual|render)\b/iu.test(currentIntent)
+    // i18n-allow: Reviewed multilingual internal-review intent recognition; not user-visible copy.
+    && /(?:内部|本地|仅供|只做).{0,20}(?:评审|审阅|预览|使用)|\b(?:internal|local|private)\b.{0,20}\b(?:review|preview|use)\b/iu.test(currentIntent)
+    // i18n-allow: Reviewed multilingual internal-review intent recognition; not user-visible copy.
+    && /(?:不|不要|不会|无需).{0,12}(?:发送|发布|分享|交付)|\b(?:do\s+not|don't|without)\b.{0,16}\b(?:send|publish|share|deliver)\b/iu.test(currentIntent)
+  ) {
+    return allow('draft', 'The user requested internal-only image generation and explicitly prohibited external delivery');
+  }
+
   if (isExplicitMessagingFileTransfer(toolName, context)) {
     return confirm('messaging', 'Messaging file transfer requires exact one-time confirmation');
   }

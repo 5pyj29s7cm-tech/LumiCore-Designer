@@ -73,6 +73,10 @@ export interface ConversationTaskPolicySnapshot {
 
 export interface ConversationTaskReceipt {
   id: string;
+  taskId?: string;
+  turnId?: string;
+  requestId?: string;
+  idempotencyKey?: string;
   key: string;
   name: string;
   arguments: Record<string, unknown>;
@@ -259,6 +263,12 @@ export function normalizeConversationTaskReceipt(value: unknown): ConversationTa
   if (!name || !key) return null;
   return {
     id: compact(candidate.id, 180) || key,
+    ...(compact(candidate.taskId, 180) ? { taskId: compact(candidate.taskId, 180) } : {}),
+    ...(compact(candidate.turnId, 180) ? { turnId: compact(candidate.turnId, 180) } : {}),
+    ...(compact(candidate.requestId, 240) ? { requestId: compact(candidate.requestId, 240) } : {}),
+    ...(compact(candidate.idempotencyKey, 320)
+      ? { idempotencyKey: compact(candidate.idempotencyKey, 320) }
+      : {}),
     key,
     name,
     arguments: candidate.arguments && typeof candidate.arguments === 'object' && !Array.isArray(candidate.arguments)
@@ -319,6 +329,8 @@ export function toolRecordSucceeded(record: ToolExecutionRecord): boolean {
     const ignoredFalseFields = /^(?:wps_create_document|wps_create_document_with_text)$/i.test(record.name)
       ? new Set<string>(['saved'])
       : new Set<string>();
+    const openOperation = /(?:^|_)(?:open|launch|activate)(?:_|$)/i.test(record.name);
+    if (!openOperation) ignoredFalseFields.add('opened');
     const explicitlyFailedOutcome = SEMANTIC_FALSE_FIELDS.some(field => (
       !ignoredFalseFields.has(field) && payload[field] === false
     ));
@@ -493,6 +505,12 @@ export function recordsToTaskReceipts(
       : null;
     return ({
     id: compact(record.id, 180) || `receipt_${Date.now()}_${index}`,
+    ...(compact(record.taskId, 180) ? { taskId: compact(record.taskId, 180) } : {}),
+    ...(compact(record.turnId, 180) ? { turnId: compact(record.turnId, 180) } : {}),
+    ...(compact(record.requestId, 240) ? { requestId: compact(record.requestId, 240) } : {}),
+    ...(compact(record.idempotencyKey, 320)
+      ? { idempotencyKey: compact(record.idempotencyKey, 320) }
+      : {}),
     key: toolRecordKey(record),
     name: compact(record.name, 160),
     arguments: stableValue(record.arguments || {}) as Record<string, unknown>,
@@ -548,6 +566,10 @@ export function taskReceiptsToRecords(receipts: ConversationTaskReceipt[] = []):
     if (!receipt) return null;
     return {
     id: receipt.id,
+    ...(receipt.taskId ? { taskId: receipt.taskId } : {}),
+    ...(receipt.turnId ? { turnId: receipt.turnId } : {}),
+    ...(receipt.requestId ? { requestId: receipt.requestId } : {}),
+    ...(receipt.idempotencyKey ? { idempotencyKey: receipt.idempotencyKey } : {}),
     name: receipt.name,
     arguments: receipt.arguments || {},
     result: receipt.result || '',

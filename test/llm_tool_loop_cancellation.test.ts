@@ -104,7 +104,7 @@ describe('LLM tool loop cancellation boundary', () => {
     expect(result.text).toMatch(/cancelled before the remaining tool calls/i);
   });
 
-  it('stops a model from repeatedly calling the same failing tool with changing arguments', async () => {
+  it('keeps changing-argument failures inside the shared route iteration budget', async () => {
     const registry = new ToolRegistry();
     const failing = vi.fn(async () => { throw new Error('missing exact source path'); });
     registry.register({
@@ -134,12 +134,12 @@ describe('LLM tool loop cancellation boundary', () => {
       ...getters,
     );
 
-    expect(failing).toHaveBeenCalledTimes(3);
-    expect(result.toolCalls).toHaveLength(3);
-    expect(result.text).toMatch(/failed three times/i);
+    expect(failing).toHaveBeenCalledTimes(10);
+    expect(result.toolCalls).toHaveLength(10);
+    expect(result.text).toMatch(/bounded tool execution.+budget was exhausted/is);
   });
 
-  it('reserves a tool-free final answer after a verified design project status read', async () => {
+  it('hands a verified design-project status receipt to centralized finalization', async () => {
     const registry = new ToolRegistry();
     const statusHandler = vi.fn(async () => JSON.stringify({
       ok: true,
@@ -176,8 +176,9 @@ describe('LLM tool loop cancellation boundary', () => {
     );
 
     expect(statusHandler).toHaveBeenCalledTimes(1);
-    expect(mocks.makeLLMCall).toHaveBeenCalledTimes(2);
-    expect(result.text).toBe('The project brief is complete and CAD is next.');
+    expect(mocks.makeLLMCall).toHaveBeenCalledTimes(1);
+    expect(result.text).toBe('');
+    expect(result.toolCalls).toHaveLength(1);
   });
 
   it('does not end a creation workflow merely because it read the project status first', async () => {
@@ -234,7 +235,7 @@ describe('LLM tool loop cancellation boundary', () => {
     ]);
   });
 
-  it('requires the first professional receipt tool before an industry blocker answer', async () => {
+  it('does not rebuild product workflow orchestration inside the shared adapter', async () => {
     const registry = new ToolRegistry();
     const assessment = vi.fn(async () => JSON.stringify({
       status: 'not_ready',
@@ -277,9 +278,9 @@ describe('LLM tool loop cancellation boundary', () => {
       },
     );
 
-    expect(assessment).toHaveBeenCalledTimes(1);
-    expect(result.toolCalls.map(record => record.name)).toEqual(['industry_source_assessment']);
-    expect(result.text).toMatch(/creation stopped/i);
+    expect(assessment).not.toHaveBeenCalled();
+    expect(result.toolCalls).toEqual([]);
+    expect(result.text).toBe('The source looks incomplete.');
   });
 
   it('forces the exact missing industry tool after the model falls back to stale ledger reads', async () => {
@@ -329,7 +330,7 @@ describe('LLM tool loop cancellation boundary', () => {
         industryWorkflowTaskId: 'wt_task_current',
         industryWorkflowRequiredToolReceipts: ['industry_source_assessment', 'industry_output_create'],
         toolPolicy: {
-          allowedTools: ['industry_source_assessment', 'industry_output_create', 'unrelated_read_only'],
+          allowedTools: ['industry_source_assessment', 'industry_output_create'],
           requireConfirmation: [],
           forbiddenTools: [],
           maxIterations: 3,
@@ -344,7 +345,7 @@ describe('LLM tool loop cancellation boundary', () => {
       'industry_source_assessment',
       'industry_output_create',
     ]);
-    expect(result.text).toBe('Created and verified current.dxf.');
+    expect(result.text).toMatch(/bounded tool execution.+budget was exhausted/is);
     expect(result.text).not.toMatch(/historical file as the current result/i);
   });
 
@@ -391,7 +392,7 @@ describe('LLM tool loop cancellation boundary', () => {
         industryWorkflowTaskId: 'wt_task_current',
         industryWorkflowRequiredToolReceipts: ['industry_source_assessment', 'industry_output_create'],
         toolPolicy: {
-          allowedTools: ['industry_source_assessment', 'industry_output_create', 'unrelated_read_only'],
+          allowedTools: ['industry_source_assessment', 'industry_output_create'],
           requireConfirmation: [],
           forbiddenTools: [],
           maxIterations: 3,
@@ -403,7 +404,7 @@ describe('LLM tool loop cancellation boundary', () => {
     expect(output).not.toHaveBeenCalled();
     expect(unrelatedRead).not.toHaveBeenCalled();
     expect(result.toolCalls.map(record => record.name)).toEqual(['industry_source_assessment']);
-    expect(result.text).toMatch(/industry_output_create/);
+    expect(result.text).not.toMatch(/industry_output_create/);
     expect(result.text).not.toMatch(/historical file as the current result/i);
   });
 });

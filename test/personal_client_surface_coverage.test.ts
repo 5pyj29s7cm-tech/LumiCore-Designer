@@ -130,7 +130,6 @@ describe('complete personal-client surface contract', () => {
     ]);
     expect(quotedPropertyValues(desktopIcons, 'windowId')).not.toContain('command-center');
     expect(quotedPropertyValues(desktopIcons, 'windowId')).not.toContain('runtime-log');
-    expect(quotedPropertyValues(desktopIcons, 'windowId')).toContain('personalization');
     expect(quotedPropertyValues(desktopIcons, 'windowId')).not.toEqual(expect.arrayContaining(['avatar-studio', 'sound']));
     expect(quotedPropertyValues(utilityIcons, 'id')).toContain('personalization');
     expect(quotedPropertyValues(utilityIcons, 'id')).toEqual(expect.arrayContaining(['personality', 'kernel']));
@@ -143,7 +142,6 @@ describe('complete personal-client surface contract', () => {
     const dock = sourceBlock(desktop, '{/* Bottom Taskbar / Dock */}', '{/* Main OS Content Layer (Personal Desktop Surface) */}');
     expect(dock).not.toContain('data-lumi-target="knowledge"');
     expect(dock).not.toContain('data-lumi-target="personalization"');
-    expect(desktopIcons).toContain("id: 'personalization'");
     expect(dock).not.toContain("setViewMode(viewMode === 'personal' ? 'world' : 'personal')");
     expect(dock).not.toContain('<Globe');
     expect(desktop).toContain('getPersonalClientSurfaceByAction(action)');

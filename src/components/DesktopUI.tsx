@@ -70,7 +70,11 @@ import { useApp, type OperationMode } from '@/contexts/AppContext';
 import { describeAgentResponseDelivery } from '@/lib/agentResponseDelivery';
 const LumiCoreAvatar = lazy(() => import('./LumiCoreAvatar').then(m => ({ default: m.LumiCoreAvatar })));
 const InkWorldLazy = lazy(() => import('./InkWorld').then(m => ({ default: m.InkWorld })));
-import type { WorkflowStep } from './workflowTypes';
+import {
+  normalizeTaskCompletionFeedback,
+  type WorkflowTask,
+  type WorkflowStep,
+} from './workflowTypes';
 import type { CommandCenterView } from './commandCenterTypes';
 import { useWakeWord } from '../hooks/useWakeWord';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -1983,6 +1987,7 @@ export function DesktopUI({
   const showMcpPanel = false;
   const [agentStatus, setAgentStatus] = useState<'idle' | 'thinking' | 'background' | 'executing' | 'waiting_confirmation' | 'done' | 'error'>('idle');
   const [workflowSteps, setWorkflowSteps] = useState<WorkflowStep[]>([]);
+  const autonomousTaskStatusRef = useRef<Map<string, string>>(new Map());
   const [pendingOperationMode, setPendingOperationMode] = useState<OperationMode | null>(null);
   const seenWorkflowToolEvents = useRef<Set<string>>(new Set());
   const readMeetingItem = useCallback((scopedKey: string, legacyKey: string): string | null => (
@@ -3454,6 +3459,49 @@ export function DesktopUI({
       }
     };
 
+    const normalizeAutonomousTask = (data: any, status: WorkflowTask['status']): WorkflowTask | null => {
+      const raw = data?.task || data;
+      const id = String(raw?.id || data?.taskId || '');
+      if (!id) return null;
+      return {
+        id,
+        title: raw?.title || data?.title || id,
+        status: (raw?.status || status) as WorkflowTask['status'],
+        toolCallsCount: Number(raw?.toolCallsCount || 0),
+        error: raw?.error,
+        resultPreview: raw?.resultPreview || raw?.result,
+        updatedAt: raw?.updatedAt || raw?.timestamp,
+        completionFeedback: normalizeTaskCompletionFeedback(raw?.completionFeedback || data?.completionFeedback),
+      };
+    };
+
+    const recordAutonomousTaskStep = (task: WorkflowTask) => {
+      const previousStatus = autonomousTaskStatusRef.current.get(task.id);
+      if (previousStatus === task.status) return;
+      autonomousTaskStatusRef.current.set(task.id, task.status);
+      const isActive = task.status === 'queued' || task.status === 'running' || task.status === 'cancelling';
+      const isFailed = task.status === 'failed';
+      setAgentStatus(isActive ? 'background' : isFailed ? 'error' : 'done');
+      setWorkflowSteps(prev => [...prev, {
+        id: `autonomous-task-${task.id}-${task.status}-${Date.now()}`,
+        type: isFailed ? 'error' : task.status === 'completed' ? 'response' : 'background',
+        text: `${t.workflowAutonomousTask || 'Autonomous task'}: ${task.status}`,
+        detail: task.title || task.id,
+        time: Date.now(),
+      }]);
+    };
+
+    const autonomousTaskListener = (status: WorkflowTask['status']) => (data: any) => {
+      const task = normalizeAutonomousTask(data, status);
+      if (task) recordAutonomousTaskStep(task);
+    };
+    const onAutonomousStarted = autonomousTaskListener('running');
+    const onAutonomousPaused = autonomousTaskListener('paused');
+    const onAutonomousRetry = autonomousTaskListener('queued');
+    const onAutonomousCompleted = autonomousTaskListener('completed');
+    const onAutonomousFailed = autonomousTaskListener('failed');
+    const onAutonomousCancelled = autonomousTaskListener('cancelled');
+
     const onDesktopControlState = (data: any) => {
       const id = `desktop-control-${String(data?.leaseId || data?.taskId || 'current')}`;
       const status = String(data?.status || '');
@@ -3475,6 +3523,12 @@ export function DesktopUI({
     };
 
     socket.on('agent:status', onStatus);
+    socket.on('autonomous:task_started', onAutonomousStarted);
+    socket.on('autonomous:task_paused', onAutonomousPaused);
+    socket.on('autonomous:task_retry_scheduled', onAutonomousRetry);
+    socket.on('autonomous:task_completed', onAutonomousCompleted);
+    socket.on('autonomous:task_failed', onAutonomousFailed);
+    socket.on('autonomous:task_cancelled', onAutonomousCancelled);
     socket.on('agent:desktop_control_state', onDesktopControlState);
     socket.on('agent:tool_call', onToolCall);
     socket.on('agent:tool', onToolCall);
@@ -3542,6 +3596,12 @@ export function DesktopUI({
 
     return () => {
       socket.off('agent:status', onStatus);
+      socket.off('autonomous:task_started', onAutonomousStarted);
+      socket.off('autonomous:task_paused', onAutonomousPaused);
+      socket.off('autonomous:task_retry_scheduled', onAutonomousRetry);
+      socket.off('autonomous:task_completed', onAutonomousCompleted);
+      socket.off('autonomous:task_failed', onAutonomousFailed);
+      socket.off('autonomous:task_cancelled', onAutonomousCancelled);
       socket.off('agent:desktop_control_state', onDesktopControlState);
       socket.off('agent:tool_call', onToolCall);
       socket.off('agent:tool', onToolCall);
@@ -3563,6 +3623,7 @@ export function DesktopUI({
     petStorageKeys,
     socket,
     t.workflowAnalyzing,
+    t.workflowAutonomousTask,
     t.workflowBackgroundStep,
     t.workflowBackgroundTask,
     t.workflowCalling,
@@ -4417,7 +4478,7 @@ export function DesktopUI({
         commandCenterOpen: chatOpen,
         commandCenterView,
         notificationsOpen: isNotificationPanelOpen,
-        memoryAvatarOpen: memoryLabOpen,
+        memoryAvatarOpen: memoryLabOpen || sanctuaryOpen,
         meetingOpen: meetingNotesOpen || operationMode === 'meeting',
         wallpaperMode: isWallpaperMode,
         widgetMode: isDesktopWidgetMode,
@@ -4464,7 +4525,7 @@ export function DesktopUI({
           commandCenterOpen: chatOpen,
           commandCenterView,
           notificationsOpen: isNotificationPanelOpen,
-          memoryAvatarOpen: memoryLabOpen,
+          memoryAvatarOpen: memoryLabOpen || sanctuaryOpen,
           runtimeLogOpen: openWindows.includes('kernel'),
           meetingOpen: meetingNotesOpen,
           wallpaperMode: isWallpaperMode,
@@ -4531,6 +4592,7 @@ export function DesktopUI({
     isWallpaperMode,
     knowledgeOpen,
     memoryLabOpen,
+    sanctuaryOpen,
     mcpActivities.length,
     meetingNotes.length,
     meetingNotesOpen,
@@ -5088,35 +5150,6 @@ export function DesktopUI({
               : 'opacity-100 pointer-events-auto'
           }`}
         >
-          <button
-            data-lumi-target="knowledge"
-            onClick={() => setKnowledgeOpen(prev => !prev)}
-            className={`w-12 h-12 rounded-2xl flex items-center justify-center transition-all group relative ${
-              knowledgeOpen
-                ? 'bg-gradient-to-br from-cyan-400 to-blue-600 text-white shadow-lg'
-                : 'bg-white/5 text-white/40 hover:bg-white/10 hover:text-white'
-            }`}
-          >
-            <BrainCircuit size={24} />
-            <div className="absolute -top-12 left-1/2 -translate-x-1/2 px-3 py-1 bg-black/80 rounded-lg text-xs font-black uppercase text-white opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">
-              {t.knowledgeBase || 'Knowledge Base'}
-            </div>
-          </button>
-          <button
-            data-lumi-target="personalization"
-            onClick={() => toggleWindow('personalization')}
-            className={`w-12 h-12 rounded-2xl flex items-center justify-center transition-all group relative ${
-              openWindows.includes('personalization')
-                ? 'bg-gradient-to-br from-cyan-400 to-indigo-600 text-white shadow-lg'
-                : 'bg-white/5 text-white/40 hover:bg-white/10 hover:text-white'
-            }`}
-          >
-            <Brush size={24} />
-            <div className="absolute -top-12 left-1/2 -translate-x-1/2 px-3 py-1 bg-black/80 rounded-lg text-xs font-black uppercase text-white opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">
-              {t.personalization || 'Personalization'}
-            </div>
-          </button>
-          <div className="lumi-dock-separator h-8 w-px shrink-0 bg-white/10 mx-2" />
           <AnimatePresence>
             {dockApps.map(app => {
               const isActive = openWindows.includes(app.id) || (app.id === 'command-center' && chatOpen);

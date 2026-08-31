@@ -326,18 +326,29 @@ export function buildLumiExecutionPipeline(
     execution: legacyExecution,
     manifest: unrestrictedManifest,
   });
+  const inactiveIndustryTools = [
+    ...(!turnIntent.flow.industryWorkflowEntryId
+      ? ['industry_workflow_start', 'industry_workflow_complete']
+      : []),
+    ...(!turnIntent.flow.industryGuidanceRequest
+      ? ['industry_user_guide', 'industry_guidance_preference_set']
+      : []),
+  ];
   const execution = applyAdditionalForbiddenTools(
-    applyCurrentTurnNoMutationConstraint(
-      applySelectedWorkflowAdapterPolicy(
-        applyLumiRoutingShadowGuard(legacyExecution, shadowComparison),
-        turnIntent,
+    applyAdditionalForbiddenTools(
+      applyCurrentTurnNoMutationConstraint(
+        applySelectedWorkflowAdapterPolicy(
+          applyLumiRoutingShadowGuard(legacyExecution, shadowComparison),
+          turnIntent,
+          input.registry,
+          input.personalityToolPolicy,
+          input.isSanctuary,
+        ),
         input.registry,
-        input.personalityToolPolicy,
-        input.isSanctuary,
+        input.dispatch.text,
+        Boolean(turnIntent.flow.industryWorkflowEntryId),
       ),
-      input.registry,
-      input.dispatch.text,
-      Boolean(turnIntent.flow.industryWorkflowEntryId),
+      inactiveIndustryTools,
     ),
     input.additionalForbiddenTools,
   );

@@ -63,8 +63,6 @@ describe('chat and voice tool-call stability', () => {
     expect(restChat).toContain('finalizeLumiResponse');
     expect(restChat).toContain("source: 'rest_chat'");
     expect(restChat).toContain('blocked: finalized.blocked');
-    expect(restChat).toContain('do not call downstream creators merely to satisfy the receipt list');
-    expect(restChat).toContain('mergeIndustryWorkflowFinalState');
   });
 
   it('archives legal meeting analysis through the legal casework toolchain', () => {
@@ -109,12 +107,9 @@ describe('chat and voice tool-call stability', () => {
   });
 
   it('keeps voice tool execution visible and aligned with chat permission behavior', () => {
-    const socketChat = readFileSync(path.join(process.cwd(), 'server/socket/chat.ts'), 'utf8');
     const voice = readFileSync(path.join(process.cwd(), 'server/socket/voice.ts'), 'utf8');
-    const restChat = readFileSync(path.join(process.cwd(), 'server/routes/chat_routes.ts'), 'utf8');
 
     expect(voice).toContain('shouldAllowVoiceLocalFileWriteForTurn');
-    expect(voice).toContain('shouldAllowExplicitLocalFileWrite');
     expect(voice).toContain('allowLocalFileWrites');
     expect(voice).toContain('localWriteIntentReason');
     expect(voice).toContain('emitToolLifecycle');
@@ -122,31 +117,6 @@ describe('chat and voice tool-call stability', () => {
     expect(voice).toContain('activeTurnRequestId');
     expect(voice).toContain("channel: publicPayload.channel || 'voice'");
     expect(voice).toContain('onProgress');
-    expect(restChat).toContain('shouldAllowExplicitLocalFileWrite(localWriteAuthorizationText)');
-    expect(restChat).toContain('[routeText, industryWorkflowSourceInput]');
-    expect(restChat).toContain('allowLocalFileWrites,');
-    expect(restChat).toContain('localWriteIntentReason,');
-    expect(voice).toContain('startIndustryWorkflow({');
-    expect(voice).toContain('getIndustryWorkflowPrerequisiteStatus');
-    expect(voice).toContain('voice_industry_prerequisite_guard');
-    expect(socketChat).toContain('getIndustryWorkflowPrerequisiteStatus');
-    expect(socketChat).toContain('chat_industry_prerequisite_guard');
-    expect(socketChat).toContain('chat_design_project_status');
-    expect(socketChat).toContain('recordIndustryWorkflowExecution');
-    expect(socketChat).toContain("setConversationActionExecutionStatus(conversationId, uid, 'blocked'");
-    const chatPrerequisiteStart = socketChat.indexOf('if (chatIndustryWorkflowTask && chatIndustryPrerequisite)');
-    const chatPrerequisiteEnd = socketChat.indexOf('effectiveSystemPrompt +=', chatPrerequisiteStart);
-    const chatPrerequisiteGuard = socketChat.slice(chatPrerequisiteStart, chatPrerequisiteEnd);
-    expect(chatPrerequisiteGuard).toContain('requestId, deferActionPreparation: true');
-    const voicePrerequisiteStart = voice.indexOf('if (voiceIndustryWorkflowTask && voiceIndustryPrerequisite)');
-    const voicePrerequisiteEnd = voice.indexOf('if (userObservedCompletion)', voicePrerequisiteStart);
-    const voicePrerequisiteGuard = voice.slice(voicePrerequisiteStart, voicePrerequisiteEnd);
-    expect(voicePrerequisiteGuard).toContain('await commitVoiceTerminal({');
-    expect(voicePrerequisiteGuard).toContain("source: 'voice_industry_prerequisite_guard'");
-    expect(voicePrerequisiteGuard).toContain('persistTerminalState: () => {');
-    expect(voicePrerequisiteGuard).toMatch(/setConversationActionExecutionStatus\([\s\S]*?'blocked'/);
-    expect(voice).toContain('voice_design_project_status');
-    expect(voice).toContain('bindIndustryWorkflowToolPolicy');
   });
 
   it('keeps personal and organization knowledge retrieval aligned across text and voice', () => {

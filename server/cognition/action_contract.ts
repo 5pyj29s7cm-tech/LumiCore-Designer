@@ -166,13 +166,13 @@ function extractPrimaryTaskText(input: string): string {
 }
 
 const CURRENT_APP_REFERENCE_RE =
-  /(?:\u5728|\u5f80|\u7528).{0,16}(?:\u8fd9\u91cc\u9762|\u8fd9\u91cc|\u91cc\u9762|\u8fd9\u4e2a\u8f6f\u4ef6|\u5f53\u524d\u8f6f\u4ef6|\u521a\u6253\u5f00\u7684(?:\u8f6f\u4ef6|\u5e94\u7528|\u91cc\u9762)|(?:WPS(?:\s+Office)?|Word|Excel|PowerPoint|AutoCAD|CAD|\u5fae\u4fe1|WeChat|Chrome|\u753b\u56fe).{0,8}(?:\u91cc|\u91cc\u9762|\u4e2d|\u5185))|\b(?:in|inside)\b.{0,24}\b(?:this|current|opened|WPS|Word|Excel|PowerPoint|AutoCAD|WeChat|Chrome)\b.{0,12}\b(?:app|application|document)?/iu;
+  /(?:\u5728|\u5f80|\u7528).{0,16}(?:\u8fd9\u91cc\u9762|\u8fd9\u91cc|\u91cc\u9762|\u8fd9\u4e2a\u8f6f\u4ef6|\u5f53\u524d\u8f6f\u4ef6|\u521a\u6253\u5f00\u7684(?:\u8f6f\u4ef6|\u5e94\u7528|\u91cc\u9762)|(?:WPS(?:\s+Office)?|Word|Excel|PowerPoint|AutoCAD|CAD|SketchUp|Photoshop|\u5fae\u4fe1|WeChat|Chrome|\u753b\u56fe|\u9177\u5bb6\u4e50|\u5343\u725b|\u91d1\u8776).{0,8}(?:\u91cc|\u91cc\u9762|\u4e2d|\u5185))|\b(?:in|inside)\b.{0,24}\b(?:this|current|opened|WPS|Word|Excel|PowerPoint|AutoCAD|SketchUp|Photoshop|WeChat|Chrome)\b.{0,12}\b(?:app|application|document)?/iu;
 
 const CURRENT_APP_MUTATION_INTENT_RE =
   /(?:\u65b0\u5efa|\u521b\u5efa|\u5199\u5165|\u8f93\u5165|\u7c98\u8d34|\u5199|\u7f16\u8f91|\u4fee\u6539|\u4fdd\u5b58)|\b(?:new|create|write|type|paste|edit|modify|save)\b/iu;
 
 const AUTHORING_APP_TARGET_RE =
-  /(?:\bWPS(?:\s+Office)?\b|\bMicrosoft\s+Word\b|\bWord\b|\bExcel\b|\bPowerPoint\b|\bAutoCAD\b|\bCAD\b|\u91d1\u5c71\u6587\u5b57|\u753b\u56fe)/iu;
+  /(?:\bWPS(?:\s+Office)?\b|\bMicrosoft\s+Word\b|\bWord\b|\bExcel\b|\bPowerPoint\b|\bAutoCAD\b|\bCAD\b|\bSketchUp\b|\bPhotoshop\b|\u91d1\u5c71\u6587\u5b57|\u753b\u56fe|\u9177\u5bb6\u4e50|\u5343\u725b|\u91d1\u8776)/iu;
 const APP_OPEN_INTENT_RE =
   /(?:\u6253\u5f00|\u542f\u52a8|\u8fd0\u884c|\u8fdb\u5165)|\b(?:open|launch|start|run)\b/iu;
 
@@ -187,6 +187,7 @@ export function requestedDesktopWindowAction(input: string): DesktopWindowAction
 }
 
 export function requiresCurrentAppUiMutation(input: string): boolean {
+  if (requestsBlankAutoCadDocument(input)) return false;
   const raw = String(input || '');
   const primary = compact(extractPrimaryTaskText(input));
   const hasRecoveredTarget = /(?:^|\r?\n)\s*-\s*appTarget:\s*(?!none|null|unknown|n\/a)[^\r\n]+/i.test(raw);
@@ -238,8 +239,8 @@ export function extractCurrentAppTarget(input: string): string {
   if (recovered && !/^(?:none|null|unknown|n\/a)$/i.test(recovered)) return recovered;
 
   const primary = compact(extractPrimaryTaskText(raw));
-  const named = primary.match(/\b(WPS(?:\s+Office)?|Microsoft\s+Word|Word|Excel|PowerPoint|AutoCAD|WeChat|Chrome)\b/i)?.[1]
-    || primary.match(/(\u5fae\u4fe1|\u753b\u56fe)/u)?.[1];
+  const named = primary.match(/\b(WPS(?:\s+Office)?|Microsoft\s+Word|Word|Excel|PowerPoint|AutoCAD|SketchUp|Photoshop|WeChat|Chrome)\b/i)?.[1]
+    || primary.match(/(\u5fae\u4fe1|\u753b\u56fe|\u9177\u5bb6\u4e50|\u5343\u725b|\u91d1\u8776)/u)?.[1];
   return compact(named);
 }
 
@@ -2750,6 +2751,17 @@ function hasArtifactVerification(records: ToolExecutionRecord[]): boolean {
       const payload = parseRecordJson(record);
       return (payload?.exists === true && Number(payload?.size ?? payload?.sizeBytes ?? 1) > 0)
         || /"exists"\s*:\s*true/i.test(record.result) && !/"(?:size|sizeBytes)"\s*:\s*0\b/i.test(record.result);
+    }
+    if (
+      record.terminalVerification?.status === 'verified'
+      && record.terminalVerification?.strategy === 'artifact'
+    ) {
+      const payload = parseRecordJson(record);
+      const primaryExists = payload?.exists === true && Number(payload?.size ?? payload?.sizeBytes ?? 0) > 0;
+      const previewRequired = Boolean(compact(payload?.previewPath));
+      const previewVerified = !previewRequired
+        || payload?.previewExists === true && Number(payload?.previewSize ?? payload?.previewSizeBytes ?? 0) > 0;
+      return primaryExists && previewVerified;
     }
     return false;
   });

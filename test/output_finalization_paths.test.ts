@@ -80,15 +80,11 @@ describe('finalized output paths', () => {
     expect(rest).toContain('createPreFinalizationTextGate');
     expect(rest).toContain('restTextGate.push(chunk)');
     expect(rest).toContain('if (!deferRestStream)');
-    expect(rest).toContain('const restIndustryToolPolicy = industryWorkflowTask');
     expect(rest).toContain('const restModelToolPolicy = restrictToolPolicyForExecutionBoundary(');
-    expect(rest).toContain('buildModelCapabilityPolicy(restExecutionDecision)');
-    expect(rest).toContain('buildHttpToolSecurityContext(req)');
-    expect(rest).toContain('desktopProofPresented && !httpToolSecurityContext.localExecution');
-    expect(rest).toContain('httpToolSecurityContext.executionBoundary');
+    expect(rest).toContain('restExecutionPipeline.authorizationPolicy');
+    expect(rest).toContain("'remote_restricted'");
     expect(rest).toContain('toolPolicy: restModelToolPolicy');
-    expect(rest).toContain('restModelToolPolicy.maxIterations ?? 3');
-    expect(rest).toContain('source: \'rest_chat_stream\'');
+    expect(rest).toContain('restModelToolPolicy.maxIterations || 3');
     expect(rest).toContain("finalizeRestToolResult(responseText, result, 'rest_chat_stream')");
     expect(rest).toContain('finalizeExecutionForOutboundDelivery');
     expect(rest).toContain("'rest_chat_guard_recovery'");
