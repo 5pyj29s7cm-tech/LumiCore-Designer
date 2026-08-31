@@ -999,7 +999,10 @@ export function buildActionContract(input: string): LumiActionContract {
   // A design-project ledger query can contain generic task/status words, but
   // those words refer to the persisted design stage rather than Lumi's
   // runtime-work queue. Keep the edition contract ahead of task control.
-  if (isDesignProjectStatusRequest(text)) return buildDesignDeliveryContract();
+  if (
+    /(?:设计项目|CAD|效果图|提案\s*PPT|交付中心|design\s+project|visualization|handoff)/iu.test(text) // i18n-allow: Designer status input recognition; not user-visible copy.
+    && isDesignProjectStatusRequest(text)
+  ) return buildDesignDeliveryContract();
   // A named persistent takeover-task query belongs to the takeover ledger,
   // not the active runtime-work ledger. Its deterministic quick command emits
   // a verified work_takeover_task_list receipt, so do not demand the unrelated

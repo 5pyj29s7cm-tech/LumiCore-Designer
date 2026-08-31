@@ -62,7 +62,21 @@ const EMPTY_INTENT: NormalizedActionIntent = {
 
 // i18n-allow: Multilingual client-navigation input recognition; not user-visible copy.
 const CLIENT_NAVIGATION_VERB_RE = // i18n-allow: Multilingual client-navigation input recognition; not user-visible copy.
-  /(?:打开|开启|启用|进入|切换到|切到|回到|返回|显示|展开|关闭|收起|open|show|enter|switch|turn\s+on|return|close)/iu;
+  /(?:打开|开启|启用|进入|切换到|切换|切到|回到|返回|显示|展开|关闭|收起|open|show|enter|switch|turn\s+on|return|close)/iu;
+
+// An actionable correction restates the command after a discourse prefix.
+// Parse that command through the same normalized-intent pipeline instead of
+// letting task relation, tool intent, and client navigation each invent a
+// different correction rule.
+const ACTIONABLE_CORRECTION_PREFIX_RE =
+  /^(?:(?:我说的是|我说的|我的意思是|我的意思|我指的是|刚才(?:我)?说的是|刚才(?:我)?说的|刚刚(?:我)?说的是|刚刚(?:我)?说的)\s*[:：,，]?\s*|(?:what\s+I\s+meant\s+was|I\s+was\s+asking\s+you\s+to|I\s+meant)\s*[:,-]?\s*)/iu; // i18n-allow: Multilingual actionable-correction input recognition; not user-visible copy.
+
+export function extractActionableCorrectionInstruction(value: string): string | null {
+  const text = currentTurnText(value).replace(/\s+/gu, ' ').trim();
+  if (!ACTIONABLE_CORRECTION_PREFIX_RE.test(text)) return null;
+  const instruction = text.replace(ACTIONABLE_CORRECTION_PREFIX_RE, '').trim();
+  return instruction && instruction !== text ? instruction : null;
+}
 
 // Some speech recognizers render “壁纸模式” as “壁纸状态”. A standalone
 // imperative using that phrase still means entering Lumi's wallpaper surface;
@@ -85,10 +99,7 @@ const BARE_ASSISTANT_RESTATEMENT_RE =
   /^(?:(?:你)?(?:刚才|刚刚)\s*)?(?:怎么说|怎麼說)(?:的)?[啊呀吧嘛呢，,。！？?!\s]*$/u;
 
 function escapePattern(value: string): string {
-  return value
-    .trim()
-    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    .replace(/[\s_-]+/g, '[\\s_-]*');
+  return value.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/[\s_-]+/g, '[\\s_-]*');
 }
 
 const REGISTERED_CLIENT_SURFACE_RULES: ReadonlyArray<{ pattern: RegExp; target: string; action: string }> =
@@ -96,16 +107,10 @@ const REGISTERED_CLIENT_SURFACE_RULES: ReadonlyArray<{ pattern: RegExp; target: 
     const action = surface.actions[0];
     if (!action) return [];
     const aliases = Array.from(new Set([
-      surface.id,
-      surface.label,
-      ...(surface.navigationAliases || []),
+      surface.id, surface.label, ...(surface.navigationAliases || []),
     ].map(value => String(value || '').trim()).filter(Boolean)));
     if (!aliases.length) return [];
-    return [{
-      pattern: new RegExp(`(?:${aliases.map(escapePattern).join('|')})`, 'iu'),
-      target: surface.target,
-      action,
-    }];
+    return [{ pattern: new RegExp(`(?:${aliases.map(escapePattern).join('|')})`, 'iu'), target: surface.target, action }];
   });
 
 const CLIENT_SURFACE_RULES: ReadonlyArray<{ pattern: RegExp; target: string; action: string }> = [
@@ -132,7 +137,7 @@ function currentTurnText(value: string): string {
     .trim();
 }
 
-function stripNegatedActionClauses(value: string): string {
+function stripNegatedDesignActionClauses(value: string): string {
   return String(value || '')
     .replace(/(?:\u4e0d\u8981|\u4e0d\u7528|\u65e0\u9700|\u4e0d\u5fc5|\u7981\u6b62|\u4e0d\u5f97|\u5207\u52ff|\u8bf7\u52ff|\u522b)[^\uff0c\u3002\uff1b!?\uff01\uff1f]{0,160}/gu, ' ')
     .replace(/\b(?:do\s+not|don't|dont|must\s+not|never|without)\b[^.!?;]{0,200}/gi, ' ')
@@ -158,14 +163,42 @@ function trimSlot(value: string): string {
 
 const ARTIFACT_FILE_EXTENSION_RE = /\.(?:txt|md|csv|json|docx?|xlsx?|pptx?|pdf)\b/iu;
 
+/**
+ * Find a basename without asking the regexp engine to retry a bounded
+ * filename capture at every character in a long, delimiter-free turn. The
+ * previous `{1,160}\.ext` expression did up to 160 failed scans per input
+ * position when no filename was present, which made ordinary long Chinese
+ * conversation disproportionately expensive.
+ */
+function relativeArtifactPath(text: string, includeJson = true): string {
+  const extensionMatches = text.matchAll(includeJson
+    ? /\.(?:txt|md|csv|json|docx?|xlsx?|pptx?|pdf)\b/giu
+    : /\.(?:txt|md|csv|docx?|xlsx?|pptx?|pdf)\b/giu);
+  for (const match of extensionMatches) {
+    const extensionStart = match.index;
+    if (extensionStart == null || extensionStart <= 0) continue;
+    const lowerBound = Math.max(0, extensionStart - 160);
+    let start = extensionStart;
+    while (
+      start > lowerBound
+      && !/[\s\\/:*?"<>|\r\n]/u.test(text[start - 1] || '')
+    ) start -= 1;
+    if (start === extensionStart) continue;
+    const candidate = trimSlot(text.slice(start, extensionStart + match[0].length));
+    if (candidate) return candidate;
+  }
+  return '';
+}
+
 function explicitArtifactPath(text: string): string {
+  // Most turns do not contain a supported artifact suffix. This linear gate
+  // keeps them away from the more specific absolute-path matcher entirely.
+  if (!ARTIFACT_FILE_EXTENSION_RE.test(text)) return '';
   const absolute = text.match(
     /([A-Za-z]:[\\/][^\r\n"'<>|?*]+?\.(?:txt|md|csv|json|docx?|xlsx?|pptx?|pdf))(?=$|[\s.,，。;；:：!！?？)）\]}'"])/iu,
   )?.[1];
   if (absolute) return trimSlot(absolute);
-  return trimSlot(
-    text.match(/([^\s\\/:*?"<>|\r\n]{1,160}\.(?:txt|md|csv|json|docx?|xlsx?|pptx?|pdf))\b/iu)?.[1] || '',
-  );
+  return relativeArtifactPath(text);
 }
 
 function hasAffirmativeArtifactCreationAction(text: string): boolean {
@@ -258,6 +291,37 @@ function explicitLocalArtifactReadIntent(text: string): NormalizedActionIntent |
   };
 }
 
+function currentAuthoringDocumentReadIntent(text: string): NormalizedActionIntent | null {
+  // A current WPS/Office document is an external desktop read target even when
+  // the user cannot provide its filesystem path yet. Classifying this as
+  // `none` lets downstream task bookkeeping fall back to a mutation contract,
+  // although the requested operation is strictly observational.
+  // i18n-allow: Multilingual current-authoring-document read recognition; not user-visible copy.
+  const readAction = /(?:分析|读取|读一下|查看|审查|检查|总结|概括|提取|讲了什么|主要内容)|\b(?:analy[sz]e|read|inspect|review|check|summari[sz]e|extract|what(?:'s|\s+is)\s+(?:it|this).{0,12}about)\b/iu.test(text);
+  const currentDocument = /(?:当前|现在|正在|刚才|刚刚).{0,24}(?:文件|文档|PPT|演示文稿|表格|资料)|(?:当前|现在|正在|刚才|刚刚).{0,16}打开(?:着|的)?.{0,12}(?:文件|文档|PPT|演示文稿|表格|资料)|\b(?:current(?:ly)?(?:\s+open)?|currently\s+open|active|foreground|opened)\b.{0,24}\b(?:file|document|presentation|sheet|workbook)\b|\b(?:file|document|presentation|sheet|workbook)\b.{0,24}\b(?:current(?:ly)?\s+open|active|foreground|opened)\b/iu.test(text);
+  if (!readAction || !currentDocument) return null;
+
+  let target = '';
+  if (/(?:^|\b)WPS(?:\b|$)|金山(?:文字|表格|演示|WPS)/iu.test(text)) target = 'WPS'; // i18n-allow: Reviewed WPS input aliases; not user-visible copy.
+  else if (/(?:Microsoft\s+)?PowerPoint|POWERPNT\.EXE/iu.test(text)) target = 'Microsoft PowerPoint';
+  else if (/(?:Microsoft\s+)?Excel|EXCEL\.EXE/iu.test(text)) target = 'Microsoft Excel';
+  else if (/(?:Microsoft\s+)?Word|WINWORD\.EXE/iu.test(text)) target = 'Microsoft Word';
+  else if (/\b(?:Microsoft\s+)?Office\b/iu.test(text)) target = 'Microsoft Office';
+  if (!target) return null;
+
+  return {
+    kind: 'desktop_operation',
+    operation: 'read',
+    subject: 'user',
+    target,
+    payload: text,
+    sideEffectClass: 'none',
+    relation: 'new',
+    confidence: 0.99,
+    rule: 'current-authoring-document-read',
+  };
+}
+
 export function isExplicitArtifactCreationText(text: string): boolean {
   return Boolean(explicitArtifactCreationIntent(currentTurnText(String(text || ''))));
 }
@@ -285,19 +349,10 @@ function correctionOrExplanation(text: string): NormalizedActionIntent | null {
   // i18n-allow: Chinese terse-complaint input recognition; not user-visible copy.
   const terseComplaint = // i18n-allow: Chinese terse-complaint input recognition; not user-visible copy.
     /^(?:(?:我操|卧槽|靠|妈的|搞什么|什么鬼)[，,\s]*)?(?:你|lumi)[^。！？!?\n]{0,20}(?:打开|发送|执行|操作|做|画)了[^。！？!?\n]{0,28}(?:什么|啥|为什么|怎么回事)[^。！？!?\n]*[啊呀呢吧。！？!?]*$/iu;
-  // i18n-allow: Explicit correction prefaces remain explanation-only even when
-  // the rest of the sentence contains a tool or usage verb.
-  const explicitCorrection = /(?:\u4f60(?:\u641e\u9519|\u5f04\u9519)\u4e86?|\u4e0d\u662f\u8fd9\u4e2a\u610f\u601d|\u6211\u8bf4\u7684\u662f|\u6211\u53ea\u662f(?:\u95ee|\u60f3\u77e5\u9053))/u;
-  // A correction about the completeness or wording of Lumi's immediately
-  // prior answer stays conversational. Words such as "漏了" and "补充" must
-  // not be mistaken for a runtime failure or a fresh work task.
-  // i18n-allow: Chinese conversational correction recognition; not user-visible copy.
-  const responseCorrection = /(?:\u4f60|lumi)?[^\u3002\uff01\uff1f.!?\n]{0,24}(?:\u6f0f(?:\u4e86|\u6389)?|\u5c11(?:\u4e86|\u8bf4)|\u6ca1(?:\u6709)?(?:\u56de\u7b54|\u8bf4|\u8bb2)(?:\u5b8c|\u5b8c\u6574)|\u56de\u7b54(?:\u4e0d\u5b8c\u6574|\u5c11\u4e86|\u6f0f\u4e86)|\u53ea(?:\u9700|\u8981)?\u8865\u5145|\u8865\u5145(?:\u4e00\u53e5|\u56de\u7b54)|\u6539\u6b63(?:\u4e00\u4e0b)?(?:\u56de\u7b54|\u8bf4\u6cd5))/iu;
-  // An explicit request to stay tool-free is authoritative for this turn,
-  // even when the sentence mentions tools by name.
-  // i18n-allow: Multilingual explicit no-tool instruction recognition.
-  const explicitNoTool = /(?:\u4e0d\u8981|\u522b|\u65e0\u9700|\u4e0d\u7528).{0,16}(?:\u8c03\u7528|\u4f7f\u7528|\u6267\u884c|\u5f00\u542f).{0,8}(?:\u5de5\u5177|\u63d2\u4ef6|\u6280\u80fd)|\b(?:do\s+not|don'?t|without)\s+(?:call(?:ing)?|use|using|run(?:ning)?)\s+(?:any\s+)?(?:tools?|plugins?|skills?)\b/iu;
-  const explicitNoToolCorrection = explicitNoTool.test(text) && !statusQuery(text);
+  // i18n-allow: A correction to the completeness of the preceding answer is
+  // conversational. Negative mentions of tools must never turn it into work.
+  const answerCompletenessCorrection =
+    /(?:你)?(?:漏了|少了|没(?:有)?回答|未回答|没说|没有说|没讲|没有讲|回答不完整).{0,100}(?:只(?:补充|回答|说)|补充一句|不要调用工具|不用工具)|(?:只补充一句|补充一句).{0,100}(?:不要调用工具|不用工具)/u; // i18n-allow: Answer-correction input recognition; not user-visible copy.
   // A user can correct task identity while quoting the wrongly selected old
   // action. Quoted verbs remain evidence about the previous turn and must not
   // become a fresh command.
@@ -310,9 +365,6 @@ function correctionOrExplanation(text: string): NormalizedActionIntent | null {
     isRecentActionReceiptQuery(text)
     && !negativeAuthorization.test(text)
     && !authorizationOrExecutionObjection.test(text)
-    && !explicitCorrection.test(text)
-    && !responseCorrection.test(text)
-    && !explicitNoToolCorrection
     && !taskIdentityCorrection.test(text)
   ) return null;
   if (
@@ -320,9 +372,7 @@ function correctionOrExplanation(text: string): NormalizedActionIntent | null {
     && !authorizationOrExecutionObjection.test(text)
     && !actionComplaint.test(text)
     && !terseComplaint.test(text)
-    && !explicitCorrection.test(text)
-    && !responseCorrection.test(text)
-    && !explicitNoToolCorrection
+    && !answerCompletenessCorrection.test(text)
     && !taskIdentityCorrection.test(text)
   ) return null;
   return {
@@ -450,7 +500,12 @@ export function hasMixedStatusExecutionIntent(value: string): boolean {
 }
 
 function statusQuery(text: string): NormalizedActionIntent | null {
-  if (isDesignProjectStatusRequest(text)) {
+  // Only invoke the richer edition matcher when the turn names a design
+  // ledger concept. This preserves linear behavior for long unrelated turns.
+  if (
+    /(?:设计项目|CAD|效果图|提案\s*PPT|交付中心|design\s+project|visualization|handoff)/iu.test(text) // i18n-allow: Designer status input recognition; not user-visible copy.
+    && isDesignProjectStatusRequest(text)
+  ) {
     return {
       kind: 'status_query',
       operation: 'status',
@@ -472,6 +527,39 @@ function statusQuery(text: string): NormalizedActionIntent | null {
   // Reporting the id/status after creating a specifically described new task
   // is part of that creation contract, not a query about an older task.
   if (persistentWorkTaskCreation(text)) return null;
+  // Explicit current-runtime questions must be read-only status intents even
+  // when they do not contain the narrow "task status/progress" wording. This
+  // covers the production utterance "你现在有在执行的任务吗" and keeps it out
+  // of the generic desktop-operation fallback.
+  if (/^(?:\u4f60|lumi)?\s*(?:\u73b0\u5728|\u5f53\u524d)?\s*(?:\u6709\s*)?(?:\u5728|\u6b63\u5728)?\s*(?:\u6267\u884c|\u5904\u7406|\u8fd0\u884c|\u505a)\s*(?:\u7684)?\s*(?:\u4efb\u52a1|\u5de5\u4f5c)(?:\u5417|\u5462|\u6ca1\u6709)?[\u3002\uff01\uff1f.!?\s]*$/iu.test(text)) {
+    return {
+      kind: 'status_query',
+      operation: 'status',
+      subject: 'lumi',
+      target: 'runtime_work',
+      payload: '',
+      sideEffectClass: 'none',
+      relation: 'status',
+      confidence: 0.99,
+      rule: 'current-runtime-work-status',
+    };
+  }
+  // Terse questions immediately after an operation ask for its persisted
+  // outcome. Treat them as receipt reads; task relation resolution decides
+  // which exact adjacent task they bind to.
+  if (/^(?:\u6e05\u7406|\u6e05\u6389|\u53d6\u6d88|\u505c\u6b62|\u5904\u7406|\u6267\u884c|\u5b8c\u6210)(?:\u7684|\u5f97)?(?:\u600e\u4e48\u6837|\u5982\u4f55|\u597d\u4e86|\u5b8c\u6210|\u6210\u529f|\u4e86\u5417|\u4e86\u6ca1|\u6ca1\u6709)[\u3002\uff01\uff1f.!?\s]*$/u.test(text)) {
+    return {
+      kind: 'status_query',
+      operation: 'status',
+      subject: 'lumi',
+      target: 'previous_action',
+      payload: '',
+      sideEffectClass: 'none',
+      relation: 'status',
+      confidence: 0.98,
+      rule: 'terse-adjacent-action-status',
+    };
+  }
   // i18n-allow: Chinese task-status control recognition; not user-visible copy.
   if (/^(?:你|lumi)?\s*(?:现在|当前)?\s*(?:在)?\s*(?:干嘛|干啥|做什么|搞什么|忙什么)[啊呀吧嘛呢，,。！？?!\s]*$/iu.test(text)) {
     return {
@@ -486,7 +574,7 @@ function statusQuery(text: string): NormalizedActionIntent | null {
       rule: 'active-task-status-control',
     };
   }
-  const namedArtifact = text.match(/([^\s\\/:*?"<>|\r\n]{1,160}\.(?:txt|md|docx?|xlsx?|pptx?|pdf|csv))\b/iu)?.[1]?.trim();
+  const namedArtifact = relativeArtifactPath(text, false);
   const asksNamedArtifactStatus = Boolean(
     namedArtifact
     && /(?:\u6587\u4ef6|\u4ea7\u7269|\u4efb\u52a1).{0,24}(?:\u73b0\u5728)?(?:\u662f\u4ec0\u4e48|\u4ec0\u4e48|\u5565)\u72b6\u6001|\u662f\u5426(?:\u5df2\u7ecf)?(?:\u5199\u5165|\u56de\u8bfb).{0,12}[\uff1f?]|\u6700\u7ec8\u72b6\u6001|\b(?:what\s+is|final)\b.{0,24}\bstatus\b|\bwas\b.{0,32}\b(?:written|read\s*back)\b/iu.test(text)
@@ -579,28 +667,14 @@ function statusQuery(text: string): NormalizedActionIntent | null {
   // the turn a status follow-up; the explicit create/write action wins.
   if (isExplicitArtifactCreationText(text)) return null;
 
-  // Registered edition workspaces participate in the same durable status
-  // lookup as generic tasks. This keeps spoken follow-ups such as “设计项目进度呢”
-  // on the receipt-backed status lane instead of asking the model to guess.
-  // A workspace label plus a bare completion word is not a status query. Long
-  // execution instructions routinely contain acceptance clauses such as
-  // "missing any receipt means incomplete". Require explicit interrogative or
-  // progress/status wording so those clauses cannot suppress the requested
-  // creation tools in the normalized-vs-legacy safety comparison.
   const registeredSurfaceStatus =
-    /(?:\u8fdb\u5ea6|\u72b6\u6001|\u7ed3\u679c(?:\u5462|\u5982\u4f55|\u600e\u4e48\u6837)?|\u505a\u5230\u54ea|\u5230\u54ea(?:\u4e86)?|\u600e\u4e48\u6837|\u662f\u5426(?:\u5df2\u7ecf)?\u5b8c\u6210|\u6709\u6ca1\u6709\u5b8c\u6210|\u505a\u5b8c\u4e86\u5417|\u5b8c\u6210\u4e86\u5417|\u505a\u597d\u4e86\u5417|\u597d\u4e86\u5417)|\b(?:status|progress|done\s+yet|is\s+(?:it|this|the\s+task)\s+(?:complete|completed|done))\b/iu.test(text) // i18n-allow: Reviewed multilingual status-follow-up input recognition.
+    /(?:进度|状态|结果呢|做到哪|到哪了|怎么样|做完了吗|完成了吗|好了吗)/u.test(text) // i18n-allow: Reviewed Chinese status-follow-up input recognition.
       ? CLIENT_SURFACE_RULES.find(candidate => candidate.pattern.test(text))
       : undefined;
   if (registeredSurfaceStatus) {
     return {
-      kind: 'status_query',
-      operation: 'status',
-      subject: 'lumi',
-      target: registeredSurfaceStatus.target,
-      payload: '',
-      sideEffectClass: 'none',
-      relation: 'status',
-      confidence: 0.97,
+      kind: 'status_query', operation: 'status', subject: 'lumi', target: registeredSurfaceStatus.target,
+      payload: '', sideEffectClass: 'none', relation: 'status', confidence: 0.97,
       rule: 'registered-client-surface-status',
     };
   }
@@ -655,7 +729,9 @@ function clientNavigation(text: string): NormalizedActionIntent | null {
   // i18n-allow: Multilingual wallpaper close-action recognition; not user-visible copy.
   const clientActionArguments = surface.action === 'set_wallpaper_mode'
     ? { enabled: !/(?:关闭|退出|收起|close|exit|turn\s+off)/iu.test(text) }
-    : undefined;
+    : surface.action === 'set_client_mode'
+      ? { mode: surface.target }
+      : undefined;
   return {
     kind: 'client_navigation',
     operation: 'navigate',
@@ -681,7 +757,7 @@ function externalAiHistoryRead(text: string): NormalizedActionIntent | null {
     || /\b(?:external\s+AI|AI\s+(?:assistant|agent|app|chat))\b|外部\s*AI|AI\s*(?:助手|智能体|客户端|应用)/iu.test(text); // i18n-allow: Multilingual external-AI target input recognition.
   // i18n-allow: Multilingual external-AI history action input recognition; not user-visible copy.
   const hasHistoryAction = /(?:聊天(?:历史|记录|内容)|对话(?:历史|记录|内容)|历史(?:消息|会话)|(?:同步|导入|归档|授权|注册|添加|撤销|读取|查看|搜索|查询|总结).{0,40}(?:聊天|对话|历史|内容|来源)|(?:聊天|对话|历史).{0,40}(?:同步|导入|归档|授权|注册|读取|查看|搜索|查询|总结)|\b(?:chat|conversation|message)\s+(?:history|content|archive|source)\b|\b(?:sync|import|archive|authorize|register|revoke|read|view|search|query)\b.{0,48}\b(?:chat|conversation|message)\s+(?:history|content|archive|source)\b)/iu.test(text);
-  // A fresh prompt to another model belongs to the collaboration lane, even
+  // A fresh prompt to one named external model belongs to its own request lane, even
   // when the requested prompt happens to mention history or conversations.
   // i18n-allow: Multilingual external-AI submission exclusion; not user-visible copy.
   const explicitNewSubmission = /(?:发给|发送给|交给|问问|询问|提问|让.{0,20}(?:回答|处理))|\b(?:ask|send\s+to|delegate|submit|prompt)\b/iu.test(text);
@@ -828,6 +904,40 @@ function genericExternalCommit(text: string): NormalizedActionIntent | null {
   return null;
 }
 
+function mediaGeneration(text: string): NormalizedActionIntent | null {
+  const image = /(?:\u751f\u6210|\u5236\u4f5c|\u505a|\u51fa|\u6e32\u67d3).{0,24}(?:\u56fe\u7247|\u56fe\u50cf|\u6548\u679c\u56fe|\u6e32\u67d3\u56fe|\u6d77\u62a5)|\b(?:generate|create|make|render)\b.{0,32}\b(?:image|visual|render|poster)\b/iu.test(text);
+  const video = /(?:\u751f\u6210|\u5236\u4f5c|\u505a|\u51fa).{0,24}(?:\u89c6\u9891|\u52a8\u753b)|\b(?:generate|create|make)\b.{0,32}\b(?:video|animation)\b/iu.test(text);
+  if (!image && !video) return null;
+  return {
+    kind: 'media_generation',
+    operation: 'create',
+    subject: 'user',
+    target: image ? 'image' : 'video',
+    payload: text,
+    sideEffectClass: 'external_commit',
+    relation: /(?:\u7ee7\u7eed|\u63a5\u7740|\u4e0b\u4e00\u6b65)|\b(?:continue|next)\b/iu.test(text) ? 'continue' : 'new',
+    confidence: 0.95,
+    rule: image ? 'explicit-image-generation' : 'explicit-video-generation',
+  };
+}
+
+function documentCreation(text: string): NormalizedActionIntent | null {
+  const presentation = /(?:\u6267\u884c|\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u8f93\u51fa|\u5bfc\u51fa|\u5b8c\u6210).{0,32}(?:\u63d0\u6848\s*PPT|PPT|\u6f14\u793a\u6587\u7a3f|presentation)|(?:\u63d0\u6848\s*PPT|PPT|\u6f14\u793a\u6587\u7a3f).{0,24}(?:\u9636\u6bb5|\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u8f93\u51fa|\u5bfc\u51fa)/iu.test(text);
+  const document = /(?:\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u8f93\u51fa|\u5bfc\u51fa).{0,28}(?:PDF|DOCX|Word\s*\u6587\u6863|\u62a5\u544a\u6587\u4ef6)|\b(?:generate|create|export)\b.{0,32}\b(?:pdf|docx|document|report)\b/iu.test(text);
+  if (!presentation && !document) return null;
+  return {
+    kind: 'document_creation',
+    operation: 'create',
+    subject: 'user',
+    target: presentation ? 'presentation' : 'document',
+    payload: text,
+    sideEffectClass: 'local_write',
+    relation: /(?:\u7ee7\u7eed|\u63a5\u7740|\u4e0b\u4e00\u6b65|\u9636\u6bb5)|\b(?:continue|next|stage)\b/iu.test(text) ? 'continue' : 'new',
+    confidence: 0.95,
+    rule: presentation ? 'explicit-presentation-creation' : 'explicit-document-creation',
+  };
+}
+
 function localDesktopOperation(text: string): NormalizedActionIntent | null {
   // Client surfaces and external commits have already won the priority race.
   // This rule requires an explicit local action plus a concrete target; a lone
@@ -860,40 +970,6 @@ function localDesktopOperation(text: string): NormalizedActionIntent | null {
   };
 }
 
-function mediaGeneration(text: string): NormalizedActionIntent | null {
-  const image = /(?:\u751f\u6210|\u5236\u4f5c|\u505a|\u51fa|\u6e32\u67d3).{0,24}(?:\u56fe\u7247|\u56fe\u50cf|\u6548\u679c\u56fe|\u6e32\u67d3\u56fe|\u6d77\u62a5)|\b(?:generate|create|make|render)\b.{0,32}\b(?:image|visual|render|poster)\b/iu.test(text);
-  const video = /(?:\u751f\u6210|\u5236\u4f5c|\u505a|\u51fa).{0,24}(?:\u89c6\u9891|\u52a8\u753b)|\b(?:generate|create|make)\b.{0,32}\b(?:video|animation)\b/iu.test(text);
-  if (!image && !video) return null;
-  return {
-    kind: 'media_generation',
-    operation: 'create',
-    subject: 'user',
-    target: image ? 'image' : 'video',
-    payload: text,
-    sideEffectClass: 'external_commit',
-    relation: /(?:\u7ee7\u7eed|\u63a5\u7740|\u4e0b\u4e00\u6b65)|\b(?:continue|next)\b/iu.test(text) ? 'continue' : 'new',
-    confidence: 0.95,
-    rule: image ? 'explicit-image-generation' : 'explicit-video-generation',
-  };
-}
-
-function documentCreation(text: string): NormalizedActionIntent | null {
-  const presentation = /(?:\u6267\u884c|\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u8f93\u51fa|\u5bfc\u51fa|\u5b8c\u6210).{0,32}(?:\u63d0\u6848\s*PPT|PPT|\u6f14\u793a\u6587\u7a3f|presentation)|(?:\u63d0\u6848\s*PPT|PPT|\u6f14\u793a\u6587\u7a3f).{0,24}(?:\u9636\u6bb5|\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u8f93\u51fa|\u5bfc\u51fa)/iu.test(text);
-  const document = /(?:\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u8f93\u51fa|\u5bfc\u51fa).{0,28}(?:PDF|DOCX|Word\s*\u6587\u6863|\u62a5\u544a\u6587\u4ef6)|\b(?:generate|create|export)\b.{0,32}\b(?:pdf|docx|document|report)\b/iu.test(text);
-  if (!presentation && !document) return null;
-  return {
-    kind: 'document_creation',
-    operation: 'create',
-    subject: 'user',
-    target: presentation ? 'presentation' : 'document',
-    payload: text,
-    sideEffectClass: 'local_write',
-    relation: /(?:\u7ee7\u7eed|\u63a5\u7740|\u4e0b\u4e00\u6b65)|\b(?:continue|next)\b/iu.test(text) ? 'continue' : 'new',
-    confidence: 0.95,
-    rule: presentation ? 'explicit-presentation-creation' : 'explicit-document-creation',
-  };
-}
-
 function persistentWorkTaskCreation(text: string): NormalizedActionIntent | null {
   const createsTask = /(?:\u521b\u5efa|\u65b0\u5efa|\u5efa\u7acb)\s*(?:\u4e00\u4e2a|\u4e00\u9879)?[^\u3002\uff01\uff1f?\n]{0,28}(?:\u6301\u4e45\u4efb\u52a1|\u957f\u671f\u4efb\u52a1|\u5de5\u4f5c\u63a5\u7ba1\u4efb\u52a1|\u5de5\u4f5c\u4efb\u52a1)|\b(?:create|start)\b.{0,36}\b(?:persistent|long[-\s]?running|work[-\s]?takeover)\s+task\b/iu.test(text);
   if (!createsTask) return null;
@@ -916,10 +992,27 @@ function persistentWorkTaskCreation(text: string): NormalizedActionIntent | null
 export function normalizeActionIntent(value: string): NormalizedActionIntent {
   const text = currentTurnText(value);
   if (!text) return { ...EMPTY_INTENT };
-  const affirmativeActionText = stripNegatedActionClauses(text);
+  const correctedInstruction = extractActionableCorrectionInstruction(text);
+  if (correctedInstruction) {
+    const corrected = normalizeActionIntent(correctedInstruction);
+    if (
+      corrected.kind !== 'none'
+      && corrected.kind !== 'correction_explanation'
+      && corrected.operation !== 'status'
+    ) {
+      return {
+        ...corrected,
+        relation: 'correction',
+        confidence: Math.min(corrected.confidence, 0.98),
+        rule: `actionable-correction:${corrected.rule}`,
+      };
+    }
+  }
   const artifactCreation = explicitArtifactCreationIntent(text);
   const artifactRead = explicitLocalArtifactReadIntent(text);
+  const currentAuthoringDocumentRead = currentAuthoringDocumentReadIntent(text);
   const explicitArtifactCreation = Boolean(artifactCreation);
+  const affirmativeDesignActionText = stripNegatedDesignActionClauses(text);
 
   // Order is a safety invariant. Later action-shaped words cannot override a
   // correction, status query, client-native route, external-AI read, or
@@ -930,14 +1023,15 @@ export function normalizeActionIntent(value: string): NormalizedActionIntent {
     persistentWorkTaskCreation(text),
     artifactCreation,
     artifactRead,
-    explicitArtifactCreation ? null : clientNavigation(affirmativeActionText),
+    currentAuthoringDocumentRead,
+    explicitArtifactCreation ? null : clientNavigation(text),
     explicitArtifactCreation ? null : externalAiHistoryRead(text),
     explicitArtifactCreation ? null : inboundMessageRead(text),
-    explicitArtifactCreation ? null : outgoingMessageSend(affirmativeActionText),
-    explicitArtifactCreation ? null : mediaGeneration(affirmativeActionText),
-    explicitArtifactCreation ? null : documentCreation(affirmativeActionText),
-    explicitArtifactCreation ? null : genericExternalCommit(affirmativeActionText),
-    explicitArtifactCreation ? null : localDesktopOperation(affirmativeActionText),
+    explicitArtifactCreation ? null : outgoingMessageSend(text),
+    explicitArtifactCreation ? null : mediaGeneration(affirmativeDesignActionText),
+    explicitArtifactCreation ? null : documentCreation(affirmativeDesignActionText),
+    explicitArtifactCreation ? null : genericExternalCommit(text),
+    explicitArtifactCreation ? null : localDesktopOperation(text),
   ].find(Boolean);
   if (priority) return priority;
 
