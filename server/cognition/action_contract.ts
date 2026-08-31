@@ -20,6 +20,8 @@ import {
   normalizeActionIntent,
 } from './normalized_action_intent';
 import { isReadOnlyKnowledgeBaseInspectionRequest } from './knowledge_intent';
+import { isDesignProjectStatusRequest } from '../design/status_intent';
+import { isDesignProjectCreationRequest } from '../regions/packs/cn/industry_capability_profile';
 import type { TaskCapsuleV1 } from '../conversation/task_capsule';
 import {
   parseReceiptObject,
@@ -994,6 +996,10 @@ export function buildActionContract(input: string): LumiActionContract {
 
   const text = compact(rawInput);
   if (!text) return NONE_CONTRACT;
+  // A design-project ledger query can contain generic task/status words, but
+  // those words refer to the persisted design stage rather than Lumi's
+  // runtime-work queue. Keep the edition contract ahead of task control.
+  if (isDesignProjectStatusRequest(text)) return buildDesignDeliveryContract();
   // A named persistent takeover-task query belongs to the takeover ledger,
   // not the active runtime-work ledger. Its deterministic quick command emits
   // a verified work_takeover_task_list receipt, so do not demand the unrelated
@@ -2909,6 +2915,25 @@ export function hasVerifiedCadGeometryExtractionEvidence(
 }
 
 function hasDesignDeliveryEvidence(records: ToolExecutionRecord[], taskText: string): boolean {
+  if (isDesignProjectStatusRequest(taskText)) {
+    return records.some(record => {
+      if (record.name !== 'interior_design_project_status' || record.error) return false;
+      const payload = parseRecordJson(record);
+      return payload?.ok === true
+        && payload?.persisted === true
+        && Boolean(compact(payload?.project?.id));
+    });
+  }
+  if (isDesignProjectCreationRequest(taskText)) {
+    return records.some(record => {
+      if (record.name !== 'interior_design_project_create' || record.error) return false;
+      const payload = parseRecordJson(record);
+      return payload?.ok === true
+        && payload?.persisted === true
+        && payload?.active === true
+        && Boolean(compact(payload?.project?.id));
+    });
+  }
   const sourceRequired = requiresSourceGrounding(taskText);
   const wantsCompositePackage = /(?:\u5168\u5957\u8bbe\u8ba1|\u5168\u6848\u8bbe\u8ba1|\u5b8c\u6574\u4ea4\u4ed8\u5305|\u8bbe\u8ba1\u4ea4\u4ed8|\u88c5\u4fee\u4ea4\u4ed8|full\s+(?:design|renovation|interior)|design\s+(?:delivery|package|handoff))/iu.test(taskText);
   const wantsCad = /(?:\bCAD\b|\bDXF\b|\bDWG\b|AutoCAD|\u65bd\u5de5\u56fe|\u5e73\u9762\u56fe)/iu.test(taskText);

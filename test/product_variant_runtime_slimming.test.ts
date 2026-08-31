@@ -31,11 +31,11 @@ describe('product variant runtime slimming', () => {
       'industry_workflow_start',
       'industry_workflow_complete',
       'work_takeover_task_create',
-      'external_ai_collaborate',
     ]) {
       expect(runtimeNames).toContain(required);
     }
 
+    expect(runtimeNames).not.toContain('external_ai_collaborate');
     expect(runtimeNames).not.toContain('git_status');
     expect(runtimeNames).not.toContain('git_commit');
   });
@@ -63,10 +63,9 @@ describe('product variant runtime slimming', () => {
 
   it('prevents natural-language auto-install from silently expanding the edition', () => {
     const bootstrap = read('server/runtime/bootstrap.ts');
-    const autoInstaller = read('server/agents/auto_installer.ts');
     expect(bootstrap).toContain('registerProductVariantTools(toolRegistry');
     expect(bootstrap).not.toContain('registerAllTools(toolRegistry');
-    expect(autoInstaller).toContain('PRODUCT_VARIANT.runtime.defaultSkills.includes(dirName)');
+    expect(fs.existsSync(path.join(process.cwd(), 'server/agents/auto_installer.ts'))).toBe(false);
     expect(PRODUCT_VARIANT.runtime.defaultSkills.length).toBeGreaterThan(0);
     expect(PRODUCT_VARIANT.runtime.defaultSkills.length).toBeLessThanOrEqual(3);
   });

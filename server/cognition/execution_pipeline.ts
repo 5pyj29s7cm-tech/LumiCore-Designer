@@ -135,6 +135,7 @@ function applyCurrentTurnNoMutationConstraint(
   execution: LumiExecutionDecision,
   registry: ToolRegistry,
   text: string,
+  exactIndustryWorkflow = false,
 ): LumiExecutionDecision {
   // A confirmation-only external-commit request deliberately says both
   // "prepare to send" and "do not send now". It must expose the exact
@@ -179,15 +180,26 @@ function applyCurrentTurnNoMutationConstraint(
   // requested stage. Negative clauses such as "do not create CAD/PPT" scope
   // that stage; they must not erase the workflow ledger and its exact tools.
   if (
-    execution.toolRoute?.hardAllowlist === true
-    && execution.toolRoute.categories.includes('industry_workflow')
+    exactIndustryWorkflow
+    || (
+      execution.toolRoute?.hardAllowlist === true
+      && execution.toolRoute.categories.includes('industry_workflow')
+    )
   ) return execution;
   if (!hasExplicitNoMutationInstruction(text)) return execution;
   const mutationTools = registry.getCapabilityManifest(undefined)
     .filter(entry => (
       entry.operation === 'create'
       || entry.operation === 'mutate'
-      || entry.sideEffects.some(effect => effect.type !== 'local_read')
+      || entry.sideEffects.some(effect => (
+        effect.type === 'local_write'
+        || effect.type === 'local_state_change'
+        || effect.type === 'desktop_control'
+        || effect.type === 'process_execution'
+        || effect.type === 'installation'
+        || effect.type === 'external_state_change'
+        || effect.type === 'external_communication'
+      ))
     ))
     .map(entry => entry.toolName);
   const restricted = applyAdditionalForbiddenTools(execution, mutationTools);
@@ -325,6 +337,7 @@ export function buildLumiExecutionPipeline(
       ),
       input.registry,
       input.dispatch.text,
+      Boolean(turnIntent.flow.industryWorkflowEntryId),
     ),
     input.additionalForbiddenTools,
   );

@@ -70,11 +70,7 @@ import { useApp, type OperationMode } from '@/contexts/AppContext';
 import { describeAgentResponseDelivery } from '@/lib/agentResponseDelivery';
 const LumiCoreAvatar = lazy(() => import('./LumiCoreAvatar').then(m => ({ default: m.LumiCoreAvatar })));
 const InkWorldLazy = lazy(() => import('./InkWorld').then(m => ({ default: m.InkWorld })));
-import {
-  normalizeTaskCompletionFeedback,
-  type BackgroundWorkflowTask,
-  type WorkflowStep,
-} from './workflowTypes';
+import type { WorkflowStep } from './workflowTypes';
 import type { CommandCenterView } from './commandCenterTypes';
 import { useWakeWord } from '../hooks/useWakeWord';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -1989,7 +1985,6 @@ export function DesktopUI({
   const [workflowSteps, setWorkflowSteps] = useState<WorkflowStep[]>([]);
   const [pendingOperationMode, setPendingOperationMode] = useState<OperationMode | null>(null);
   const seenWorkflowToolEvents = useRef<Set<string>>(new Set());
-  const backgroundTaskStatusRef = useRef<Map<string, string>>(new Map());
   const readMeetingItem = useCallback((scopedKey: string, legacyKey: string): string | null => (
     localStorage.getItem(scopedKey)
       ?? (workDomain === 'personal' ? localStorage.getItem(legacyKey) : null)
@@ -3459,50 +3454,6 @@ export function DesktopUI({
       }
     };
 
-    const normalizeBackgroundTask = (data: any): BackgroundWorkflowTask | null => {
-      const raw = data?.task || data;
-      const id = String(raw?.id || data?.taskId || '');
-      if (!id) return null;
-      const workerNames = Array.isArray(raw?.workerNames)
-        ? raw.workerNames
-        : Array.isArray(raw?.workers)
-          ? raw.workers.map((worker: any) => worker?.name || worker?.id).filter(Boolean)
-          : [];
-      return {
-        id,
-        title: raw?.title || data?.title || id,
-        status: (raw?.status || 'queued') as BackgroundWorkflowTask['status'],
-        workerNames,
-        toolCallsCount: Number(raw?.toolCallsCount || 0),
-        error: raw?.error,
-        resultPreview: raw?.resultPreview,
-        updatedAt: raw?.updatedAt,
-        completionFeedback: normalizeTaskCompletionFeedback(raw?.completionFeedback || data?.completionFeedback),
-      };
-    };
-
-    const recordBackgroundTaskStep = (task: BackgroundWorkflowTask) => {
-      const previousStatus = backgroundTaskStatusRef.current.get(task.id);
-      if (previousStatus === task.status) return;
-      backgroundTaskStatusRef.current.set(task.id, task.status);
-      const isActive = task.status === 'queued' || task.status === 'running' || task.status === 'cancelling';
-      const isFailed = task.status === 'failed';
-      setAgentStatus(isActive ? 'background' : isFailed ? 'error' : 'done');
-      setWorkflowSteps(prev => [...prev, {
-        id: `background-task-${task.id}-${task.status}-${Date.now()}`,
-        type: isFailed ? 'error' : task.status === 'completed' ? 'response' : 'background',
-        text: `${t.workflowBackgroundTask || 'Background task'}: ${task.status}`,
-        detail: task.title || task.id,
-        time: Date.now(),
-      }]);
-    };
-
-    const onBackgroundTaskUpdate = (data: any) => {
-      const task = normalizeBackgroundTask(data);
-      if (!task) return;
-      recordBackgroundTaskStep(task);
-    };
-
     const onDesktopControlState = (data: any) => {
       const id = `desktop-control-${String(data?.leaseId || data?.taskId || 'current')}`;
       const status = String(data?.status || '');
@@ -3524,7 +3475,6 @@ export function DesktopUI({
     };
 
     socket.on('agent:status', onStatus);
-    socket.on('agent:background_task_update', onBackgroundTaskUpdate);
     socket.on('agent:desktop_control_state', onDesktopControlState);
     socket.on('agent:tool_call', onToolCall);
     socket.on('agent:tool', onToolCall);
@@ -3592,7 +3542,6 @@ export function DesktopUI({
 
     return () => {
       socket.off('agent:status', onStatus);
-      socket.off('agent:background_task_update', onBackgroundTaskUpdate);
       socket.off('agent:desktop_control_state', onDesktopControlState);
       socket.off('agent:tool_call', onToolCall);
       socket.off('agent:tool', onToolCall);

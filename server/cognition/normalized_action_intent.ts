@@ -1,4 +1,5 @@
 import { PERSONAL_CLIENT_SURFACES } from '../../shared/client_surfaces';
+import { isDesignProjectStatusRequest } from '../design/status_intent';
 
 export type NormalizedActionIntentKind =
   | 'none'
@@ -449,6 +450,19 @@ export function hasMixedStatusExecutionIntent(value: string): boolean {
 }
 
 function statusQuery(text: string): NormalizedActionIntent | null {
+  if (isDesignProjectStatusRequest(text)) {
+    return {
+      kind: 'status_query',
+      operation: 'status',
+      subject: 'lumi',
+      target: 'interior_design_project',
+      payload: '',
+      sideEffectClass: 'none',
+      relation: 'status',
+      confidence: 0.99,
+      rule: 'designer-project-ledger-status',
+    };
+  }
   // A concrete new write owns the turn even when a separate scope fence uses
   // a status noun. Retrospective/status-only forms are excluded by the strict
   // affirmative artifact-action recognizer.

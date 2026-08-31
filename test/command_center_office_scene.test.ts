@@ -124,8 +124,8 @@ describe('single-core command center', () => {
     expect(styles).toContain('.lumi-command-center-layered .lumi-command-center-switcher');
     expect(styles).toContain('scrollbar-width: none');
     expect(styles).toContain('.lumi-command-center-switcher-copy');
-    expect(styles).toContain('.lumi-command-center-history-item-preview {\n  display: none;');
-    expect(styles).toContain('.lumi-command-center-history-item-meta {\n  display: none;');
+    expect(styles).toMatch(/\.lumi-command-center-history-item-preview \{\r?\n\s+display: none;/u);
+    expect(styles).toMatch(/\.lumi-command-center-history-item-meta \{\r?\n\s+display: none;/u);
     expect(styles).toContain('--command-center-rail-width: clamp(220px, 20vw, 300px)');
     expect(styles).toContain('.lumi-command-center-history-rail');
     expect(styles).toContain('--history-selector-collapsed-width');

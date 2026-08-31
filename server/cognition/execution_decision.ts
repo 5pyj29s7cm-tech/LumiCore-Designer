@@ -359,6 +359,8 @@ function enhanceToolRouteForFlow(
       reasons: unique([...route.reasons, 'design project status uses the durable project ledger']),
       truncated: false,
       hardAllowlist: true,
+      forbiddenToolNames: (route.forbiddenToolNames || [])
+        .filter(name => name !== 'interior_design_project_status'),
       maxIterations: 2,
     };
   }
@@ -407,6 +409,8 @@ function enhanceToolRouteForFlow(
       ]),
       truncated: false,
       hardAllowlist: true,
+      forbiddenToolNames: (route.forbiddenToolNames || [])
+        .filter(name => !toolNames.includes(name)),
       maxIterations: Math.max(route.maxIterations || 0, designProjectCreation ? 8 : 12),
     };
   }
