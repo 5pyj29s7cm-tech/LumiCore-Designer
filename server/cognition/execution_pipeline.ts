@@ -9,8 +9,11 @@ import {
 } from './normalized_action_intent';
 import {
   buildLumiCapabilitySelection,
+  buildModelCapabilityPolicy,
+  buildModelToolProjection,
   type LumiCapabilitySelection,
 } from './capability_selection';
+import { trustedContinuationEvidenceTools } from './tool_router';
 import {
   buildLumiExecutionDecision,
   type LumiExecutionDecision,
@@ -50,6 +53,9 @@ export interface LumiExecutionPipeline {
   capabilityPlan: LumiCapabilityPlan;
   executionPlan: CapabilityExecutionPlan;
   execution: LumiExecutionDecision;
+  authorizationPolicy: ToolPolicy;
+  modelToolProjection: ReturnType<typeof buildModelToolProjection>;
+  executionRequested: boolean;
   intentTrace: LumiIntentTrace;
   shadowComparison: LumiRoutingShadowComparison;
 }
@@ -194,6 +200,16 @@ function applyCurrentTurnNoMutationConstraint(
   };
 }
 
+function hasTrustedActionContinuation(input: BuildLumiExecutionPipelineInput): boolean {
+  const state = input.actionTaskState;
+  const context = String(input.dispatch.continuationContext || '');
+  if (!state?.unfinished || !state.taskId || !context) return false;
+  const followup = context.match(/(?:^|\n)-\s*followupIntent:\s*([^\r\n]+)/i)?.[1]?.trim().toLowerCase();
+  const taskId = context.match(/(?:^|\n)-\s*taskId:\s*([^\r\n]+)/i)?.[1]?.trim();
+  return new Set(['execute', 'correction', 'retry', 'accept', 'confirm']).has(followup || '')
+    && taskId === state.taskId;
+}
+
 function applySelectedWorkflowAdapterPolicy(
   execution: LumiExecutionDecision,
   turnIntent: LumiTurnDispatch,
@@ -279,6 +295,7 @@ export function buildLumiExecutionPipeline(
   // semantic roles (for example, turning "generate an image" into a status
   // query because an active-task bridge contains the word "status").
   const normalizedIntent = normalizeActionIntent(input.dispatch.text);
+  const trustedActionContinuation = hasTrustedActionContinuation(input);
   const legacyExecution = buildLumiExecutionDecision({
     flow: turnIntent.flow,
     text: decisionText,
@@ -287,6 +304,7 @@ export function buildLumiExecutionPipeline(
     toolRegistry: input.registry,
     personalityToolPolicy: input.personalityToolPolicy,
     actionTaskState: input.actionTaskState,
+    trustedActionContinuation,
     pendingAssistantOfferContext: input.pendingAssistantOfferContext,
     isSanctuary: input.isSanctuary,
   });
@@ -326,6 +344,17 @@ export function buildLumiExecutionPipeline(
       .map(toolName => manifest.find(entry => entry.toolName === toolName)?.capabilityId)
       .filter(Boolean) as string[],
   ));
+  const authorizationPolicy = buildModelCapabilityPolicy(execution);
+  const pinnedContinuationTools = trustedContinuationEvidenceTools({
+    actionTaskState: input.actionTaskState,
+    trustedActionContinuation,
+  }, new Set(input.registry.getToolDeclarations().map(declaration => declaration.function.name)));
+  const modelToolProjection = buildModelToolProjection(execution, {
+    lane: selection.lane,
+    preferredTools: selection.preferredTools,
+    pinnedTools: pinnedContinuationTools,
+  });
+  const executionRequested = Boolean(execution.allowToolUse && modelToolProjection.toolNames.length > 0);
   const capabilityPlan: LumiCapabilityPlan = {
     ...selection,
     schemaVersion: 1,
@@ -336,7 +365,7 @@ export function buildLumiExecutionPipeline(
       (!turnIntent.flow.industryWorkflowEntryId || turnIntent.flow.domain === 'work')
       && (
         turnIntent.flow.completionEvidenceNeeded
-        || turnIntent.flow.allowToolUseForTurn
+        || executionRequested
         || turnIntent.boundary === 'task_center'
         || turnIntent.boundary === 'work_takeover'
       ),
@@ -374,6 +403,9 @@ export function buildLumiExecutionPipeline(
     capabilityPlan,
     executionPlan,
     execution,
+    authorizationPolicy,
+    modelToolProjection,
+    executionRequested,
     intentTrace,
     shadowComparison,
   };
