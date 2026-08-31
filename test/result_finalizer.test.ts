@@ -13,6 +13,18 @@ const verifiedDesktopReceipt = {
 };
 
 describe('Lumi result finalizer', () => {
+  it('corrects a live-client verification claim when no state receipt exists', async () => {
+    const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
+    const result = finalizeLumiResponse({
+      taskText: '\u8bf4\u660e\u4f60\u5bf9\u5ba2\u6237\u7aef\u8fd0\u884c\u72b6\u6001\u7684\u4e86\u89e3',
+      responseText: '\u8fd9\u4e9b\u80fd\u529b\u5df2\u9a8c\u8bc1\u5b58\u5728\u4e8e client.modes \u72b6\u6001\u4e2d\u3002',
+      toolRecords: [],
+      source: 'chat',
+    });
+    expect(result.blocked).toBe(false);
+    expect(result.reason).toBe('unsupported_client_state_verification_claim_corrected');
+    expect(result.text).not.toContain('client.modes');
+  });
   it('blocks a fenced legacy tool protocol from leaking into a read-only conversation', async () => {
     const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
     const result = finalizeLumiResponse({
@@ -30,7 +42,7 @@ describe('Lumi result finalizer', () => {
   it.each([
     '\u5f53\u524d\u4f1a\u8bdd\u53ea\u6302\u8f7d\u4e86\u4e24\u4e2a\u5de5\u5177\uff0c\u8bb0\u5fc6\u5e93\u68c0\u7d22\u5de5\u5177\u6ca1\u6302\u8f7d\u3002',
     '\u5f53\u524d\u804a\u5929\u6a21\u5f0f\u672c\u8eab\u6ca1\u5e26\u5de5\u5177\uff0c\u7ffb\u4e0d\u4e86\u8bb0\u5fc6\u5e93\u3002',
-  ])('blocks unsupported per-session tool availability claims: %s', async (responseText) => {
+  ])('replaces unsupported per-session tool claims with canonical mode facts: %s', async (responseText) => {
     const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
     const result = finalizeLumiResponse({
       taskText: '\u4f60\u73b0\u5728\u4e0d\u662f\u52a9\u624b\u6a21\u5f0f\u5417',
@@ -39,9 +51,10 @@ describe('Lumi result finalizer', () => {
       source: 'command-center-chat',
     });
 
-    expect(result.blocked).toBe(true);
-    expect(result.reason).toContain('fictional user-switchable tool availability');
-    expect(result.text).toContain('\u4e0d\u5b58\u5728\u9700\u8981\u4f60\u5207\u6362');
+    expect(result.blocked).toBe(false);
+    expect(result.reason).toBe('canonical_operation_mode_facts');
+    expect(result.text).toContain('assistant');
+    expect(result.text).not.toBe(responseText);
   });
 
   it('allows a truthful explanation that a routed subset is not the tool inventory', async () => {
