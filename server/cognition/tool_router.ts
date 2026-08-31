@@ -94,10 +94,13 @@ function addIfAvailable(out: Set<string>, available: Set<string>, name: string):
 }
 
 /**
- * Preserve the smallest server-proven capability envelope for a trusted
- * continuation.  A terse "继续/重试" turn does not contain enough semantic
- * information to rediscover the original tool family, so only tools that
- * already produced evidence for the same unfinished task may be re-exposed.
+ * A correction/retry is allowed to keep the exact capabilities that already
+ * produced evidence for the same durable task.  The current wording may name
+ * only a replacement path (and therefore match an unrelated route), so retain
+ * the prior receipt tools as a narrow, server-owned continuation envelope.
+ * Never use the personality wildcard to restore the whole registry: when the
+ * snapshot is wildcarded, the observed receipt names are the least-privilege
+ * capability set we can prove belongs to this task.
  */
 export function trustedContinuationEvidenceTools(
   options: ToolRouteOptions | undefined,
@@ -794,6 +797,7 @@ export function routeToolsForTurn(
   const desktopLaunchRequest =
     actionContract.kind === 'desktop_operation'
     && Boolean(extractDesktopLaunchTarget(text))
+    && !currentAppEdit
     && !documentOpenAndReview
     && !isDirectAutocadOperationsPlayback(text);
   const extensionRegistryOnly = actionContract.kind === 'extension_registry';
@@ -846,6 +850,15 @@ export function routeToolsForTurn(
       actionContract,
       routingManifest,
     ));
+  }
+
+  // Add this before the restrictive route branches below.  Those branches
+  // (status, cancellation, read-only inspection, active-document anchoring,
+  // and confirmation) are authoritative and may clear it; ordinary
+  // corrections/retries retain the proven read/retry tools instead of losing
+  // them to semantic rerouting of the replacement wording.
+  if (continuationEvidenceTools.length && !currentAppEdit) {
+    for (const name of continuationEvidenceTools) addIfAvailable(selected, available, name);
   }
 
   if (actionContract.kind === 'messaging_read') {
@@ -1140,6 +1153,9 @@ export function routeToolsForTurn(
     availableNames.filter(name => selected.has(name)),
     unique([
       ...continuationEvidenceTools,
+      ...(currentAuthoringDocumentInspection
+        ? ['desktop_running_processes', 'desktop_active_window']
+        : []),
       ...priorityToolsForRoute(categories, text),
       ...manifestPriorities,
     ]),

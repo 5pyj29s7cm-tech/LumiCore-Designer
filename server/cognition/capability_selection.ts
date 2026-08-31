@@ -67,12 +67,17 @@ export interface LumiCapabilitySelection {
 }
 
 export interface ModelToolProjectionHints {
-  /** Server-owned capabilities already evidenced for this unfinished task. */
+  lane?: LumiCapabilityLane;
+  preferredTools?: readonly string[];
+  /**
+   * Server-owned capabilities that already produced evidence for the exact
+   * unfinished task. These are placed before semantic suggestions so a
+   * correction/retry cannot evict the tools needed to continue the task from
+   * the model's bounded declaration list.
+   */
   pinnedTools?: readonly string[];
   /** Ordinary conversation may stay tool-free even in an action-capable mode. */
   allowUnroutedDiscovery?: boolean;
-  lane?: LumiCapabilityLane;
-  preferredTools?: readonly string[];
 }
 
 /**
@@ -97,7 +102,7 @@ export function buildModelCapabilityPolicy(
   const hardRoute = execution.toolRoute?.hardAllowlist === true
     ? execution.toolRoute
     : null;
-  const hardAllowed = hardRoute
+  const hardAllowed = hardRoute && hardRoute.toolNames.length > 0
     ? unique(hardRoute.toolNames).filter(name => (
         !forbidden.has(name)
         && (baseWildcard || baseAllowedSet.has(name))

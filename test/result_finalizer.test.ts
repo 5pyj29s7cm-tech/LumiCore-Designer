@@ -25,6 +25,131 @@ describe('Lumi result finalizer', () => {
     expect(result.reason).toBe('unsupported_client_state_verification_claim_corrected');
     expect(result.text).not.toContain('client.modes');
   });
+
+  it('grounds receipt-only runtime cancellation after nested JSON normalization', async () => {
+    const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
+    const result = finalizeLumiResponse({
+      taskText: '\u6e05\u6389\u8fd9\u4e9b\u4efb\u52a1',
+      responseText: 'Completed the background task cleanup.',
+      toolRecords: [{
+        name: 'runtime_work_cancel',
+        arguments: { taskIds: ['task-a'] },
+        result: '',
+        receipt: JSON.stringify(JSON.stringify({
+          ok: true,
+          status: 'cancelled',
+          matchedCount: 1,
+          cancelledCount: 1,
+          cancellingCount: 0,
+          failedCount: 0,
+        })),
+        terminalVerification: {
+          status: 'verified',
+          strategy: 'terminal_receipt',
+          reason: 'The runtime ledger confirmed cancellation.',
+        },
+      }],
+      source: 'chat',
+    });
+
+    expect(result.blocked).toBe(false);
+  });
+
+  it('never persists a blank runtime-status turn and keeps the cleanup offer adjacent', async () => {
+    const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
+    const result = finalizeLumiResponse({
+      taskText: '后台工作现在怎么样？请核对哪些仍可撤回。',
+      responseText: '',
+      toolRecords: [{
+        name: 'runtime_work_status',
+        arguments: {},
+        result: JSON.stringify({
+          ok: true,
+          status: 'active',
+          activeCount: 2,
+          items: [
+            { id: 'task-a', title: '任务 A', controls: { canCancel: true } },
+            { id: 'task-b', title: '任务 B', controls: { canCancel: true } },
+          ],
+        }),
+        terminalVerification: {
+          status: 'verified',
+          strategy: 'terminal_receipt',
+          reason: 'server-owned runtime snapshot',
+        },
+        envelope: { status: 'verified_success' },
+      } as any],
+      source: 'chat',
+    });
+
+    expect(result.blocked).toBe(false);
+    expect(result.text).toContain('当前有 2 项后台工作');
+    expect(result.text).toMatch(/要不要我帮你清理这些后台任务？/u);
+  });
+
+  it('projects an empty verified runtime cancellation into a concise user receipt', async () => {
+    const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
+    const result = finalizeLumiResponse({
+      taskText: '清理这些后台任务',
+      responseText: '',
+      toolRecords: [{
+        name: 'runtime_work_cancel',
+        arguments: { taskIds: ['task-a'] },
+        result: JSON.stringify({
+          ok: true,
+          status: 'cancelled',
+          requestedTaskIds: ['task-a'],
+          cancelledTaskIds: ['task-a'],
+          cancellingTaskIds: [],
+          notCancelledTaskIds: [],
+          targetResults: [],
+        }),
+        terminalVerification: {
+          status: 'verified',
+          strategy: 'terminal_receipt',
+          reason: 'server-owned runtime cancellation',
+        },
+        envelope: { status: 'verified_success' },
+      } as any],
+      source: 'chat',
+    });
+
+    expect(result.blocked).toBe(false);
+    expect(result.text).toContain('已取消：task-a');
+  });
+
+  it('blocks cleanup completion when core tools failed and only unrelated reads succeeded', async () => {
+    const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
+    const result = finalizeLumiResponse({
+      taskText: '\u6e05\u6389\u8fd9\u4e9b\u4efb\u52a1',
+      responseText: 'Completed the background task cleanup.',
+      toolRecords: [{
+        name: 'runtime_work_cancel',
+        arguments: { taskIds: ['task-a'] },
+        result: '',
+        error: 'Cancellation failed.',
+      }, {
+        name: 'database_query',
+        arguments: { query: 'SELECT * FROM commandCenterPlans' },
+        result: '',
+        error: 'Could not determine table name.',
+      }, {
+        name: 'list_directory',
+        arguments: { path: '.' },
+        result: JSON.stringify({ ok: true, entries: ['entry.cjs', 'node.exe'] }),
+        terminalVerification: verifiedDesktopReceipt.terminalVerification,
+      }, {
+        name: 'search_files',
+        arguments: { path: '.', pattern: 'task' },
+        result: JSON.stringify({ ok: true, matches: ['runtime'] }),
+        terminalVerification: verifiedDesktopReceipt.terminalVerification,
+      }],
+      source: 'chat',
+    });
+
+    expect(result.blocked).toBe(true);
+    expect(result.reason).toContain('Missing core evidence for task_control');
+  });
   it('blocks a fenced legacy tool protocol from leaking into a read-only conversation', async () => {
     const { finalizeLumiResponse } = await import('../server/cognition/result_finalizer');
     const result = finalizeLumiResponse({
