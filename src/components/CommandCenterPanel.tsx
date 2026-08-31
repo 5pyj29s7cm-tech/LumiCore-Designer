@@ -28,31 +28,6 @@ import { TaskCompletionFeedbackDetails } from './TaskCompletionFeedbackDetails';
 import { normalizeTaskCompletionFeedback, type TaskCompletionFeedback } from './workflowTypes';
 import type { CommandCenterView } from './commandCenterTypes';
 
-// Kept as type-only compatibility exports for older Designer fixtures. The
-// rendered command center is single-core and never instantiates agent/team
-// surfaces; these helpers only adapt legacy test payloads.
-/**
- * Legacy shape used only by pre-single-core Designer fixtures.  Keep the
- * projection local so removing the old agent workspace does not leave a
- * runtime import (or resurrect the deleted LocalAgentSphere component).
- */
-type LocalAgentCosmosAgent = {
-  id: string;
-  name: string;
-  category: string;
-  runtime: 'internal' | 'external';
-  state: string;
-  taskId?: string;
-  taskTitle?: string;
-};
-type LocalAgentCosmosTask = {
-  id: string;
-  title?: string;
-  state: string;
-  active: boolean;
-  workerIds: string[];
-};
-
 export type CommandCenterTask = {
   id: string;
   kind?: 'autonomy' | 'takeover';
@@ -60,8 +35,6 @@ export type CommandCenterTask = {
   status?: string;
   phase?: string;
   updatedAt?: string;
-  /** Legacy task-feed fields retained only for variant compatibility. */
-  workerNames?: string[];
   toolCallsCount?: number;
   resultPreview?: string;
   error?: string;
@@ -134,7 +107,6 @@ export function normalizeCommandCenterTask(value: unknown): CommandCenterTask | 
     status,
     phase,
     updatedAt: typeof task.updatedAt === 'string' ? task.updatedAt : undefined,
-    workerNames: Array.isArray(task.workerNames) ? task.workerNames.map(String).filter(Boolean) : undefined,
     toolCallsCount: task.toolCallsCount == null
       ? (task.progress?.toolCallCount == null ? undefined : numeric(task.progress.toolCallCount))
       : numeric(task.toolCallsCount),
@@ -170,95 +142,6 @@ export function buildLumiCoreOrbitTasks(tasks: CommandCenterTask[]): LumiCoreOrb
     title: task.title || task.id,
     state: taskOrbitState(task),
     active: commandCenterTaskIsActive(task),
-  }));
-}
-
-/** @deprecated Agent/team cosmos was removed; retained for legacy adapters. */
-export type CommandAgent = {
-  id: string;
-  name: string;
-  category?: string;
-  runtime?: 'internal' | 'external';
-  status?: string;
-  isFrozen?: boolean;
-  healthStatus?: string;
-  lastRunStatus?: string;
-};
-
-/** @deprecated Use CommandCenterTask and buildLumiCoreOrbitTasks instead. */
-export type BackgroundTask = CommandCenterTask & {
-  workerNames?: string[];
-  toolCallsCount?: number;
-  resultPreview?: string;
-  error?: string;
-  completedAt?: string;
-};
-
-/** @deprecated Compatibility projection for pre-single-core test clients. */
-export function mergeCommandCenterTasks(
-  previous: BackgroundTask | undefined,
-  incoming: BackgroundTask,
-): BackgroundTask {
-  const next = ({ ...(previous || {}) } as unknown) as BackgroundTask;
-  for (const [key, value] of Object.entries(incoming)) {
-    if (value !== undefined && value !== null) {
-      (next as Record<string, unknown>)[key] = value;
-    }
-  }
-  return next;
-}
-
-/** @deprecated Compatibility projection; no runtime agent UI uses this. */
-export function buildCommandCenterCosmosAgents(
-  agents: CommandAgent[],
-  tasks: BackgroundTask[],
-): LocalAgentCosmosAgent[] {
-  return agents
-    .filter(agent => !['lumi', 'lumi_default'].includes(agent.id))
-    .map(agent => {
-      const id = String(agent.id || '').trim().toLowerCase();
-      const name = String(agent.name || '').trim().toLowerCase();
-      const task = tasks.find(item => commandCenterTaskIsActive(item)
-        && (item.workerNames || []).some(worker => {
-          const value = String(worker || '').trim().toLowerCase();
-          return value === id || value === name;
-        }));
-      const state = agent.isFrozen || agent.status === 'terminated'
-        ? 'paused'
-        : agent.runtime === 'external' && agent.healthStatus !== 'online'
-          ? 'attention'
-          : agent.lastRunStatus === 'failed'
-            ? 'attention'
-            : task ? 'working' : 'ready';
-      return {
-        id: agent.id,
-        name: agent.name,
-        category: agent.category || 'general',
-        runtime: agent.runtime === 'external' ? 'external' : 'internal',
-        state,
-        taskId: task?.id,
-        taskTitle: task?.title,
-      } as LocalAgentCosmosAgent;
-    });
-}
-
-/** @deprecated Compatibility projection; no runtime agent UI uses this. */
-export function buildCommandCenterCosmosTasks(
-  tasks: BackgroundTask[],
-  agents: LocalAgentCosmosAgent[],
-): LocalAgentCosmosTask[] {
-  return tasks.map(task => ({
-    id: task.id,
-    title: task.title,
-    state: taskOrbitState(task),
-    active: commandCenterTaskIsActive(task),
-    workerIds: agents
-      .filter(agent => (task.workerNames || []).some(worker => {
-        const value = String(worker || '').trim().toLowerCase();
-        return value === String(agent.id || '').trim().toLowerCase()
-          || value === String(agent.name || '').trim().toLowerCase();
-      }))
-      .map(agent => agent.id),
   }));
 }
 

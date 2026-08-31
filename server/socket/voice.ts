@@ -290,8 +290,6 @@ interface AudioSession {
   isSpeaking: boolean;
   /** Tool iteration loop is running — new input is queued, not dropped */
   isProcessing: boolean;
-  /** True during orchestrator multi-agent execution — status checks get quick ack */
-  isOrchestrating: boolean;
   /** AbortController for the full LLM+tool pipeline — aborted on barge-in */
   pipelineAbortController: AbortController | null;
   /** Independent conversational response while the work pipeline keeps running. */
@@ -329,7 +327,7 @@ interface AudioSession {
   }>;
   /** True when background agent is executing tools (barge-in requires wake word) */
   isBackgroundWork: boolean;
-  activeWorkStatus: 'idle' | 'planning' | 'executing' | 'orchestrating' | 'waiting_confirmation' | 'completed';
+  activeWorkStatus: 'idle' | 'planning' | 'executing' | 'waiting_confirmation' | 'completed';
   activeWorkStep: string;
   activeWorkToolCalls: number;
   /** Server-owned liveness for a real work lease; UI timers may observe but never cancel it. */
@@ -800,7 +798,6 @@ async function cancelActiveVoiceTurn(
   session.isSpeaking = false;
   session.ttsPlaybackUntil = 0;
   session.isProcessing = false;
-  session.isOrchestrating = false;
   if (!preserveInputQueue) session.inputQueue = [];
   session.accumulatedText = '';
   if (session.bargeinTimer) {
@@ -1252,9 +1249,6 @@ function buildActiveVoiceWorkProgressReply(session: AudioSession, userText: stri
   const toolStep = rawStep.match(/^(?:Running\s+)?([a-z][\w-]+?)(?:\s+(completed|failed))?$/i);
   const step = (() => {
     if (!toolStep) {
-      if (/^Coordinating worker agents$/i.test(rawStep)) {
-        return isEnglish ? 'coordinating the parallel work' : CN_VOICE_WORK_MESSAGES.coordinatingParallelWork;
-      }
       if (!rawStep) return '';
       if (!isEnglish && !/[\u3400-\u9fff]/u.test(rawStep)) return CN_VOICE_WORK_MESSAGES.executingCurrentStep;
       return rawStep.slice(0, 36);
@@ -1291,9 +1285,7 @@ function buildActiveVoiceWorkProgressReply(session: AudioSession, userText: stri
   }
   return step
     ? CN_VOICE_WORK_MESSAGES.progressWithStep(step)
-    : session.isOrchestrating
-      ? CN_VOICE_WORK_MESSAGES.coordinatingTask(task)
-      : CN_VOICE_WORK_MESSAGES.continuingTask(task);
+    : CN_VOICE_WORK_MESSAGES.continuingTask(task);
 }
 
 function stopVoiceWorkHeartbeat(session: AudioSession): void {
@@ -2167,7 +2159,6 @@ async function processVoiceInput(
   const clientActionOnlyTurn = turnFlow.clientActionOnlyTurn;
   const workSurfaceRoute = turnFlow.workSurfaceRoute;
   const visionIntent = turnFlow.visionIntent;
-  const exposeAgentWork = turnFlow.exposeAgentWork;
   const executionDecision = executionPipeline.execution;
   const voiceInputTokenBudget = resolveVoiceModelInputBudget({
     text: actionIntentText,
@@ -4389,137 +4380,12 @@ async function processVoiceInput(
     const effectiveModel = voiceModel;
     logger.info(`[Audio] Cognition: ${cognition.intent.category} (confidence: ${cognition.intent.confidence}), model: ${effectiveModel}`);
 
-    // ── Orchestrator: complex/moderate tasks → multi-agent decomposition ──
-    // The Designer edition uses the same single LumiCore execution owner as
-    // the primary client. Legacy worker orchestration remains disabled.
-    let usedOrchestrator = false;
     let recoveryConversationMessages: NormalizedMessage[] = [
       { role: 'system', content: voiceSystemPrompt },
       { role: 'user', content: routedUserText },
     ];
-    const shouldOrchestrate = false;
-    if (shouldOrchestrate) {
-      /* Legacy multi-worker execution was removed from the product runtime.
-      let voiceWorkflowCheckpointed = false;
-      try {
-        emitAgent("agent:status", { status: "thinking", agentName: "Lumi", phase: exposeAgentWork ? 'orchestrator' : 'background' });
-        session.isOrchestrating = true;
-        session.activeWorkStatus = 'orchestrating';
-        session.activeWorkStep = 'Coordinating worker agents';
-
-        const voiceModelRecovery = actionTaskExecution.state?.taskId
-          ? getConversationModelExecutionRecovery({
-              conversationId: conversationTurn.conversation.id,
-              userId: session.userId,
-              taskId: actionTaskExecution.state.taskId,
-            })
-          : null;
-        const orchResult = await runOrchestratedTask(
-          routedUserText,
-          {
-            ...toolSecurityContext,
-            userId: session.userId,
-            personalityId: session.personalityId,
-            domain: voiceScope.domain,
-            orgId: voiceScope.orgId,
-            desktopRelay,
-            toolPolicy: routedToolPolicy,
-            taskId: actionTaskExecution.state?.taskId,
-            desktopExecutionTracker,
-            resumeNodeReceipts: voiceModelRecovery?.receipts,
-            resumeExecutionGraph: voiceModelRecovery?.graph,
-            isCancelled: () => pipelineAbort?.signal.aborted ?? false,
-          },
-          {
-            provider,
-            model: effectiveModel,
-            inputTokenBudget: voiceInputTokenBudget,
-            ...reasoningRoutePolicy,
-          },
-          llmGetters,
-          exposeAgentWork && !deferCompletionSpeech
-            ? (msg) => {
-                if (shouldForwardPreFinalizationProgress(msg)) {
-                  emitAgent("agent:chunk", { text: msg, agentName: "Lumi" });
-                }
-              }
-            : undefined,
-          (record, meta) => {
-            session.activeWorkStatus = 'executing';
-            session.activeWorkStep = record.error
-              ? `${record.name} failed`
-              : record.result !== undefined
-                ? `${record.name} completed`
-                : `Running ${record.name}`;
-            if (isTerminalOrchestrationToolEvent(record)) {
-              session.activeWorkToolCalls++;
-              toolResults.push({ ...record, result: record.result || '' });
-            }
-            // Direct desktop relays already emit their own start/result lifecycle.
-            // Re-emitting here would duplicate every visible tool event.
-            if (isDirectDesktopTool(record.name)) return;
-            emitAgent("agent:tool_call", {
-              correlationId: record.id,
-              toolCallId: record.id,
-              name: record.name,
-              arguments: record.arguments,
-              args: record.arguments,
-              subTaskId: meta.subTaskId,
-              workerAgentId: meta.agentId,
-              workerAgentName: meta.agentName,
-              result: record.result?.slice(0, 500),
-              error: record.error,
-            });
-          },
-          async (checkpoint: OrchestrationWorkflowCheckpoint) => {
-            const taskId = actionTaskExecution.state?.taskId;
-            if (!taskId) {
-              throw new Error('Voice orchestration has no durable task identity');
-            }
-            await persistVoiceWorkflowCheckpointDurably({
-              conversationId: conversationTurn.conversation.id,
-              userId: session.userId,
-              taskId,
-              checkpoint,
-              resumeNodeReceipts: voiceModelRecovery?.receipts,
-            });
-            voiceWorkflowCheckpointed = true;
-          },
-        );
-        if (!isCurrentTurn()) return;
-        if (orchResult) {
-          if (actionTaskExecution.state?.taskId) {
-            const persistedModelResult = persistConversationModelExecutionResult({
-              conversationId: conversationTurn.conversation.id,
-              userId: session.userId,
-              taskId: actionTaskExecution.state.taskId,
-              workflowResult: orchResult.workflowResult,
-            });
-            if (!persistedModelResult) {
-              throw new Error('Voice orchestration final model result was rejected');
-            }
-            await flushDBOrThrow();
-          }
-          usedOrchestrator = true;
-          responseText = orchResult.responseText;
-          const rawSentences = responseText.split(/(?<=[。！？.!?\n])/);
-          // Orchestrator result text remains buffered until the shared finalizer
-          // has compared it with the complete tool ledger.
-          logger.info(`[Audio] Orchestrator response: "${responseText.slice(0, 80)}" (${rawSentences.length} sentences)`);
-        }
-        session.isOrchestrating = false;
-      } catch (e) {
-        session.isOrchestrating = false;
-        if (e instanceof VoiceWorkflowCheckpointError || voiceWorkflowCheckpointed) throw e;
-        logger.warn('[Audio] Orchestrator failed, falling back to LLM:', (e as Error).message);
-      }
-      */
-    }
-
-    if (!usedOrchestrator) {
-      // ── Single-phase: stream LLM → TTS with tool iteration, all inline ──
-      // Load recent conversation history for context continuity
-      // Include both user & assistant messages with correct roles
+    // Load recent conversation history for context continuity.
+    // Include both user and assistant messages with correct roles.
       const recentMsgs = getMessagesByTokenBudget(conversationTurn.conversation.id, 6_000, 6, requestId).filter(message => !(
         message.role === 'user' && message.externalMessageId === requestId
       ));
@@ -4787,8 +4653,6 @@ async function processVoiceInput(
         }
       }
     }
-    } // end if (!usedOrchestrator)
-
     if (!isCurrentTurn()) return;
 
     if (isDesignProjectStatusRequest(actionIntentText)) {
@@ -4987,7 +4851,7 @@ async function processVoiceInput(
       });
     }
 
-    // Candidate model/orchestrator text is never spoken before the strict
+    // Candidate model text is never spoken before the strict
     // database and terminal-receipt fences have both committed.
     await Promise.allSettled(ttsPromises);
     if (!isCurrentTurn()) return;

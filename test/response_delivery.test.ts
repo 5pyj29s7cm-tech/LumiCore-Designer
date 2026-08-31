@@ -27,8 +27,6 @@ function flow(overrides: Partial<LumiTurnFlow> = {}): LumiTurnFlow {
     } as LumiTurnFlow['workTakeover'],
     specialWorkflow: null,
     executionGovernance: {
-      delegationIntent: 'none',
-      delegationReason: 'single LumiCore owner',
       verificationIntent: 'none',
       verificationReason: '',
       capabilityLearningIntent: 'none',
@@ -36,7 +34,6 @@ function flow(overrides: Partial<LumiTurnFlow> = {}): LumiTurnFlow {
       shouldInspectCapabilitiesFirst: false,
     },
     completionEvidenceNeeded: false,
-    exposeAgentWork: false,
     routeText: '',
     promptOverlay: '',
     ...overrides,

@@ -3251,7 +3251,7 @@ export function DesktopUI({
     const workflowStepId = (prefix: string, seed?: string) =>
       `${prefix}-${seed || Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const isDetachedBackgroundEvent = (data: { source?: string }) =>
-      /^(?:background|background_delegation|proactive|scheduler)/i.test(String(data.source || ''));
+      /^(?:background|proactive|scheduler)/i.test(String(data.source || ''));
     const acceptsForegroundEvent = (data: { requestId?: string; source?: string }, claim = false) => {
       if (isDetachedBackgroundEvent(data)) return false;
       const requestId = String(data.requestId || '').trim();
