@@ -243,12 +243,12 @@ export interface ToolContext {
     };
   };
   conversationId?: string;
-  /** Owning conversation agent/personality for durable delegated work. */
+  /** Owning Lumi conversation/personality for durable work. */
   conversationAgentId?: string;
   personalityId?: string;
   turnId?: string;
   requestId?: string;
-  /** Exact reasoning route inherited by a durable delegated task. */
+  /** Exact reasoning route inherited by a durable LumiCore task. */
   modelRouting?: {
     provider?: string;
     model?: string;
@@ -276,8 +276,14 @@ export interface ToolContext {
   cwd?: string;
   /** Actual native desktop host platform when it differs from the server. */
   desktopPlatform?: NodeJS.Platform;
-  /** Relay for desktop tools: sends execution request to Tauri frontend and returns result */
-  desktopRelay?: (toolName: string, args: Record<string, any>) => Promise<string>;
+  /** Relay for desktop tools: sends execution request to Tauri frontend and returns result. */
+  desktopRelay?: ((toolName: string, args: Record<string, any>) => Promise<string>) & {
+    /**
+     * Set after physical user activity pauses this turn's desktop lease. The
+     * tool loop must stop, while the durable task remains resumable.
+     */
+    getControlPauseReason?: () => string | null;
+  };
   /** Explicit personal-device relay used only for approved cross-workspace handoff, such as sending an organization file to the member's own WeChat. */
   personalDesktopRelay?: (toolName: string, args: Record<string, any>) => Promise<string>;
   /** Called when a tool requires confirmation. Returns true to proceed, false to abort. */
@@ -361,7 +367,11 @@ export interface ToolContext {
   source?: string;
   /** Current canonical records from this exact model tool loop, before the active call. */
   getCurrentToolRecords?: () => ToolExecutionRecord[];
-  /** Transient source text whose digest matches the bound industry task. */
+  /**
+   * Optional product-workflow binding.  These fields carry a verified
+   * Designer/industry task pointer into domain tools; they do not grant any
+   * additional permissions and are ignored by generic tools.
+   */
   industryWorkflowSourceInput?: string;
   industryWorkflowTaskId?: string;
   industryWorkflowEntryId?: string;
@@ -374,6 +384,15 @@ export interface ToolDefinition {
   name: string;
   description: string;
   parameters: Record<string, any>;
+  /**
+   * Validate the exact adapter arguments before any confirmation is requested.
+   * This is a fail-closed admission check, not an authorization decision: it
+   * may reject impossible/invalid input but must not perform side effects.
+   */
+  preflight?: (
+    args: Record<string, any>,
+    context?: ToolContext,
+  ) => void | Promise<void>;
   handler: (args: Record<string, any>, context?: ToolContext) => Promise<string>;
   /**
    * Keep the generic local side-effect fence only while the handler is in

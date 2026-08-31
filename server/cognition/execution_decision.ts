@@ -5,7 +5,6 @@ import { buildUnifiedLegalEntryPrompt } from './legal_entry';
 import {
   formatToolRouteForPrompt,
   mergeToolPolicyWithRoute,
-  requestsExplicitCadFileExport,
   routeToolsForTurn,
   type ToolRoute,
 } from './tool_router';
@@ -22,9 +21,9 @@ import {
 } from './current_app_execution';
 import { WPS_CREATE_DOCUMENT_TOOL } from '../external_control/wps_automation';
 import type { ConversationActionContinuationState } from './action_continuation';
-import { isDesignProjectStatusRequest } from '../design/status_intent';
-import { buildActionContract, requiresVisibleAutoCadExecution } from './action_contract';
 import { applyTaskPolicySnapshot } from './task_execution_ledger';
+import { buildActionContract, requiresVisibleAutoCadExecution } from './action_contract';
+import { isDesignProjectStatusRequest } from '../design/status_intent';
 import {
   formatIndustryWorkflowRoutingPrompt,
   isDesignProjectCreationRequest,
@@ -42,14 +41,13 @@ type ToolDeclaration = ReturnType<ToolRegistry['getToolDeclarations']>[number];
 export interface LumiExecutionDecisionInput {
   flow: LumiTurnFlow;
   text: string;
-  /** Raw text from this accepted user turn, without recovered task context. */
+  /** Original visible turn text kept for product-specific routing guards. */
   currentTurnText?: string;
   toolDeclarations: ToolDeclaration[];
   toolRegistry?: ToolRegistry;
   personalityToolPolicy?: ToolPolicy;
   isSanctuary?: boolean;
   actionTaskState?: ConversationActionContinuationState | null;
-  /** True only when transport/server state binds this turn to that task. */
   trustedActionContinuation?: boolean;
   pendingAssistantOfferContext?: PendingAssistantOfferContext;
 }
@@ -109,8 +107,6 @@ const SELF_REPAIR_DESKTOP_RE =
   /(?:\u684c\u9762|\u7a97\u53e3|\u753b\u9762|\u9875\u9762|\u754c\u9762|\u767d\u5c4f|\u9ed1\u5c4f|\u5d29\u6e83|\u5361\u4f4f|\u5361\u6b7b|\u6ca1\u53cd\u5e94|\u6253\u4e0d\u5f00|\u542f\u52a8\u5931\u8d25|\b(?:autocad|wps|wechat|weixin|desktop|window|screen|page|ui|blank|crash(?:ed)?|stuck|hang(?:ing)?)\b|white\s+screen|black\s+screen|failed\s+to\s+(?:open|start))/iu;
 const SELF_REPAIR_ADAPTER_RE =
   /(?:\u80fd\u529b|\u9002\u914d\u5668|\u63a5\u5165|\u8fde\u63a5|\u8f6f\u4ef6|\u5e94\u7528|\b(?:mcp|skill|plugin|adapter|capability|integration|connection|autocad|wps|wechat|weixin|cad|bim)\b)/iu;
-const SELF_REPAIR_ADAPTER_RECOVERY_RE =
-  /(?:\u9002\u914d\u5668|\u63a5\u5165|\u8fde\u63a5|\u6280\u80fd|\u63d2\u4ef6|\b(?:mcp|skill|plugin|adapter|integration|connection)\b)/iu;
 const SELF_REPAIR_LEARNING_INSPECTION_RE =
   // i18n-allow: Reviewed Chinese learning-check input recognition; not user-visible copy.
   /(?:跑|做|进行|执行|查|查看|检查).{0,10}(?:一轮)?(?:学习检查|学习状态检查|学习记录检查|能力学习检查)/u;
@@ -133,9 +129,6 @@ export function buildSelfRepairToolPolicy(text: string, registry?: ToolRegistry)
 
   if (SELF_REPAIR_ADAPTER_RE.test(requested)) {
     allowedTools.push('adapter_registry_list', 'adapter_health_check');
-    if (explicitRecovery && SELF_REPAIR_ADAPTER_RECOVERY_RE.test(requested)) {
-      allowedTools.push('adapter_auto_recover');
-    }
   }
   if (SELF_REPAIR_LEARNING_INSPECTION_RE.test(requested)) {
     allowedTools.push('capability_learning_list');
@@ -230,27 +223,23 @@ function unique(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
-const INJECTED_ROUTING_CONTEXT_RE = /(?:^|\r?\n)\s*##\s+(?:Current Turn Attachments|Recent action continuation context|Internal client-surface continuation context|Exact Pending Action Confirmation)\b/i;
-
-/** Keep routing grounded in the accepted user instruction, not injected prose. */
-function primaryUserInstruction(input: string): string {
-  const raw = String(input || '').trim();
-  const marker = INJECTED_ROUTING_CONTEXT_RE.exec(raw);
-  return marker ? raw.slice(0, marker.index).trim() : raw;
-}
-
-function isUnboundTerseContinuation(input: LumiExecutionDecisionInput): boolean {
-  const text = primaryUserInstruction(input.currentTurnText || input.text);
-  if (!/^(?:继续|接着|重试|再试一次|继续执行|继续刚才的任务|恢复|continue|resume|retry|try again|proceed)\s*[。！？!?．.]?$/iu.test(text)) { // i18n-allow: Multilingual input-recognition literals; not user-visible copy.
-    return false;
-  }
-  return input.trustedActionContinuation !== true;
-}
-
 function addAvailable(out: Set<string>, available: Set<string>, names: string[]): void {
   for (const name of names) {
     if (available.has(name)) out.add(name);
   }
+}
+
+function primaryUserInstruction(text: string): string {
+  return String(text || '')
+    .split(/\n## (?:Recent action continuation context|Exact Pending Action Confirmation)\b/i, 1)[0]
+    .trim();
+}
+
+function isUnboundTerseContinuation(input: LumiExecutionDecisionInput): boolean {
+  if (input.trustedActionContinuation) return false;
+  const text = primaryUserInstruction(input.text || input.flow.routeText);
+  // i18n-allow: Multilingual terse-continuation input recognition; not user-visible copy.
+  return /^(?:继续|接着|接着做|继续做|继续执行|再试(?:一次|一下)?|重试|可以了|好了|continue|resume|retry|try\s+again|go\s+on)[\s。！？.!?]*$/iu.test(text);
 }
 
 function retainSemanticToolsWithinLimit(
@@ -313,9 +302,6 @@ const EXTERNAL_AI_HISTORY_SEMANTIC_TOOLS = [
   'external_ai_history_sync',
   'external_ai_history_status',
   'external_ai_history_query',
-  'external_ai_route_plan',
-  'external_ai_collect_answers',
-  'external_ai_session_status',
 ];
 
 const DESKTOP_CONTROL_SEMANTIC_TOOLS = [
@@ -345,12 +331,13 @@ function enhanceToolRouteForFlow(
   flow: LumiTurnFlow,
   declarations: ToolDeclaration[],
   registry?: ToolRegistry,
+  semanticText = flow.routeText,
 ): ToolRoute {
   const available = new Set(declarations.map(declaration => declaration.function.name));
   if (flow.industryGuidanceRequest) {
     const toolNames = [
       'industry_user_guide',
-      ...(isIndustryGuidancePreferenceRequest(flow.routeText)
+      ...(isIndustryGuidancePreferenceRequest(semanticText)
         ? ['industry_guidance_preference_set']
         : []),
     ].filter(name => available.has(name));
@@ -358,18 +345,13 @@ function enhanceToolRouteForFlow(
       ...route,
       toolNames,
       categories: unique([...route.categories, 'industry_guidance']),
-      reasons: unique([
-        ...route.reasons,
-        'user-learning turns use the read-only edition guide and never start a business workflow',
-      ]),
+      reasons: unique([...route.reasons, 'edition guidance is read-only and never starts a business workflow']),
       truncated: false,
       hardAllowlist: true,
-      maxIterations: Math.min(route.maxIterations || 2, 2),
+      maxIterations: 2,
     };
   }
-  const designProjectStatusRequest = available.has('interior_design_project_status')
-    && isDesignProjectStatusRequest(flow.routeText);
-  if (designProjectStatusRequest) {
+  if (available.has('interior_design_project_status') && isDesignProjectStatusRequest(semanticText)) {
     return {
       ...route,
       toolNames: ['interior_design_project_status'],
@@ -388,89 +370,44 @@ function enhanceToolRouteForFlow(
   const reasons = [...route.reasons];
   const recoveredCurrentAppEdit = isRecoveredCurrentAppEditingContinuation(flow.routeText);
   const recoveredWpsCreateAndType = isRecoveredWpsCreateTask(flow.routeText);
-  const actionContract = buildActionContract(flow.routeText);
+  const actionContract = buildActionContract(semanticText);
   // Keep one compact discovery schema in every non-hard model route. Its
   // receipt can re-project an already-authorized hidden capability on the
   // next iteration without restoring the complete registry to the prompt.
   addAvailable(additions, available, ['client_capability_manifest']);
   addAvailable(semanticPriority, available, ['client_capability_manifest']);
-  const discoveredEvidenceTools = registry?.findRelevant(flow.routeText, {
+  const discoveredEvidenceTools = registry?.findRelevant(semanticText, {
     limit: 8,
     evidenceOperations: ['observe', 'test'],
   }) || [];
   const industryWorkflowMatch = !recoveredCurrentAppEdit && flow.industryWorkflowEntryId
-    ? matchCurrentIndustryWorkflow(flow.routeText)
+    ? matchCurrentIndustryWorkflow(semanticText)
     : null;
-  const industryExecutionTools = industryWorkflowMatch?.entry.contract.executionTools || [];
   const designProjectCreation = !recoveredCurrentAppEdit
     && flow.industryWorkflowEntryId === 'project'
-    && isDesignProjectCreationRequest(flow.routeText);
-  const namesExistingWorkTakeoverTask = /\bwt_task_[a-z0-9_-]+\b/i.test(flow.routeText);
+    && isDesignProjectCreationRequest(semanticText);
   if (industryWorkflowMatch || designProjectCreation) {
-    addAvailable(additions, available, [
+    const executionTools = industryWorkflowMatch?.entry.contract.executionTools || [];
+    const toolNames = unique([
       ...(designProjectCreation
         ? ['interior_design_project_create', 'interior_design_project_select', 'interior_design_project_status']
-        : ['industry_workflow_start', 'industry_workflow_complete']),
-      ...(namesExistingWorkTakeoverTask ? ['work_takeover_task_get', 'work_takeover_task_verify_result'] : []),
-      ...industryExecutionTools,
-    ]);
-    categories.push('industry_workflow');
-    reasons.push(designProjectCreation
-      ? 'new design projects must create a durable active project before stage execution'
-      : `matched edition outcome ${industryWorkflowMatch!.entry.entryId}`);
-  }
-  if (industryWorkflowMatch && industryExecutionTools.length && !designProjectCreation) {
-    const persistentTaskTools = flow.channel === 'task' || flow.workTakeover.shouldResumeTask
-      ? [
-          'work_takeover_task_continue',
-          'work_takeover_task_advance',
-          'work_takeover_task_autorun',
-          'work_takeover_task_export_packet',
-          'work_takeover_task_run_suggested_tool',
-        ]
-      : [];
-    const localCadDiscoveryTools = route.categories.includes('cad_design')
-      && flow.workSurfaceRoute.artifactFirst
-      && flow.workSurfaceRoute.directDesktop
-      ? [
-          'desktop_list_files',
-          'desktop_path_info',
-          'desktop_list_apps',
-          'ocr_image_file',
-        ]
-      : [];
-    const boundedIndustryExecutionTools = requiresVisibleAutoCadExecution(flow.routeText)
-      && !requestsExplicitCadFileExport(flow.routeText)
-      ? industryExecutionTools.filter(name => ![
-          'cad_generate_dxf',
-          'mcp_cad-drafting_cad_renovation_folder_workflow',
-        ].includes(name))
-      : industryExecutionTools;
-    const toolNames = unique([
-      'industry_workspace_status',
-      'industry_workspace_bind',
-      ...(namesExistingWorkTakeoverTask ? ['work_takeover_task_get'] : []),
-      ...persistentTaskTools,
-      ...localCadDiscoveryTools,
-      'interior_design_project_status',
-      ...boundedIndustryExecutionTools,
-      'industry_workflow_start',
-      'industry_workflow_complete',
-      ...(namesExistingWorkTakeoverTask ? ['work_takeover_task_verify_result'] : []),
+        : ['industry_workspace_status', 'industry_workspace_bind', 'interior_design_project_status']),
+      ...executionTools,
+      ...(designProjectCreation ? [] : ['industry_workflow_start', 'industry_workflow_complete']),
     ]).filter(name => available.has(name));
     return {
       ...route,
       toolNames,
-      categories: unique(categories),
+      categories: unique([...route.categories, 'industry_workflow']),
       reasons: unique([
-        ...reasons,
-        'industry workflow contract supplies the exact execution allowlist',
-        ...(persistentTaskTools.length ? ['persistent task entry keeps task-state continuation tools in the industry allowlist'] : []),
-        ...(localCadDiscoveryTools.length ? ['local visible CAD work keeps bounded file and application discovery ahead of production tools'] : []),
+        ...route.reasons,
+        designProjectCreation
+          ? 'new design projects create a durable active project before stage execution'
+          : `industry workflow contract owns ${industryWorkflowMatch!.entry.entryId}`,
       ]),
       truncated: false,
       hardAllowlist: true,
-      maxIterations: Math.max(route.maxIterations || 0, 12),
+      maxIterations: Math.max(route.maxIterations || 0, designProjectCreation ? 8 : 12),
     };
   }
   if (discoveredEvidenceTools.length) {
@@ -571,20 +508,16 @@ function enhanceToolRouteForFlow(
   ));
   const priority = recoveredWpsCreateAndType && available.has(WPS_CREATE_DOCUMENT_TOOL)
     ? [WPS_CREATE_DOCUMENT_TOOL]
-    : designProjectCreation
-      ? ['interior_design_project_create'].filter(name => available.has(name))
-      : industryWorkflowMatch
-        ? ['industry_workflow_start', 'industry_workflow_complete'].filter(name => available.has(name))
-        : flow.workSurfaceRoute.artifactFirst && actionContract.kind === 'artifact_work'
-          ? [
-              'write_file',
-              'desktop_write_text_file',
-              'work_product_verify',
-              'desktop_path_info',
-              'read_file',
-              'read_files_batch',
-            ].filter(name => available.has(name))
-          : [];
+    : flow.workSurfaceRoute.artifactFirst && actionContract.kind === 'artifact_work'
+      ? [
+          'write_file',
+          'desktop_write_text_file',
+          'work_product_verify',
+          'desktop_path_info',
+          'read_file',
+          'read_files_batch',
+        ].filter(name => available.has(name))
+      : [];
   const merged = unique([
     ...priority,
     ...routeNames,
@@ -617,17 +550,15 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
   const statusOnlyContinuation =
     /Recovered structured action state:[\s\S]{0,500}- followupIntent:\s*status\b/i.test(input.flow.routeText || input.text);
   const currentTurnText = input.currentTurnText || input.text;
-  // Recovered context can contain task-status labels and old negative clauses.
-  // Runtime task control is therefore classified only from the accepted turn,
-  // and a concrete edition route keeps ownership of its own durable ledger.
   const specializedEditionTurn = Boolean(
     input.flow.industryGuidanceRequest
     || input.flow.industryWorkflowEntryId
-    || isDesignProjectStatusRequest(currentTurnText),
+    || isDesignProjectStatusRequest(currentTurnText)
   );
-  const runtimeWorkIntent = specializedEditionTurn
-    ? 'none'
-    : classifyRuntimeWorkIntent(currentTurnText, input.pendingAssistantOfferContext);
+  const runtimeWorkIntent = classifyRuntimeWorkIntent(
+    specializedEditionTurn ? '' : currentTurnText,
+    input.pendingAssistantOfferContext,
+  );
   const taskControlIntent = !specializedEditionTurn && (
     runtimeWorkIntent !== 'none'
     || buildActionContract(currentTurnText).kind === 'task_control'
@@ -644,9 +575,9 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
   const clientActionToolPolicy = input.flow.clientActionOnlyTurn && !statusOnlyContinuation && !modelOwnedMainChat
     ? CLIENT_ACTION_TOOL_POLICY
     : null;
-  const designProjectStatusToolPolicy: ToolPolicy | null = isDesignProjectStatusRequest(
-    input.flow.routeText || input.text,
-  ) && input.toolDeclarations.some(declaration => declaration.function.name === 'interior_design_project_status')
+  const availableToolNames = new Set(input.toolDeclarations.map(declaration => declaration.function.name));
+  const designProjectStatusToolPolicy: ToolPolicy | null = isDesignProjectStatusRequest(currentTurnText)
+    && availableToolNames.has('interior_design_project_status')
     ? {
         allowedTools: ['interior_design_project_status'],
         requireConfirmation: [],
@@ -658,10 +589,10 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
     ? {
         allowedTools: [
           'industry_user_guide',
-          ...(isIndustryGuidancePreferenceRequest(input.flow.routeText || input.text)
+          ...(isIndustryGuidancePreferenceRequest(currentTurnText)
             ? ['industry_guidance_preference_set']
             : []),
-        ],
+        ].filter(name => availableToolNames.has(name)),
         requireConfirmation: [],
         forbiddenTools: [],
         maxIterations: 2,
@@ -671,13 +602,14 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
     ? matchCurrentIndustryWorkflow(input.flow.routeText || input.text)
     : null;
   const industryProjectCreation = input.flow.industryWorkflowEntryId === 'project'
-    && isDesignProjectCreationRequest(input.flow.routeText || input.text);
-  const availableToolNames = new Set(input.toolDeclarations.map(declaration => declaration.function.name));
+    && isDesignProjectCreationRequest(currentTurnText);
   const industryWorkflowToolPolicy: ToolPolicy | null = input.flow.industryWorkflowEntryId
     ? {
         allowedTools: unique((industryProjectCreation
           ? ['interior_design_project_create', 'interior_design_project_select', 'interior_design_project_status']
           : [
+              'industry_workspace_status',
+              'industry_workspace_bind',
               'industry_workflow_start',
               'industry_workflow_complete',
               'interior_design_project_status',
@@ -685,18 +617,18 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
             ]).filter(name => availableToolNames.has(name))),
         requireConfirmation: [],
         forbiddenTools: [],
-        maxIterations: 8,
+        maxIterations: industryProjectCreation ? 8 : 12,
       }
     : null;
   const baseToolPolicy = input.isSanctuary || statusOnlyContinuation
     ? NO_TOOLS_POLICY
     : designProjectStatusToolPolicy
       ? designProjectStatusToolPolicy
-    : industryGuidanceToolPolicy
-      ? industryGuidanceToolPolicy
-    : industryWorkflowToolPolicy
-      ? industryWorkflowToolPolicy
-    : selfRepairToolPolicy
+      : industryGuidanceToolPolicy
+        ? industryGuidanceToolPolicy
+        : industryWorkflowToolPolicy
+          ? industryWorkflowToolPolicy
+          : selfRepairToolPolicy
       ? selfRepairToolPolicy
       : clientActionToolPolicy
         ? clientActionToolPolicy
@@ -714,14 +646,20 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
         maxTools: input.flow.channel === 'voice' ? 24 : 32,
         capabilityManifest: input.toolRegistry?.getCapabilityManifest(baseToolPolicy),
         pendingAssistantOfferContext: input.pendingAssistantOfferContext,
-        runtimeWorkIntent,
-        taskControlIntent,
         actionTaskState: input.actionTaskState,
         trustedActionContinuation: input.trustedActionContinuation,
       })
     : null;
   const toolRoute = rawToolRoute
-    ? enhanceToolRouteForFlow(rawToolRoute, input.flow, input.toolDeclarations, input.toolRegistry)
+    ? enhanceToolRouteForFlow(
+        rawToolRoute,
+        input.flow,
+        input.toolDeclarations,
+        input.toolRegistry,
+        input.trustedActionContinuation && input.actionTaskState?.goal
+          ? input.actionTaskState.goal
+          : primaryUserInstruction(input.flow.routeText || input.text),
+      )
     : null;
   const routedPolicy = toolRoute
     ? mergeToolPolicyWithRoute(baseToolPolicy, toolRoute)
@@ -731,9 +669,7 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
     : '';
   const resumesPinnedTask = Boolean(
     input.trustedActionContinuation
-    &&
-    taskMarker
-    && (input.flow.routeText || input.text).includes(taskMarker)
+    && taskMarker
     && input.actionTaskState?.policySnapshot
     && !statusOnlyContinuation
     && !clientActionToolPolicy
@@ -781,6 +717,12 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
         : 'Inspect only the explicitly exposed diagnostic sub-domain and report current receipts. Do not attempt or claim a repair in this turn.'
       : '',
     statusOnlyContinuation ? 'This is a status/why/recall follow-up about the recovered recent action. Explain the saved goal, actual tool evidence, blocker, and unfinished state. Do not restart execution, create a task-center item, or claim new work in this turn.' : '',
+    input.flow.industryGuidanceRequest
+      ? formatIndustryUserGuidancePrompt(currentTurnText)
+      : '',
+    input.flow.industryWorkflowEntryId
+      ? formatIndustryWorkflowRoutingPrompt(currentTurnText)
+      : '',
     recoveredCurrentAppEdit
       ? buildCurrentAppUiStateMachinePrompt(
           getRecoveredApplicationContinuationTarget(input.flow.routeText || input.text),
@@ -790,9 +732,9 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
       ? `Continue task ${input.actionTaskState?.taskId} with its original capability envelope. Short confirmations, corrections, or retry wording must not narrow the tools selected for the original task.`
       : '',
     unboundTerseContinuation
-      ? 'This terse continuation is not bound to a server-owned task. Do not call tools or infer a target from injected context; ask what should be continued.'
+      ? 'This terse continuation is not bound to a server-owned task. Do not call tools or infer a target from user-supplied context markers; ask what should be continued.'
       : '',
-    input.isSanctuary ? 'This agent is in sanctuary territory; tools are disabled.' : '',
+    input.isSanctuary ? 'This guest session is in a restricted boundary; tools are disabled.' : '',
     effectiveToolRoute ? formatToolRouteForPrompt(effectiveToolRoute) : '',
     buildUnifiedLegalEntryPrompt({
       text: input.flow.routeText || input.text,
@@ -803,12 +745,6 @@ export function buildLumiExecutionDecision(input: LumiExecutionDecisionInput): L
       routeCategories: effectiveToolRoute?.categories,
       toolNames: effectiveToolRoute?.toolNames,
     }),
-    !input.flow.industryWorkflowEntryId
-      ? ''
-      : formatIndustryWorkflowRoutingPrompt(input.flow.routeText || input.text),
-    input.flow.industryGuidanceRequest
-      ? formatIndustryUserGuidancePrompt(input.flow.routeText || input.text)
-      : '',
     !effectiveToolRoute && allowToolUse && !input.flow.clientActionOnlyTurn && !input.flow.selfRepairTurn
       ? 'No narrow tool route was selected. Use the base policy conservatively and ask one clarification if the work surface is unclear.'
       : '',

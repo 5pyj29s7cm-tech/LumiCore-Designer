@@ -129,8 +129,6 @@ import {
   getOrCreateActiveConversation,
   getConversationActionStatus,
   bindConversationActionExecutionTurn,
-  persistConversationModelExecutionResult,
-  getConversationModelExecutionRecovery,
   cancelConversationActionExecution,
   createDurableForegroundReleaseGate,
   convergeConversationActionRequestLease,
@@ -180,26 +178,12 @@ import {
   taskReceiptsToRecords,
   toolRecordSucceeded,
 } from "../cognition/task_execution_ledger";
-import { hasExplicitTeamExecutionRequest, isUserCorrectionOrExplanationQuestion } from "../cognition/tool_intent";
+import { isUserCorrectionOrExplanationQuestion } from "../cognition/tool_intent";
 import { summarizeToolRecordForPersistence } from "../cognition/tool_record_status";
 import {
   buildDeterministicWorkTaskStatusCommand,
 } from "../cognition/quick_commands";
 import { recordTokenUsage } from "../llm/token_tracker";
-import {
-  classifyComplexity,
-  listAvailableOrchestrationAgents,
-  shouldAttemptOrchestration,
-} from "../agents/orchestrator";
-import { buildDelegationAck, shouldDelegateWorkInBackground } from "../agents/background_delegation";
-import { markLatestUserTurn } from "../agents/background_delivery";
-import {
-  getBackgroundTask,
-  requestCancelBackgroundTask,
-  requestPauseBackgroundTask,
-  resumeBackgroundTask,
-} from "../agents/background_tasks";
-import { shouldChainTask } from "../agents/nl_chainer";
 import { searchKnowledgeBase } from "../org/kb";
 import { buildProfessionOverlay } from "../autonomy/professions";
 import { buildResponseLanguageInstruction } from "../utils/language";
@@ -246,7 +230,6 @@ import {
   resolveActiveTaskMessageRelation,
   type ActiveTaskMessageResolution,
 } from "../cognition/task_concurrency";
-import { backgroundTaskMatchesScope, projectBackgroundTask } from "../agents/background_task_public";
 import { SerialExecutionQueue } from "../cognition/serial_execution_queue";
 import {
   isGuardGeneratedAssistantText,
@@ -769,61 +752,6 @@ export function registerChatHandler(
     session.cancel();
     try { ack?.({ ok: true, requestId: snapshot.requestId, status: 'cancelling' }); } catch {}
   });
-
-  socket.on("agent:background_cancel", (data: { taskId?: string }) => {
-    const uid = userIdFn(socket);
-    const taskId = typeof data?.taskId === 'string' ? data.taskId : '';
-    const socketScope = resolveSocketScope(socket, uid);
-    const taskScope = { domain: socketScope.domain, orgId: socketScope.orgId || '' };
-    if (!taskId) {
-      socket.emit("agent:background_task_update", {
-        taskId,
-        error: 'Missing background task id',
-        source: 'background_delegation',
-      });
-      return;
-    }
-
-    const existing = getBackgroundTask(taskId, uid);
-    const task = existing && backgroundTaskMatchesScope(existing, taskScope)
-      ? requestCancelBackgroundTask(taskId, uid)
-      : null;
-    if (!task) {
-      socket.emit("agent:background_task_update", {
-        taskId,
-        error: 'Background task not found',
-        source: 'background_delegation',
-      });
-      return;
-    }
-
-    socket.emit("agent:background_task_update", {
-      taskId: task.id,
-      task: projectBackgroundTask(task),
-      source: 'background_delegation',
-    });
-  });
-
-  const updateBackgroundTaskState = (
-    data: { taskId?: string },
-    operation: 'pause' | 'resume',
-  ) => {
-    const uid = userIdFn(socket);
-    const taskId = typeof data?.taskId === 'string' ? data.taskId : '';
-    const socketScope = resolveSocketScope(socket, uid);
-    const taskScope = { domain: socketScope.domain, orgId: socketScope.orgId || '' };
-    const existing = taskId ? getBackgroundTask(taskId, uid) : null;
-    const task = existing && backgroundTaskMatchesScope(existing, taskScope)
-      ? operation === 'pause'
-        ? requestPauseBackgroundTask(taskId, uid)
-        : resumeBackgroundTask(taskId, uid)
-      : null;
-    socket.emit("agent:background_task_update", task
-      ? { taskId: task.id, task: projectBackgroundTask(task), source: 'background_delegation' }
-      : { taskId, error: `Background task not found or not ${operation === 'pause' ? 'pausable' : 'resumable'}`, source: 'background_delegation' });
-  };
-  socket.on("agent:background_pause", (data: { taskId?: string }) => updateBackgroundTaskState(data, 'pause'));
-  socket.on("agent:background_resume", (data: { taskId?: string }) => updateBackgroundTaskState(data, 'resume'));
 
   socket.on("agent:chat", async (
     data: { text?: string; history?: any[]; attachments?: any[]; personalityId?: string; category?: string; agentId?: string; domain?: string; orgId?: string | null; mode?: string; operationMode?: string; source?: string; requestId?: string; conversationId?: string; controlTargetRequestId?: string; controlTargetTaskId?: string; controlTargetRevision?: number },
@@ -1879,7 +1807,6 @@ export function registerChatHandler(
     if (superseded?.terminalEvent) {
       io.to(executionRoom).emit(superseded.terminalEvent.event, superseded.terminalEvent.payload);
     }
-    markLatestUserTurn(executionScope, requestId);
     if (!acknowledged) {
       try { ack?.({ ok: true, requestId, receivedAt: new Date().toISOString() }); } catch {}
     }
@@ -3101,7 +3028,6 @@ export function registerChatHandler(
       const clientActionOnlyTurn = turnFlow.clientActionOnlyTurn;
       const workSurfaceRoute = turnFlow.workSurfaceRoute;
       const visionIntent = turnFlow.visionIntent;
-      const explicitTeamOrchestration = hasExplicitTeamExecutionRequest(turnFlow.routeText);
       const executionDecision = getTurnExecutionDecision();
       const intentTrace = executionPipeline.intentTrace;
       const capabilitySelection = getTurnCapabilitySelection();
@@ -4160,145 +4086,6 @@ export function registerChatHandler(
         flow: turnFlow,
       });
       const chatTextGate = createPreFinalizationTextGate();
-      const prefersSequentialWorkflow =
-        shouldChainTask(executionTaskText) &&
-        workSurfaceRoute.artifactFirst &&
-        !workSurfaceRoute.directDesktop;
-      const availableWorkerAgents = (() => {
-        try {
-          return listAvailableOrchestrationAgents({
-            userId: uid,
-            personalityId,
-            domain: resolvedDomain,
-            orgId: resolvedOrgId,
-          }).filter((agent: any) => agent.id !== conversationAgentId);
-        } catch {
-          return [];
-        }
-      })();
-      const backgroundComplexity = classifyComplexity(executionTaskText, {
-        userId: uid,
-        personalityId,
-        domain: resolvedDomain,
-        orgId: resolvedOrgId,
-        desktopRelay,
-      });
-      const legacyDelegationHint = shouldDelegateWorkInBackground({
-        text: visibleUserText || text,
-        source: eventSource,
-        category: cognition.intent.category,
-        complexity: backgroundComplexity,
-        allowToolUse: executionDecision.allowToolUse,
-        clientActionOnly: clientActionOnlyTurn,
-        clientSurfaceRequest: Boolean(chatContextBridge) || isClientSurfaceRequestText(routingText),
-        continuationContext: Boolean(actionContinuationBridge),
-        selfRepair: selfRepairTurn,
-        sanctuary: isSanctuary,
-        directDesktop: workSurfaceRoute.directDesktop,
-        capabilityLane: capabilitySelection.lane,
-        prefersSequentialWorkflow,
-        availableAgentCount: availableWorkerAgents.length,
-      });
-      const legacyOrchestrationHint = shouldAttemptOrchestration({
-        channel: 'chat',
-        text: turnFlow.routeText,
-        complexity: backgroundComplexity,
-        allowToolUse: executionDecision.allowToolUse,
-        clientActionOnly: clientActionOnlyTurn,
-        selfRepair: selfRepairTurn,
-        responseReady: false,
-        hasPreflightContext: false,
-        prefersSequentialWorkflow,
-        capabilityLane: capabilitySelection.lane,
-        cognitionCategory: cognition.intent.category,
-      });
-      const legacyExecutionHints = [
-        legacyDelegationHint.shouldDelegate ? `background candidate: ${legacyDelegationHint.reason}` : '',
-        legacyOrchestrationHint ? 'multi-agent orchestration candidate' : '',
-        shouldChainTask(executionTaskText) ? 'multi-step execution candidate' : '',
-      ].filter(Boolean);
-      if (legacyExecutionHints.length) {
-        effectiveSystemPrompt += [
-          '',
-          '## Advisory execution candidates',
-          'Legacy routing observed the candidates below. They are hints only: decide whether to respond, use a registered capability, or execute a model-planned sequence from the current hard-policy manifest. Do not claim delegation, background work, or orchestration unless a current-turn tool receipt proves it.',
-          ...legacyExecutionHints.map(item => `- ${item}`),
-        ].join('\n');
-      }
-
-      if (!responseText && !runtimeOwnedDeterministicRecoveryCall && legacyDelegationHint.shouldDelegate) {
-        const delegationRecord = await executeToolCall({
-          registry: toolRegistry,
-          id: `background-register-${requestId}`,
-          name: 'agent_delegate_background',
-          arguments: {
-            task: executionTaskText,
-            title: visibleUserText.slice(0, 140) || storedUserContent.slice(0, 140) || 'Background task',
-            reason: legacyDelegationHint.reason,
-            preferredAgentIds: availableWorkerAgents.slice(0, 8).map((agent: any) => agent.id),
-            forceOrchestration: true,
-          },
-          context: {
-            ...toolSecurityContext,
-            userId: uid,
-            taskId: durableTaskId,
-            conversationId: conversation.id,
-            conversationAgentId,
-            personalityId,
-            turnId: requestId,
-            requestId,
-            idempotencyKey: `background:${conversation.id}:${requestId}`,
-            domain: resolvedDomain,
-            orgId: resolvedOrgId,
-            actionIntent: visibleUserText,
-            routedTaskText: turnFlow.routeText,
-            source: 'chat_background_registration',
-            modelRouting: {
-              provider: activeProvider,
-              model: activeModel,
-              selectionMode: reasoningRoutePolicy.selectionMode,
-              fallbackCandidates: reasoningRoutePolicy.fallbackCandidates,
-              allowCloudFallback: reasoningRoutePolicy.allowCloudFallback,
-            },
-            toolPolicy: {
-              allowedTools: ['agent_delegate_background'],
-              requireConfirmation: [],
-              forbiddenTools: [],
-              maxIterations: 1,
-            },
-          },
-        });
-        allToolRecords.push(delegationRecord);
-        let registeredTask: any = null;
-        try {
-          const payload = JSON.parse(delegationRecord.result || '{}');
-          if (!delegationRecord.error && payload?.ok === true && payload?.status === 'registered') {
-            registeredTask = payload.task;
-          }
-        } catch {}
-        if (registeredTask?.id) {
-          responseText = buildDelegationAck(registeredTask.workerNames || [], registeredTask.id);
-          llmWasCalled = false;
-          emitAgent('agent:delegation', {
-            taskId: registeredTask.id,
-            task: registeredTask,
-            reason: legacyDelegationHint.reason,
-            complexity: backgroundComplexity,
-            workers: registeredTask.workerNames || [],
-          });
-          emitAgent('agent:background_task_update', {
-            taskId: registeredTask.id,
-            task: registeredTask,
-            source: 'background_delegation',
-          });
-          pushNotification(uid, {
-            type: 'background_delegation',
-            title: 'Lumi background agents',
-            message: `Task registered for ${Math.max(1, registeredTask.workerNames?.length || 0)} worker agent(s): ${visibleUserText.slice(0, 80)}`,
-          });
-        }
-      }
-
       if (!responseText) {
         // Path C: Normal LLM path (simple queries, or orchestrator fallback)
 

@@ -68,8 +68,7 @@ import { useAmbientPoller } from '@/hooks/useAmbientPoller';
 import { useVoiceCall, type VoiceTranscriptMeta } from '@/hooks/useVoiceCall';
 import { useApp, type OperationMode } from '@/contexts/AppContext';
 import { describeAgentResponseDelivery } from '@/lib/agentResponseDelivery';
-const LocalAgentSphere = lazy(() => import('./LocalAgentSphere').then(m => ({ default: m.LocalAgentSphere })));
-const NexusGlobe = lazy(() => import('./NexusGlobe/NexusGlobe').then(m => ({ default: m.NexusGlobe })));
+const LumiCoreAvatar = lazy(() => import('./LumiCoreAvatar').then(m => ({ default: m.LumiCoreAvatar })));
 const InkWorldLazy = lazy(() => import('./InkWorld').then(m => ({ default: m.InkWorld })));
 import {
   normalizeTaskCompletionFeedback,
@@ -138,6 +137,8 @@ import { isClientSurfaceRendered, waitForClientSurfaceRendered } from '../lib/cl
 
 const IDLE_AWAY_SECONDS = 5 * 60;
 const RETURN_IDLE_SECONDS = 30;
+
+type SurfaceReturnTarget = 'home' | 'command-center';
 
 const AgentChatPage = lazy(() => import('./AgentChatPage').then(m => ({ default: m.AgentChatPage })));
 const AutonomousFeed = lazy(() => import('./AutonomousFeed').then(m => ({ default: m.AutonomousFeed })));
@@ -1586,6 +1587,7 @@ export function DesktopUI({
   const [sanctuaryOpen, setSanctuaryOpen] = useState(false);
   const [sanctuaryLoaded, setSanctuaryLoaded] = useState(false);
   const [sanctuaryAgent, setSanctuaryAgent] = useState<any>(null);
+  const [memoryAvatars, setMemoryAvatars] = useState<any[]>([]);
   const [petReaction, setPetReaction] = useState<{ animation: string; until: number } | null>(null);
   const [activePersonality, setActivePersonality] = useState('lumi');
   const petReactionTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1597,6 +1599,7 @@ export function DesktopUI({
   };
 
   const [memoryLabOpen, setMemoryLabOpen] = useState(false);
+  const surfaceReturnTargetRef = useRef<SurfaceReturnTarget>('home');
   const [equippedAccessories, setEquippedAccessories] = useState<string[]>(() => {
     try {
       const saved = localStorage.getItem(petStorageKeys.accessories)
@@ -1722,7 +1725,12 @@ export function DesktopUI({
   }, [chatOpen]);
 
   const openCommandCenter = useCallback((view: CommandCenterView = 'office') => {
-    setCommandCenterView(view === 'team' ? 'office' : view);
+    surfaceReturnTargetRef.current = 'home';
+    setKnowledgeOpen(false);
+    setMemoryLabOpen(false);
+    setSanctuaryOpen(false);
+    setSanctuaryAgent(null);
+    setCommandCenterView(view);
     setOpenWindows(previous => previous.filter(windowId => !['chat', 'team', 'command-center'].includes(windowId)));
     setMinimizedWindows(previous => previous.filter(windowId => !['chat', 'team', 'command-center'].includes(windowId)));
     setWindowOrder(previous => previous.filter(windowId => !['chat', 'team', 'command-center'].includes(windowId)));
@@ -1744,6 +1752,42 @@ export function DesktopUI({
       })();
     }, 80);
   }, [isTauri, setActiveTab]);
+
+  const inferSurfaceReturnTarget = useCallback((): SurfaceReturnTarget => {
+    if (chatOpen || activeTab === 'command-center') return 'command-center';
+    if (knowledgeOpen || memoryLabOpen || sanctuaryOpen) {
+      return surfaceReturnTargetRef.current;
+    }
+    return 'home';
+  }, [activeTab, chatOpen, knowledgeOpen, memoryLabOpen, sanctuaryOpen]);
+
+  const restoreSurfaceReturnTarget = useCallback(() => {
+    const target = surfaceReturnTargetRef.current;
+    surfaceReturnTargetRef.current = 'home';
+    if (target === 'command-center') {
+      openCommandCenter('office');
+      return;
+    }
+    setActiveTab('home');
+  }, [openCommandCenter, setActiveTab]);
+
+  const openKnowledgeBase = useCallback((returnTarget?: SurfaceReturnTarget) => {
+    surfaceReturnTargetRef.current = returnTarget || inferSurfaceReturnTarget();
+    setChatOpen(false);
+    setChatPrefill('');
+    setChatPrefillSource('proactive');
+    setMemoryLabOpen(false);
+    setSanctuaryOpen(false);
+    setSanctuaryAgent(null);
+    setKnowledgeLoaded(true);
+    setKnowledgeOpen(true);
+    setActiveTab('knowledge');
+  }, [inferSurfaceReturnTarget, setActiveTab]);
+
+  const closeKnowledgeBase = useCallback(() => {
+    setKnowledgeOpen(false);
+    restoreSurfaceReturnTarget();
+  }, [restoreSurfaceReturnTarget]);
 
   const askComputerProfileQuestion = useCallback((prompt: string) => {
     const text = String(prompt || '').trim();
@@ -2970,7 +3014,7 @@ export function DesktopUI({
           queueOrganizationWorkspaceRoute(detail.sub, detail.articleId);
         }
         if (detail.tab === 'chat' || detail.tab === 'command-center' || detail.tab === 'team') {
-          openCommandCenter(detail.tab === 'team' ? 'team' : 'office');
+          openCommandCenter('office');
           return;
         }
         // Anyone can open the org tab — join/create/connect handled by OrgPortal
@@ -2981,25 +3025,73 @@ export function DesktopUI({
     return () => window.removeEventListener('lumi:navigate', handler);
   }, [openCommandCenter, setActiveTab]);
 
-  const openMemoryAvatar = useCallback(async () => {
-    try { sounds.playClick(); } catch {}
+  const loadMemoryAvatars = useCallback(async (): Promise<any[]> => {
     try {
-      const res = await fetch('/api/agents/sanctuaries');
+      const res = await fetch('/api/memory-avatars', { credentials: 'include' });
       if (res.ok) {
         const data = await res.json();
-        if (data.agents && data.agents.length > 0) {
-          setSanctuaryAgent(data.agents[0]);
-          setSanctuaryOpen(true);
-          return;
-        }
+        const avatars = Array.isArray(data?.avatars) ? data.avatars : [];
+        setMemoryAvatars(avatars);
+        return avatars;
       }
     } catch {}
-    setMemoryLabOpen(true);
-  }, []);
+    return memoryAvatars;
+  }, [memoryAvatars]);
 
-  // Listen for Memory Avatar Lab open request from AgentGenerator
+  const openMemoryAvatar = useCallback(async (avatarId?: string, returnTarget?: SurfaceReturnTarget) => {
+    try { sounds.playClick(); } catch {}
+    if (returnTarget) {
+      surfaceReturnTargetRef.current = returnTarget;
+    } else if (chatOpen || activeTab === 'command-center') {
+      surfaceReturnTargetRef.current = 'command-center';
+    } else if (!sanctuaryOpen && !memoryLabOpen) {
+      surfaceReturnTargetRef.current = 'home';
+    }
+    const avatars = await loadMemoryAvatars();
+    const selected = avatarId
+      ? avatars.find(avatar => avatar?.id === avatarId)
+      : avatars[0];
+    if (avatarId && !selected) return;
+    setChatOpen(false);
+    setKnowledgeOpen(false);
+    setChatPrefill('');
+    setChatPrefillSource('proactive');
+    setActiveTab('home');
+    if (selected) {
+      setSanctuaryAgent(selected);
+      setSanctuaryLoaded(true);
+      setSanctuaryOpen(true);
+      setMemoryLabOpen(false);
+      return;
+    }
+    setMemoryLabOpen(true);
+  }, [activeTab, chatOpen, loadMemoryAvatars, memoryLabOpen, sanctuaryOpen, setActiveTab]);
+
+  const openMemoryAvatarLab = useCallback((returnTarget?: SurfaceReturnTarget) => {
+    if (returnTarget) {
+      surfaceReturnTargetRef.current = returnTarget;
+    } else if (!sanctuaryOpen && !memoryLabOpen && !(chatOpen || activeTab === 'command-center')) {
+      surfaceReturnTargetRef.current = 'home';
+    }
+    setChatOpen(false);
+    setKnowledgeOpen(false);
+    setChatPrefill('');
+    setChatPrefillSource('proactive');
+    setActiveTab('home');
+    setSanctuaryOpen(false);
+    setSanctuaryAgent(null);
+    setMemoryLabOpen(true);
+  }, [activeTab, chatOpen, memoryLabOpen, sanctuaryOpen, setActiveTab]);
+
+  const closeMemoryAvatar = useCallback(() => {
+    setMemoryLabOpen(false);
+    setSanctuaryOpen(false);
+    setSanctuaryAgent(null);
+    restoreSurfaceReturnTarget();
+  }, [restoreSurfaceReturnTarget]);
+
   useEffect(() => {
-    const handler = () => openMemoryAvatar();
+    const handler = () => { void openMemoryAvatar(undefined, 'home'); };
     window.addEventListener('lumi:open-memory-lab', handler);
     return () => window.removeEventListener('lumi:open-memory-lab', handler);
   }, [openMemoryAvatar]);
@@ -3737,7 +3829,7 @@ export function DesktopUI({
       return;
     }
     if (tab === 'chat' || tab === 'command-center' || tab === 'team') {
-      openCommandCenter(tab === 'team' ? 'team' : 'office');
+      openCommandCenter('office');
       return;
     }
     if (tab === 'memory-avatar') {
@@ -4013,7 +4105,7 @@ export function DesktopUI({
           return;
         }
         if (windowId === 'command-center') {
-          openCommandCenter(value === 'team' ? 'team' : 'office');
+          openCommandCenter('office');
           return;
         }
         if (windowId === 'notifications') {
@@ -5254,11 +5346,13 @@ export function DesktopUI({
               </div>
             )}
             <Suspense fallback={<div className="h-[210px] w-[210px] rounded-full border border-white/10 bg-white/[0.02] animate-pulse" />}>
-              <LocalAgentSphere
+              <LumiCoreAvatar
                 t={t}
+                lang={lang}
                 sentiment={sphereSentiment}
                 callState={callState}
                 audioLevel={audioLevel}
+                isMuted={isMuted}
                 highPerformance={isTauri}
                 isWallpaperMode={isWallpaperMode}
                 reaction={petReaction?.animation || null}
@@ -5266,9 +5360,7 @@ export function DesktopUI({
                 onEndCall={endVoiceCallFromUI}
                 onInterrupt={interrupt}
                 onToggleMute={toggleMute}
-                onMessage={() => {}}
                 facePresent={faceRecognition.result.facePresent}
-                gesturesDisabled={false}
                 isLightMode={resolvedAppearanceMode === 'light'}
               />
             </Suspense>
@@ -5915,7 +6007,7 @@ export function DesktopUI({
           <KnowledgeBase
             t={t}
             isOpen={knowledgeOpen}
-            onClose={() => setKnowledgeOpen(false)}
+            onClose={closeKnowledgeBase}
             domain={workDomain}
           />
         </Suspense>
@@ -5928,7 +6020,13 @@ export function DesktopUI({
             t={t}
             user={user}
             isOpen={chatOpen}
-            onClose={() => { setChatOpen(false); setActiveTab('home'); setChatPrefill(''); setChatPrefillSource('proactive'); }}
+            onClose={() => {
+              surfaceReturnTargetRef.current = 'home';
+              setChatOpen(false);
+              setActiveTab('home');
+              setChatPrefill('');
+              setChatPrefillSource('proactive');
+            }}
             layout="command-center"
             commandCenterView={commandCenterView}
             onCommandCenterViewChange={setCommandCenterView}
@@ -5937,6 +6035,10 @@ export function DesktopUI({
               setNexusReturnTarget('command-center');
               setViewMode('world');
               setActiveTab('home');
+            }}
+            onOpenMemoryAvatar={() => { void openMemoryAvatar(); }}
+            onOpenKnowledge={() => {
+              openKnowledgeBase('command-center');
             }}
             voiceSession={{
               callState,
@@ -6041,8 +6143,12 @@ export function DesktopUI({
         <Suspense fallback={null}>
           <Sanctuary
             agent={sanctuaryAgent}
+            lang={lang}
             isOpen={sanctuaryOpen}
-            onClose={() => { setSanctuaryOpen(false); setSanctuaryAgent(null); }}
+            onClose={closeMemoryAvatar}
+            avatars={memoryAvatars}
+            onSelectAvatar={(avatarId) => { void openMemoryAvatar(avatarId); }}
+            onCreateAnother={openMemoryAvatarLab}
           />
         </Suspense>
       )}
@@ -6060,7 +6166,7 @@ export function DesktopUI({
           >
             <div className="absolute top-4 left-4 z-10">
               <button
-                onClick={() => setMemoryLabOpen(false)}
+                onClick={() => { closeMemoryAvatar(); }}
                 className="w-10 h-10 flex items-center justify-center bg-black/40 backdrop-blur-xl border border-white/[0.08] rounded-2xl text-white/40 hover:text-white hover:border-white/20 transition-all"
               >
                 <ArrowLeft size={18} />
@@ -6069,9 +6175,15 @@ export function DesktopUI({
             <Suspense fallback={<LazyPanelFallback label={t.loading || 'Loading'} />}>
               <MemoryAvatarLab
                 t={t}
-                onEnterSanctuary={(agent: any) => {
+                lang={lang}
+                onEnterSanctuary={(avatar: any) => {
+                  setMemoryAvatars(previous => [
+                    ...previous.filter(existing => existing?.id !== avatar?.id),
+                    avatar,
+                  ]);
                   setMemoryLabOpen(false);
-                  setSanctuaryAgent(agent);
+                  setSanctuaryAgent(avatar);
+                  setSanctuaryLoaded(true);
                   setSanctuaryOpen(true);
                 }}
               />

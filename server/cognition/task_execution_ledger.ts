@@ -2,12 +2,17 @@ import crypto from 'node:crypto';
 import type { ToolPolicy } from '../personality/types';
 import type { ToolExecutionRecord } from '../tools/types';
 import {
-  buildActionContract,
+  buildActionEvidenceContract,
   hasCoreActionEvidence,
   requiresCurrentAppUiMutation,
 } from './action_contract';
 import type { TaskCapsuleV1 } from '../conversation/task_capsule';
-import { toolRecordTerminalText } from '../tools/receipt_payload';
+import {
+  parseNestedJson,
+  toolRecordHasTerminalPayload,
+  toolRecordTerminalPayload,
+  toolRecordTerminalText,
+} from '../tools/receipt_payload';
 
 export type ConversationTaskStatus =
   | 'created'
@@ -69,10 +74,6 @@ export interface ConversationTaskPolicySnapshot {
 export interface ConversationTaskReceipt {
   id: string;
   key: string;
-  taskId?: string;
-  turnId?: string;
-  requestId?: string;
-  idempotencyKey?: string;
   name: string;
   arguments: Record<string, unknown>;
   result: string;
@@ -259,10 +260,6 @@ export function normalizeConversationTaskReceipt(value: unknown): ConversationTa
   return {
     id: compact(candidate.id, 180) || key,
     key,
-    ...(compact(candidate.taskId, 180) ? { taskId: compact(candidate.taskId, 180) } : {}),
-    ...(compact(candidate.turnId, 180) ? { turnId: compact(candidate.turnId, 180) } : {}),
-    ...(compact(candidate.requestId, 300) ? { requestId: compact(candidate.requestId, 300) } : {}),
-    ...(compact(candidate.idempotencyKey, 500) ? { idempotencyKey: compact(candidate.idempotencyKey, 500) } : {}),
     name,
     arguments: candidate.arguments && typeof candidate.arguments === 'object' && !Array.isArray(candidate.arguments)
       ? stableValue(candidate.arguments) as Record<string, unknown>
@@ -288,32 +285,19 @@ export function normalizeConversationTaskReceipt(value: unknown): ConversationTa
 }
 
 function parseResult(value: unknown): unknown {
-  let parsed = value;
-  for (let depth = 0; depth < 3 && typeof parsed === 'string' && parsed.trim(); depth += 1) {
-    try {
-      parsed = JSON.parse(parsed);
-    } catch {
-      break;
-    }
-  }
-  return parsed;
+  return parseNestedJson(value);
 }
 
 function structuredRecordPayload(record: ToolExecutionRecord): unknown {
-  const receipt = record.receipt !== undefined ? parseResult(record.receipt) : undefined;
-  if (receipt && typeof receipt === 'object') return receipt;
-  const result = parseResult(record.result);
-  return result && typeof result === 'object' ? result : null;
+  const payload = toolRecordTerminalPayload(record);
+  return payload && typeof payload === 'object' ? payload : null;
 }
 
 export function toolRecordSucceeded(record: ToolExecutionRecord): boolean {
   if (!record?.name || compact(record.error, 600)) return false;
   if (record.terminalVerification?.status === 'failed') return false;
-  // Some adapters persist the terminal machine receipt separately and leave
-  // the display-oriented result field empty. The receipt is still authoritative
-  // evidence and must participate in success classification.
-  const result = compact(record.result || toolRecordTerminalText(record), 4000);
-  if (!result) return false;
+  if (!toolRecordHasTerminalPayload(record)) return false;
+  const result = compact(toolRecordTerminalText(record), 4000);
   const structuredPayload = structuredRecordPayload(record);
   if (structuredPayload && !Array.isArray(structuredPayload)) {
     const payload = structuredPayload as Record<string, any>;
@@ -332,13 +316,9 @@ export function toolRecordSucceeded(record: ToolExecutionRecord): boolean {
     // not evidence that document creation failed. Save contracts are checked
     // separately by the action contract and still require `saved: true` plus
     // a concrete path.
-    const ignoredFalseFields = new Set<string>();
-    if (/^(?:wps_create_document|wps_create_document_with_text)$/i.test(record.name)) {
-      ignoredFalseFields.add('saved');
-    }
-    if (!/(?:^|_)(?:open|launch|activate)(?:_|$)/i.test(record.name)) {
-      ignoredFalseFields.add('opened');
-    }
+    const ignoredFalseFields = /^(?:wps_create_document|wps_create_document_with_text)$/i.test(record.name)
+      ? new Set<string>(['saved'])
+      : new Set<string>();
     const explicitlyFailedOutcome = SEMANTIC_FALSE_FIELDS.some(field => (
       !ignoredFalseFields.has(field) && payload[field] === false
     ));
@@ -514,10 +494,6 @@ export function recordsToTaskReceipts(
     return ({
     id: compact(record.id, 180) || `receipt_${Date.now()}_${index}`,
     key: toolRecordKey(record),
-    ...(compact(record.taskId, 180) ? { taskId: compact(record.taskId, 180) } : {}),
-    ...(compact(record.turnId, 180) ? { turnId: compact(record.turnId, 180) } : {}),
-    ...(compact(record.requestId, 300) ? { requestId: compact(record.requestId, 300) } : {}),
-    ...(compact(record.idempotencyKey, 500) ? { idempotencyKey: compact(record.idempotencyKey, 500) } : {}),
     name: compact(record.name, 160),
     arguments: stableValue(record.arguments || {}) as Record<string, unknown>,
     result: compact(record.result, 3000),
@@ -572,10 +548,6 @@ export function taskReceiptsToRecords(receipts: ConversationTaskReceipt[] = []):
     if (!receipt) return null;
     return {
     id: receipt.id,
-    ...(receipt.taskId ? { taskId: receipt.taskId } : {}),
-    ...(receipt.turnId ? { turnId: receipt.turnId } : {}),
-    ...(receipt.requestId ? { requestId: receipt.requestId } : {}),
-    ...(receipt.idempotencyKey ? { idempotencyKey: receipt.idempotencyKey } : {}),
     name: receipt.name,
     arguments: receipt.arguments || {},
     result: receipt.result || '',
@@ -597,34 +569,16 @@ export function taskCompletionFromReceipts(
   taskCapsule?: TaskCapsuleV1 | null,
 ): { complete: boolean; blocker: string; records: ToolExecutionRecord[] } {
   const records = coalesceToolExecutionRecords(taskReceiptsToRecords(receipts));
-  const contract = buildActionContract(goal);
+  const contract = buildActionEvidenceContract(goal);
   // Legacy desktop builds emitted this terminal adapter name before the
   // verified `wps_create_document_with_text` receipt was introduced. Keep
   // already-persisted tasks resumable without weakening generic UI evidence.
   const legacyVerifiedWpsCreate = requiresCurrentAppUiMutation(goal) && records.some(record => (
     record.name === 'wps_create_document' && toolRecordSucceeded(record)
   ));
-  // This server-side verifier only returns `verified` after it has archived
-  // same-loop domain receipts and persisted a passing work-takeover
-  // verification. Once the receipt is bound to this conversation task, it is
-  // the canonical terminal evidence for the whole industry workflow.
-  const verifiedIndustryWorkflowCompletion = records.some(record => {
-    if (record.name !== 'industry_workflow_complete' || !toolRecordVerifiedForCompletion(record)) return false;
-    const structuredPayload = structuredRecordPayload(record);
-    if (!structuredPayload || Array.isArray(structuredPayload)) return false;
-    const payload = structuredPayload as Record<string, any>;
-    const verification = payload.verification && typeof payload.verification === 'object'
-      ? payload.verification as Record<string, any>
-      : {};
-    return payload.ok === true
-      && payload.persisted === true
-      && compact(payload.status, 80).toLowerCase() === 'verified'
-      && verification.passed === true
-      && /^wt_task_[a-z0-9_-]+$/i.test(compact(payload.task?.id, 180));
-  });
-  const complete = verifiedIndustryWorkflowCompletion || (contract.applies
+  const complete = contract.applies
     ? hasCoreActionEvidence(contract, records, goal, taskCapsule) || legacyVerifiedWpsCreate
-    : records.some(toolRecordVerifiedForCompletion));
+    : records.some(toolRecordVerifiedForCompletion);
   const failures = [...records].reverse().filter(record => !toolRecordSucceeded(record));
   // A later policy/routing rejection is useful diagnostic evidence, but it
   // must not replace the domain failure that actually stopped the task. Keep

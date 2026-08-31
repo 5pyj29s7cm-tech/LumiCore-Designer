@@ -65,18 +65,91 @@ import {
   LUMI_OFFICIAL_BASE_URL,
   LUMI_OFFICIAL_DEFAULT_MODELS,
   LUMI_OFFICIAL_DOCS_URL,
+  LUMI_OFFICIAL_RECHARGE_URL,
   LUMI_OFFICIAL_PROVIDER_ID as SHARED_LUMI_OFFICIAL_PROVIDER_ID,
+  type LumiModelRoleId,
 } from '../../shared/model_provider_capabilities';
 
 const VoiceForge = lazy(() => import('./VoiceForge').then(m => ({ default: m.VoiceForge })));
 
-// `relay` is the persisted provider id for Lumi's official gateway.  The
-// endpoint is public configuration; the credential remains server-side.
+// `relay` is the persisted provider id used by the runtime. The settings UI
+// presents the documented Lumi endpoint as the official provider while the
+// secret itself remains in the server credential store.
 const LUMI_OFFICIAL_PROVIDER_ID = SHARED_LUMI_OFFICIAL_PROVIDER_ID;
 const LUMI_OFFICIAL_API_LABEL_KEY = 'settings.lumi-official-api-label.a1b2c3d4e5' as const;
 const LUMI_OFFICIAL_SUPPORTED_KEY = 'settings.lumi-official-capability-supported.b2c3d4e5f6' as const;
 const LUMI_OFFICIAL_UNAVAILABLE_KEY = 'settings.lumi-official-capability-unavailable.c3d4e5f6a7' as const;
+const LUMI_OFFICIAL_APPLY_LABEL_KEY = 'settings.lumi-official-apply-label.f1a2b3c4d5' as const;
+const LUMI_OFFICIAL_APPLY_DESCRIPTION_KEY = 'settings.lumi-official-apply-description.a2b3c4d5e6' as const;
+const LUMI_OFFICIAL_APPLY_NOT_CONFIGURED_KEY = 'settings.lumi-official-apply-not-configured.b3c4d5e6f7' as const;
+const LUMI_OFFICIAL_APPLY_SUCCESS_KEY = 'settings.lumi-official-apply-success.c4d5e6f7a8' as const;
+const LUMI_OFFICIAL_APPLY_PARTIAL_KEY = 'settings.lumi-official-apply-partial.d5e6f7a8b9' as const;
+const LUMI_OFFICIAL_APPLY_FAILED_KEY = 'settings.lumi-official-apply-failed.e6f7a8b9c0' as const;
+const LUMI_OFFICIAL_ADAPTER_UNAVAILABLE_KEY = 'settings.lumi-official-adapter-unavailable.a8b9c0d1e2' as const;
+const LUMI_OFFICIAL_CONFIG_NOT_READY_KEY = 'settings.lumi-official-config-not-ready.b9c0d1e2f3' as const;
 const LUMI_RELAY_BASE_URL_PLACEHOLDER = LUMI_OFFICIAL_BASE_URL;
+const LUMI_OFFICIAL_CATALOG_REFRESH_EVENT = 'lumi:official-model-catalog-refresh';
+
+type LumiOfficialCatalog = {
+  models: Array<{ id: string; capability: string; endpoint?: string; ownedBy?: string }>;
+  byRole: Partial<Record<LumiModelRoleId, string[]>>;
+};
+
+let lumiOfficialCatalogCache: LumiOfficialCatalog | null = null;
+let lumiOfficialCatalogPromise: Promise<LumiOfficialCatalog> | null = null;
+
+async function loadLumiOfficialCatalog(force = false): Promise<LumiOfficialCatalog> {
+  if (force) lumiOfficialCatalogCache = null;
+  if (lumiOfficialCatalogCache) return lumiOfficialCatalogCache;
+  if (!lumiOfficialCatalogPromise) {
+    lumiOfficialCatalogPromise = apiFetch('/api/preferences/official/models', { credentials: 'include' })
+      .then(async response => {
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || body.ok !== true) throw new Error(body.error || `HTTP ${response.status}`);
+        const catalog: LumiOfficialCatalog = {
+          models: Array.isArray(body.models) ? body.models : [],
+          byRole: body.byRole && typeof body.byRole === 'object' ? body.byRole : {},
+        };
+        lumiOfficialCatalogCache = catalog;
+        return catalog;
+      })
+      .finally(() => { lumiOfficialCatalogPromise = null; });
+  }
+  return lumiOfficialCatalogPromise;
+}
+
+function useLumiOfficialCatalog(): LumiOfficialCatalog | null {
+  const [catalog, setCatalog] = useState<LumiOfficialCatalog | null>(lumiOfficialCatalogCache);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = (force = false) => {
+      void loadLumiOfficialCatalog(force)
+        .then(next => { if (!cancelled) setCatalog(next); })
+        .catch(() => { if (!cancelled) setCatalog(null); });
+    };
+    const onRefresh = () => refresh(true);
+    refresh(false);
+    window.addEventListener(LUMI_OFFICIAL_CATALOG_REFRESH_EVENT, onRefresh);
+    return () => {
+      cancelled = true;
+      window.removeEventListener(LUMI_OFFICIAL_CATALOG_REFRESH_EVENT, onRefresh);
+    };
+  }, []);
+  return catalog;
+}
+
+function officialModelOptions(
+  catalog: LumiOfficialCatalog | null,
+  role: LumiModelRoleId,
+  fallback: string[],
+): string[] {
+  const live = catalog?.byRole?.[role];
+  return Array.isArray(live) && live.length > 0 ? live : fallback;
+}
+
+function refreshLumiOfficialCatalog(): void {
+  window.dispatchEvent(new Event(LUMI_OFFICIAL_CATALOG_REFRESH_EVENT));
+}
 
 function readStoredRelayBaseUrl(): string {
   try {
@@ -86,23 +159,57 @@ function readStoredRelayBaseUrl(): string {
   }
 }
 
+/**
+ * Relay credentials used to be mirrored in localStorage by both relay rows.
+ * Keep a one-time cleanup here for installations upgraded from that build;
+ * the server-side credential store remains the source of truth.
+ */
 function clearLegacyRelaySecret(): void {
-  try { localStorage.removeItem('lumi_relay_key'); } catch { /* storage may be unavailable */ }
+  try {
+    localStorage.removeItem('lumi_relay_key');
+  } catch {
+    // Browser storage may be unavailable in non-DOM/test runtimes.
+  }
 }
 
 function lumiOfficialApiLabel(t?: any): string {
   return uiMessage(LUMI_OFFICIAL_API_LABEL_KEY, t?.langCode === 'en' ? 'en' : 'zh');
 }
 
+function lumiOfficialCapabilityNote(t: any, capabilityKey: UiMessageKey): string {
+  const locale = t?.langCode === 'en' ? 'en' : 'zh';
+  return formatUiMessage(LUMI_OFFICIAL_UNAVAILABLE_KEY, {
+    value0: uiMessage(capabilityKey, locale),
+  }, locale);
+}
+
+/**
+ * The official-API endpoint returns stable machine reasons for skipped roles.
+ * Keep those protocol values out of the visible settings panel while retaining
+ * an explicit fallback for a server-provided diagnostic that is safe to show.
+ */
+function lumiOfficialRoleReason(reason: string | undefined, locale: 'en' | 'zh'): string {
+  if (!reason) return '';
+  if (reason === 'adapter_not_available') {
+    return uiMessage(LUMI_OFFICIAL_ADAPTER_UNAVAILABLE_KEY, locale);
+  }
+  if (reason === 'official_api_not_configured') {
+    return uiMessage(LUMI_OFFICIAL_CONFIG_NOT_READY_KEY, locale);
+  }
+  return reason;
+}
+
 function LumiOfficialCapabilityBadge({ t, supported, capabilityKey }: { t: any; supported: boolean; capabilityKey: UiMessageKey }) {
   const locale = t?.langCode === 'en' ? 'en' : 'zh';
   return (
     <div className={`mt-3 rounded-xl border px-3 py-2 text-xs leading-relaxed ${
-      supported ? 'border-cyan-300/15 bg-cyan-300/[0.06] text-cyan-100/65' : 'border-amber-300/15 bg-amber-300/[0.06] text-amber-100/65'
+      supported
+        ? 'border-cyan-300/15 bg-cyan-300/[0.06] text-cyan-100/65'
+        : 'border-amber-300/15 bg-amber-300/[0.06] text-amber-100/65'
     }`}>
       {supported
         ? formatUiMessage(LUMI_OFFICIAL_SUPPORTED_KEY, { value0: lumiOfficialApiLabel(t) }, locale)
-        : formatUiMessage(LUMI_OFFICIAL_UNAVAILABLE_KEY, { value0: uiMessage(capabilityKey, locale) }, locale)}
+        : lumiOfficialCapabilityNote(t, capabilityKey)}
     </div>
   );
 }
@@ -810,6 +917,80 @@ async function runVisionConnectionTest(provider: string, model: string): Promise
   return { latencyMs: Number(data.latencyMs) || 0, model: data.model || model };
 }
 
+type OfficialRoleReceipt = {
+  role: string;
+  status: 'applied' | 'skipped' | 'failed';
+  provider?: string;
+  model?: string;
+  reason?: string;
+};
+
+type OfficialRoleApplyResponse = {
+  ok: boolean;
+  code?: string;
+  error?: string;
+  applied: OfficialRoleReceipt[];
+  skipped: OfficialRoleReceipt[];
+  failed: Array<{ role: string; reason: string }>;
+  roles: Record<string, OfficialRoleReceipt>;
+};
+
+async function applyOfficialModelRoles(): Promise<OfficialRoleApplyResponse> {
+  const response = await apiFetch('/api/preferences/official/apply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({}),
+  });
+  const data = await response.json().catch(() => ({}));
+  const responseCode = typeof data.code === 'string' ? data.code : undefined;
+  if (!response.ok && responseCode !== 'OFFICIAL_API_NOT_CONFIGURED') {
+    throw new Error(data.error || `Official API adaptation failed (${response.status})`);
+  }
+  const normalizeReceipts = (value: unknown, fallbackStatus: OfficialRoleReceipt['status']): OfficialRoleReceipt[] => {
+    if (!Array.isArray(value)) return [];
+    return value.map((item: any) => {
+      if (typeof item === 'string') return { role: item, status: fallbackStatus };
+      return {
+        role: String(item?.role || ''),
+        status: item?.status === 'failed' || item?.status === 'skipped' || item?.status === 'applied'
+          ? item.status
+          : fallbackStatus,
+        ...(item?.provider ? { provider: String(item.provider) } : {}),
+        ...(item?.model ? { model: String(item.model) } : {}),
+        ...(item?.reason ? { reason: String(item.reason) } : {}),
+      };
+    }).filter(item => item.role);
+  };
+  const applied = normalizeReceipts(data.applied, 'applied');
+  const skipped = normalizeReceipts(data.skipped, 'skipped');
+  const roles: Record<string, OfficialRoleReceipt> = {};
+  if (data.roles && typeof data.roles === 'object' && !Array.isArray(data.roles)) {
+    for (const [role, item] of Object.entries(data.roles as Record<string, any>)) {
+      if (!item || typeof item !== 'object') continue;
+      roles[role] = {
+        role,
+        status: item.status === 'failed' || item.status === 'skipped' || item.status === 'applied' ? item.status : 'skipped',
+        ...(item.provider ? { provider: String(item.provider) } : {}),
+        ...(item.model ? { model: String(item.model) } : {}),
+        ...(item.reason ? { reason: String(item.reason) } : {}),
+      };
+    }
+  }
+  [...applied, ...skipped].forEach(item => { if (!roles[item.role]) roles[item.role] = item; });
+  return {
+    ok: data.ok === true,
+    code: responseCode,
+    error: typeof data.error === 'string' ? data.error : undefined,
+    applied,
+    skipped,
+    failed: Array.isArray(data.failed)
+      ? data.failed.map((item: any) => ({ role: String(item?.role || ''), reason: String(item?.reason || '') }))
+      : [],
+    roles,
+  };
+}
+
 function LLMProviderRow({ icon, label, providerId, models, placeholder, disabled = false, serverKey, t }: {
   icon: React.ReactNode; label: string; providerId: string; models: string[];
   placeholder: string; disabled?: boolean; serverKey: string; t?: any;
@@ -817,8 +998,9 @@ function LLMProviderRow({ icon, label, providerId, models, placeholder, disabled
   const { aiConfig, updateAIConfig } = useApp();
   const isZh = t?.langCode !== 'en';
   const ui = (zh: string, en: string) => (isZh ? zh : en);
-  // Provider secrets are write-only server credentials. Never hydrate or
-  // persist them in browser storage (including old upgraded installations).
+  // Provider secrets are write-only server credentials.  Do not hydrate them
+  // from (or write them to) browser storage; an upgraded installation is
+  // cleaned up as soon as this row mounts.
   const [keyValue, setKeyValue] = useState('');
   const [saved, setSaved] = useState(false);
   const [serverConfigured, setServerConfigured] = useState(false);
@@ -843,7 +1025,7 @@ function LLMProviderRow({ icon, label, providerId, models, placeholder, disabled
 
   const handleRemoveKey = () => {
     saveServerKeys({ [serverKey]: '' }).then(() => {
-      try { localStorage.removeItem(`lumi_${providerId}_key`); } catch {}
+      localStorage.removeItem(`lumi_${providerId}_key`);
       setServerConfigured(false);
       setKeyValue('');
       setKeyDirty(false);
@@ -985,7 +1167,7 @@ function VisionProviderRow({ icon, label, providerId, models, placeholder, disab
   const { visionConfig, updateVisionConfig } = useApp();
   const isZh = t?.langCode !== 'en';
   const ui = (zh: string, en: string) => (isZh ? zh : en);
-  // Vision provider secrets stay in the server credential store only.
+  // Vision provider secrets are kept exclusively by the backend.
   const [keyValue, setKeyValue] = useState('');
   const [saved, setSaved] = useState(false);
   const [serverConfigured, setServerConfigured] = useState(false);
@@ -1010,8 +1192,8 @@ function VisionProviderRow({ icon, label, providerId, models, placeholder, disab
     saveServerKeys({ [serverKey]: keyValue.trim() }).then(() => {
       try { localStorage.removeItem(`lumi_vision_${providerId}_key`); } catch {}
       setServerConfigured(true);
-      setKeyValue('');
       setKeyDirty(false);
+      setKeyValue('');
       setTestState('idle');
       setTestMessage('');
       if (visionConfig.provider === providerId) {
@@ -1338,10 +1520,22 @@ function VisionLocalProviderRow({ icon, label, providerId, endpoint, storageKey,
 
 function VisionRelayProviderRow({ t }: { t?: any }) {
   const { visionConfig, updateVisionConfig } = useApp();
+  const officialCatalog = useLumiOfficialCatalog();
+  const relayVisionModels = officialModelOptions(officialCatalog, 'vision', [
+    LUMI_OFFICIAL_DEFAULT_MODELS.vision,
+    'aliyun/qwen3-vl-flash',
+    'aliyun/qwen3-vl-plus',
+  ]);
   const isZh = t?.langCode !== 'en';
   const ui = (zh: string, en: string) => (isZh ? zh : en);
+  // Never hydrate a secret from browser storage. The backend only exposes a
+  // boolean configured status; the user can enter a replacement key when
+  // needed and the field is cleared after a successful save.
   const [apiKey, setApiKey] = useState('');
   const [baseUrl, setBaseUrl] = useState(() => {
+    // The endpoint is documented and owned by Lumi; only the key is kept
+    // blank until the user enters it. A previously chosen endpoint remains
+    // editable for managed deployments.
     return readStoredRelayBaseUrl() || LUMI_OFFICIAL_BASE_URL;
   });
   const savedModels = (() => {
@@ -1375,6 +1569,9 @@ function VisionRelayProviderRow({ t }: { t?: any }) {
 
   const handleSave = () => {
     const enteredKey = apiKey.trim();
+    // Once a key is stored, changing only the endpoint must not require
+    // asking the user to paste the secret again.  The backend never returns
+    // the existing key; an empty field therefore means "keep it" here.
     if ((!enteredKey && !serverConfigured) || !baseUrl.trim()) return;
     saveServerKeys({
       RELAY_BASE_URL: baseUrl.trim(),
@@ -1388,6 +1585,7 @@ function VisionRelayProviderRow({ t }: { t?: any }) {
       setTestState('idle');
       setTestMessage('');
       setSaved(true);
+      refreshLumiOfficialCatalog();
       setTimeout(() => setSaved(false), 2000);
       toast.success(t?.apiKeySaved || uiMessage('settings.api-key-saved.a1dc4d42fb'));
     }).catch(err => toast.error(err.message || t?.failedToSaveKey || uiMessage('settings.failed-to-save.465b88f9c0')));
@@ -1395,7 +1593,7 @@ function VisionRelayProviderRow({ t }: { t?: any }) {
 
   const handleRemove = () => {
     saveServerKeys({ RELAY_API_KEY: '', RELAY_BASE_URL: '' }).then(() => {
-      clearLegacyRelaySecret();
+      localStorage.removeItem('lumi_relay_key');
       localStorage.removeItem('lumi_relay_url');
       setApiKey('');
       setBaseUrl('');
@@ -1403,6 +1601,7 @@ function VisionRelayProviderRow({ t }: { t?: any }) {
       setConnectionDirty(false);
       setTestState('idle');
       setTestMessage('');
+      refreshLumiOfficialCatalog();
       toast.success(t?.apiKeyRemoved || uiMessage('settings.api-key-removed.bae3220b94'));
     }).catch(err => toast.error(err.message || uiMessage('settings.failed-to-remove.5c5d9c7827')));
   };
@@ -1428,7 +1627,7 @@ function VisionRelayProviderRow({ t }: { t?: any }) {
   return (
     <SettingsDisclosure
       icon={<Globe size={18} className="text-cyan-400" />}
-      label={`${lumiOfficialApiLabel(t)} · Vision`}
+      label={lumiOfficialApiLabel(t) + ' · Vision'}
       defaultOpen={visionConfig.provider === 'relay'}
       badges={<>
         {serverConfigured && <span className="rounded-full border border-green-500/20 bg-green-500/10 px-2 py-0.5 text-[11px] font-semibold text-green-400">{uiMessage('settings.configured.d7f5ed6e15')}</span>}
@@ -1465,7 +1664,7 @@ function VisionRelayProviderRow({ t }: { t?: any }) {
           className="h-10 min-w-0 rounded-lg border border-white/10 bg-black/30 px-3 font-mono text-xs text-white outline-none focus:border-cyan-400/50"
         />
         <datalist id="vision-relay-models">
-          {[LUMI_OFFICIAL_DEFAULT_MODELS.vision, 'huawei_maas/deepseek-r1-250528', 'huawei_maas/qwen3-32b'].map(m => <option key={m} value={m} />)}
+          {relayVisionModels.map(m => <option key={m} value={m} />)}
         </datalist>
       </div>
       <div className="flex flex-wrap gap-2">
@@ -1769,6 +1968,9 @@ function GenerativeModelsPage({ t }: { t: any }) {
   const [preferences, setPreferences] = useState<GenerationPreferences>(DEFAULT_GENERATION_PREFERENCES);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const officialCatalog = useLumiOfficialCatalog();
+  const relayImageModels = officialModelOptions(officialCatalog, 'image_generation', GENERATION_MODEL_OPTIONS.relayImage);
+  const relayVideoModels = officialModelOptions(officialCatalog, 'video_generation', GENERATION_MODEL_OPTIONS.relayVideo);
 
   useEffect(() => {
     let cancelled = false;
@@ -1794,7 +1996,9 @@ function GenerativeModelsPage({ t }: { t: any }) {
         provider,
         model: provider === 'auto'
           ? ''
-          : previous.image.models[provider] || IMAGE_GENERATION_PROVIDERS[provider]?.models[0] || '',
+          : previous.image.models[provider]
+            || (provider === LUMI_OFFICIAL_PROVIDER_ID ? relayImageModels[0] : IMAGE_GENERATION_PROVIDERS[provider]?.models[0])
+            || '',
       },
     }));
   };
@@ -1805,7 +2009,9 @@ function GenerativeModelsPage({ t }: { t: any }) {
       video: {
         ...previous.video,
         provider,
-        model: previous.video.models[provider] || VIDEO_GENERATION_PROVIDERS[provider]?.models[0] || '',
+        model: previous.video.models[provider]
+          || (provider === LUMI_OFFICIAL_PROVIDER_ID ? relayVideoModels[0] : VIDEO_GENERATION_PROVIDERS[provider]?.models[0])
+          || '',
       },
     }));
   };
@@ -1843,8 +2049,12 @@ function GenerativeModelsPage({ t }: { t: any }) {
 
   if (loading) return <div className="flex h-40 items-center justify-center"><Loader2 className="animate-spin text-white/45" /></div>;
 
-  const imageProvider = IMAGE_GENERATION_PROVIDERS[preferences.image.provider];
-  const videoProvider = VIDEO_GENERATION_PROVIDERS[preferences.video.provider];
+  const imageProvider = preferences.image.provider === LUMI_OFFICIAL_PROVIDER_ID
+    ? { ...IMAGE_GENERATION_PROVIDERS.relay, models: relayImageModels }
+    : IMAGE_GENERATION_PROVIDERS[preferences.image.provider];
+  const videoProvider = preferences.video.provider === LUMI_OFFICIAL_PROVIDER_ID
+    ? { ...VIDEO_GENERATION_PROVIDERS.relay, models: relayVideoModels }
+    : VIDEO_GENERATION_PROVIDERS[preferences.video.provider];
 
   return (
     <div className="space-y-8">
@@ -1865,7 +2075,9 @@ function GenerativeModelsPage({ t }: { t: any }) {
                 <option value="openai">OpenAI</option>
                 <option value="qwen">Qwen / DashScope</option>
                 <option value="siliconflow">SiliconFlow</option>
-                <option value={LUMI_OFFICIAL_PROVIDER_ID}>{lumiOfficialApiLabel(t)}</option>
+                <option value={LUMI_OFFICIAL_PROVIDER_ID}>
+                  {lumiOfficialApiLabel(t)}
+                </option>
               </select>
             </div>
             {imageProvider && (
@@ -1972,7 +2184,7 @@ const WORLD_MODEL_OPTIONS: Record<string, string[]> = {
   qwen: ['qwen-vl-max'],
   ollama: ['qwen2.5vl:7b', 'minicpm-v:8b', 'llama3.2-vision:11b'],
   lmstudio: ['qwen2.5-vl-7b-instruct', 'minicpm-v-4_5', 'internvl3_5-8b'],
-  relay: [LUMI_OFFICIAL_DEFAULT_MODELS.vision, 'huawei_maas/deepseek-r1-250528', 'huawei_maas/qwen3-32b'],
+  relay: [LUMI_OFFICIAL_DEFAULT_MODELS.world, 'aliyun/qwen3-vl-flash', 'aliyun/qwen3-vl-plus'],
 };
 
 function WorldActionModelPage({ t }: { t: any }) {
@@ -1981,6 +2193,7 @@ function WorldActionModelPage({ t }: { t: any }) {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testMessage, setTestMessage] = useState('');
+  const officialCatalog = useLumiOfficialCatalog();
 
   useEffect(() => {
     let cancelled = false;
@@ -2053,7 +2266,11 @@ function WorldActionModelPage({ t }: { t: any }) {
   if (loading) return <div className="flex h-40 items-center justify-center"><Loader2 className="animate-spin text-white/45" /></div>;
 
   const inherited = preference.provider === 'inherit_vision';
-  const modelOptions = inherited ? [] : WORLD_MODEL_OPTIONS[preference.provider] || [];
+  const modelOptions = inherited
+    ? []
+    : preference.provider === LUMI_OFFICIAL_PROVIDER_ID
+      ? officialModelOptions(officialCatalog, 'world', WORLD_MODEL_OPTIONS.relay)
+      : WORLD_MODEL_OPTIONS[preference.provider] || [];
   const activeProvider = inherited ? preference.resolved?.provider : preference.provider;
   const activeModel = inherited ? preference.resolved?.model : preference.model;
 
@@ -2198,6 +2415,13 @@ function RetrievalModelSettings({ t }: { t?: any }) {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testMessage, setTestMessage] = useState('');
+  const officialCatalog = useLumiOfficialCatalog();
+  const embeddingOptions = (provider: string) => provider === LUMI_OFFICIAL_PROVIDER_ID
+    ? officialModelOptions(officialCatalog, 'embedding', EMBEDDING_MODELS.relay)
+    : EMBEDDING_MODELS[provider] || [];
+  const rerankOptions = (provider: string) => provider === LUMI_OFFICIAL_PROVIDER_ID
+    ? officialModelOptions(officialCatalog, 'rerank', RERANK_MODELS.relay)
+    : RERANK_MODELS[provider] || [];
 
   useEffect(() => {
     let cancelled = false;
@@ -2312,7 +2536,7 @@ function RetrievalModelSettings({ t }: { t?: any }) {
             id={`embedding-${preferences.embedding.provider}-model`}
             label={uiMessage('settings.model.44c0cd4289')}
             value={preferences.embedding.model}
-            options={EMBEDDING_MODELS[preferences.embedding.provider] || []}
+            options={embeddingOptions(preferences.embedding.provider)}
             onChange={model => setEmbedding({ model })}
           />
           <label className="grid gap-2 md:grid-cols-[170px_minmax(0,1fr)] md:items-center">
@@ -2327,7 +2551,7 @@ function RetrievalModelSettings({ t }: { t?: any }) {
               id={`embedding-${preferences.embedding.fallbackProvider}-fallback-model`}
               label={uiMessage('settings.fallback-model-id.31f402c7ca')}
               value={preferences.embedding.fallbackModel}
-              options={EMBEDDING_MODELS[preferences.embedding.fallbackProvider] || []}
+              options={embeddingOptions(preferences.embedding.fallbackProvider)}
               onChange={fallbackModel => setEmbedding({ fallbackModel })}
             />
           )}
@@ -2362,7 +2586,7 @@ function RetrievalModelSettings({ t }: { t?: any }) {
                 id={`rerank-${preferences.rerank.provider}-model`}
                 label={uiMessage('settings.model.44c0cd4289')}
                 value={preferences.rerank.model}
-                options={RERANK_MODELS[preferences.rerank.provider] || []}
+                options={rerankOptions(preferences.rerank.provider)}
                 onChange={model => setRerank({ model })}
               />
               <label className="grid gap-2 md:grid-cols-[170px_minmax(0,1fr)] md:items-center">
@@ -2659,13 +2883,16 @@ type ProviderScope = 'official' | 'local' | 'services';
 
 function AIProvidersPage({ t, providerStatus }: { t: any; providerStatus: Record<string, ProviderRuntimeStatus> }) {
   const [scope, setScope] = useState<ProviderScope>('official');
-  const extensionProviders = Object.entries(providerStatus).filter(([, status]) => (
-    status.extension === true && (scope === 'local' ? status.local === true : scope === 'services' ? status.local !== true : false)
-  ));
+  const extensionProviders = Object.entries(providerStatus).filter(([, status]) => {
+    if (status.extension !== true) return false;
+    if (scope === 'local') return status.local === true;
+    if (scope === 'services') return status.local !== true;
+    return false;
+  });
   const tabs: Array<{ id: ProviderScope; label: string }> = [
-    { id: 'official', label: lumiOfficialApiLabel(t) },
-    { id: 'local', label: uiMessage('settings.local-compatible.4fda3a8732') },
-    { id: 'services', label: uiMessage('settings.cloud-providers.134b71a80d') },
+    { id: 'official', label: uiMessage('settings.provider-scope-official-lumi.0f4d8e2a11') },
+    { id: 'local', label: uiMessage('settings.provider-scope-local.3b7c1a9e20') },
+    { id: 'services', label: uiMessage('settings.provider-scope-services.6e2f9c4b18') },
   ];
   return (
     <div className="space-y-6">
@@ -2677,6 +2904,8 @@ function AIProvidersPage({ t, providerStatus }: { t: any; providerStatus: Record
               key={item.id}
               type="button"
               onClick={() => setScope(item.id)}
+              role="tab"
+              aria-selected={scope === item.id}
               className={`rounded-lg px-3 py-2 text-sm font-medium transition-colors ${scope === item.id ? 'bg-celestial-saturn text-black shadow-sm' : 'text-white/45 hover:bg-white/[0.06] hover:text-white/70'}`}
             >
               {item.label}
@@ -2688,7 +2917,7 @@ function AIProvidersPage({ t, providerStatus }: { t: any; providerStatus: Record
         ? <OfficialProviderSettings t={t} />
         : scope === 'local'
           ? <LocalProviderSettings t={t} />
-          : <CloudProviderSettings t={t} providerStatus={providerStatus} />}
+          : <ServiceProviderSettings t={t} providerStatus={providerStatus} />}
       {extensionProviders.length > 0 && (
         <SettingsSection title="Signed extension Providers" icon={<Shield size={18} className="text-emerald-300" />}>
           <div className="divide-y divide-white/10 border-y border-white/10">
@@ -2719,119 +2948,6 @@ function AIProvidersPage({ t, providerStatus }: { t: any; providerStatus: Record
   );
 }
 
-type OfficialRoleReceipt = {
-  role: string;
-  status: 'applied' | 'skipped' | 'failed';
-  provider?: string;
-  model?: string;
-  reason?: string;
-};
-
-type OfficialRoleApplyResponse = {
-  ok: boolean;
-  code?: string;
-  error?: string;
-  applied: OfficialRoleReceipt[];
-  skipped: OfficialRoleReceipt[];
-  failed: Array<{ role: string; reason: string }>;
-  roles: Record<string, OfficialRoleReceipt>;
-};
-
-async function applyOfficialModelRoles(): Promise<OfficialRoleApplyResponse> {
-  const response = await apiFetch('/api/preferences/official/apply', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify({}),
-  });
-  const data = await response.json().catch(() => ({}));
-  const normalize = (value: unknown, fallback: OfficialRoleReceipt['status']): OfficialRoleReceipt[] => (
-    Array.isArray(value)
-      ? value.map((item: any) => ({
-        role: String(item?.role || item || ''),
-        status: item?.status === 'failed' || item?.status === 'skipped' || item?.status === 'applied' ? item.status : fallback,
-        ...(item?.provider ? { provider: String(item.provider) } : {}),
-        ...(item?.model ? { model: String(item.model) } : {}),
-        ...(item?.reason ? { reason: String(item.reason) } : {}),
-      })).filter(item => item.role)
-      : []
-  );
-  const applied = normalize(data.applied, 'applied');
-  const skipped = normalize(data.skipped, 'skipped');
-  const roles: Record<string, OfficialRoleReceipt> = {};
-  [...applied, ...skipped].forEach(item => { roles[item.role] = item; });
-  if (data.roles && typeof data.roles === 'object' && !Array.isArray(data.roles)) {
-    for (const [role, item] of Object.entries(data.roles as Record<string, any>)) {
-      if (!item || typeof item !== 'object') continue;
-      roles[role] = {
-        role,
-        status: item.status === 'failed' || item.status === 'skipped' || item.status === 'applied' ? item.status : 'skipped',
-        ...(item.provider ? { provider: String(item.provider) } : {}),
-        ...(item.model ? { model: String(item.model) } : {}),
-        ...(item.reason ? { reason: String(item.reason) } : {}),
-      };
-    }
-  }
-  if (!response.ok && data.code !== 'OFFICIAL_API_NOT_CONFIGURED') {
-    throw new Error(data.error || `Official API adaptation failed (${response.status})`);
-  }
-  return {
-    ok: data.ok === true,
-    code: typeof data.code === 'string' ? data.code : undefined,
-    error: typeof data.error === 'string' ? data.error : undefined,
-    applied,
-    skipped,
-    failed: Array.isArray(data.failed) ? data.failed.map((item: any) => ({ role: String(item?.role || ''), reason: String(item?.reason || '') })) : [],
-    roles,
-  };
-}
-
-function OfficialProviderSettings({ t }: { t: any }) {
-  const [applying, setApplying] = useState(false);
-  const [result, setResult] = useState<OfficialRoleApplyResponse | null>(null);
-  const apply = async () => {
-    if (applying) return;
-    setApplying(true);
-    setResult(null);
-    try {
-      const next = await applyOfficialModelRoles();
-      setResult(next);
-      if (next.applied.length > 0) window.dispatchEvent(new CustomEvent('lumi:model-configuration-changed'));
-      if (next.code === 'OFFICIAL_API_NOT_CONFIGURED') toast.error(uiMessage('settings.lumi-official-capability-unavailable.c3d4e5f6a7'));
-      else if (next.failed.length > 0) toast.error(`Applied ${next.applied.length}; ${next.failed.length} failed`);
-      else if (next.applied.length > 0) toast.success(`Applied ${next.applied.length} Lumi model roles`);
-    } catch (error: any) {
-      setResult({ ok: false, applied: [], skipped: [], failed: [{ role: 'request', reason: error?.message || 'request failed' }], roles: {} });
-      toast.error(error?.message || 'Official API adaptation failed');
-    } finally {
-      setApplying(false);
-    }
-  };
-  return (
-    <SettingsSection title={uiMessage('settings.lumi-official-service.9a4e2d7c10')} icon={<Sparkle size={18} className="text-celestial-saturn" />}>
-      <p className="mb-5 max-w-3xl text-sm leading-relaxed text-white/45">
-        Configure the Lumi-owned endpoint once, then apply it to every model role. <a href={LUMI_OFFICIAL_DOCS_URL} target="_blank" rel="noreferrer" className="text-cyan-300/80 underline">API docs</a>
-      </p>
-      <div className="border-y border-white/10">
-        <RelayProviderRow t={t} label={uiMessage('settings.lumi-official-relay.7d3b1f9c24')} />
-      </div>
-      <div className="mt-5 rounded-xl border border-celestial-saturn/15 bg-celestial-saturn/[0.04] p-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <p className="text-xs leading-relaxed text-white/55">Apply configured official API settings to reasoning, vision, world actions, generation, retrieval, and speech.</p>
-          <Button type="button" onClick={() => { void apply(); }} disabled={applying} data-testid="apply-official-api" className="h-10 rounded-lg bg-celestial-saturn px-4 text-xs font-bold text-black hover:bg-yellow-300 disabled:opacity-40">
-            {applying ? <Loader2 size={15} className="mr-2 animate-spin" /> : <Zap size={15} className="mr-2" />} Apply Lumi Official API
-          </Button>
-        </div>
-        {result && <div className="mt-3 border-t border-white/10 pt-3 text-[11px] text-white/55" role="status" aria-live="polite">
-          {Object.values(result.roles).map(item => <div key={item.role} className="flex flex-wrap gap-2"><span className={item.status === 'applied' ? 'text-emerald-300' : item.status === 'failed' ? 'text-red-300' : 'text-amber-200'}>{item.status}</span><span>{item.role}</span>{item.model && <span className="font-mono text-white/40">{item.provider}/{item.model}</span>}{item.reason && <span className="text-white/35">{item.reason}</span>}</div>)}
-          {result.error && <p className="mt-1 text-red-300/80">{result.error}</p>}
-        </div>}
-      </div>
-      <LumiOfficialCapabilityBadge t={t} supported={true} capabilityKey="settings.capability-official-supported-roles.a3b4c5d6e7" />
-    </SettingsSection>
-  );
-}
-
 const REASONING_MODEL_OPTIONS: Record<string, string[]> = {
   deepseek: ['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-chat', 'deepseek-reasoner'],
   qwen: ['qwen-plus', 'qwen-max', 'qwen-turbo'],
@@ -2856,6 +2972,7 @@ function ReasoningRoleSettings({ t, providerStatus }: { t: any; providerStatus: 
   ));
   const [testing, setTesting] = useState(false);
   const [testMessage, setTestMessage] = useState('');
+  const officialCatalog = useLumiOfficialCatalog();
 
   useEffect(() => {
     setModel(aiConfig.model);
@@ -2990,7 +3107,13 @@ function ReasoningRoleSettings({ t, providerStatus }: { t: any; providerStatus: 
           id={`reasoning-role-${aiConfig.provider}`}
           label={uiMessage('settings.model.44c0cd4289')}
           value={model}
-          options={[configuredModel, ...selectedExtensionModels, ...(REASONING_MODEL_OPTIONS[aiConfig.provider] || [])].filter(Boolean)}
+          options={[
+            configuredModel,
+            ...selectedExtensionModels,
+            ...(aiConfig.provider === LUMI_OFFICIAL_PROVIDER_ID
+              ? officialModelOptions(officialCatalog, 'reasoning', REASONING_MODEL_OPTIONS.relay)
+              : REASONING_MODEL_OPTIONS[aiConfig.provider] || []),
+          ].filter(Boolean)}
           onChange={value => { setModel(value); setTestMessage(''); }}
         />
         {(selectionMode === 'ordered_fallback' || selectionMode === 'auto') && (
@@ -3020,6 +3143,7 @@ function ReasoningRoleSettings({ t, providerStatus }: { t: any; providerStatus: 
             ? 'Pinned mode fails explicitly if this exact provider/model is unavailable.'
             : 'Every attempt and the model actually used are written to the local routing receipt ledger.'}
         </p>
+        <LumiOfficialCapabilityBadge t={t} supported={true} capabilityKey="settings.capability-reasoning.f2a3b4c5d6" />
       </div>
       <div className="mt-5 flex flex-wrap justify-end gap-2">
         <Button onClick={test} disabled={testing || !model.trim()} className="h-10 rounded-lg border border-emerald-400/20 bg-emerald-400/10 px-4 text-xs font-bold text-emerald-200 hover:bg-emerald-400/15 disabled:opacity-40">
@@ -3036,12 +3160,151 @@ function ReasoningRoleSettings({ t, providerStatus }: { t: any; providerStatus: 
   );
 }
 
-function CloudProviderSettings({ t, providerStatus }: { t: any; providerStatus: Record<string, ProviderRuntimeStatus> }) {
+function OfficialProviderSettings({ t }: { t: any }) {
+  const locale = t?.langCode === 'en' ? 'en' : 'zh';
+  const [applying, setApplying] = useState(false);
+  const [applyResult, setApplyResult] = useState<OfficialRoleApplyResponse | null>(null);
+  const officialCatalog = useLumiOfficialCatalog();
+  const catalogSummary = officialCatalog
+    ? { modelCount: officialCatalog.models.length, roleCount: Object.keys(officialCatalog.byRole).length }
+    : null;
+
+  const applyOfficialApi = async () => {
+    if (applying) return;
+    setApplying(true);
+    setApplyResult(null);
+    try {
+      const result = await applyOfficialModelRoles();
+      setApplyResult(result);
+      if (result.applied.length > 0) {
+        // AppContext refreshes its in-memory reasoning/vision state from the
+        // server. World and retrieval pages reload their own preferences when
+        // opened, so no secret or model value is copied into the browser.
+        window.dispatchEvent(new CustomEvent('lumi:model-configuration-changed'));
+      }
+      if (result.code === 'OFFICIAL_API_NOT_CONFIGURED') {
+        toast.error(uiMessage(LUMI_OFFICIAL_APPLY_NOT_CONFIGURED_KEY, locale));
+      } else if (result.failed.length > 0) {
+        toast.error(formatUiMessage(LUMI_OFFICIAL_APPLY_PARTIAL_KEY, {
+          value0: result.applied.length,
+          value1: result.failed.length,
+        }, locale));
+      } else if (result.applied.length > 0) {
+        toast.success(formatUiMessage(LUMI_OFFICIAL_APPLY_SUCCESS_KEY, {
+          value0: result.applied.length,
+        }, locale));
+      }
+    } catch (error: any) {
+      const message = error?.message || uiMessage(LUMI_OFFICIAL_APPLY_FAILED_KEY, locale);
+      setApplyResult({ ok: false, applied: [], skipped: [], failed: [{ role: 'request', reason: message }], roles: {} });
+      toast.error(message);
+    } finally {
+      setApplying(false);
+    }
+  };
+
+  const roleLabels: Record<string, string> = {
+    reasoning: uiMessage('settings.reasoning.6a171d96b4', locale),
+    vision: uiMessage('settings.vision-model.df2108ba57', locale),
+    world: uiMessage('settings.world-model.67c5d91de2', locale),
+    embedding: uiMessage('settings.embedding-role-label.f7a8b9c0d1', locale),
+    image_generation: uiMessage('settings.image-generation-model.fdd84f5c71', locale),
+    video_generation: uiMessage('settings.video-generation-model.390997b87b', locale),
+    rerank: uiMessage('settings.rerank-role-label.a8b9c0d1e2', locale),
+    speech_recognition: uiMessage('settings.speech-recognition-role-label.b9c0d1e2f3', locale),
+    speech_synthesis: uiMessage('settings.speech-synthesis-role-label.c0d1e2f3a4', locale),
+    request: uiMessage(LUMI_OFFICIAL_APPLY_LABEL_KEY, locale),
+  };
+
+  return (
+    <SettingsSection title={uiMessage('settings.lumi-official-service.9a4e2d7c10')} icon={<Sparkle size={18} className="text-celestial-saturn" />}>
+      <p className="mb-5 max-w-3xl text-sm leading-relaxed text-white/45">
+        {uiMessage('settings.lumi-official-service-description.2c8f6a1e05')}
+        {' '}
+        <span className="inline-flex flex-wrap gap-x-3 gap-y-1">
+          <a
+            href={LUMI_OFFICIAL_DOCS_URL}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 text-cyan-300/80 underline decoration-cyan-300/30 underline-offset-2 hover:text-cyan-200"
+          >
+            API docs <ExternalLink size={12} />
+          </a>
+          <a
+            href={LUMI_OFFICIAL_RECHARGE_URL}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 text-amber-200/80 underline decoration-amber-200/30 underline-offset-2 hover:text-amber-100"
+          >
+            {uiMessage('settings.lumi-official-recharge-link.1c2d3e4f5a', locale)} <ExternalLink size={12} />
+          </a>
+        </span>
+      </p>
+      {catalogSummary && (
+        <p className="mb-4 text-xs text-cyan-100/45" data-testid="official-model-catalog-summary">
+          {formatUiMessage('settings.lumi-official-catalog-summary.2d3e4f5a6b', {
+            value0: catalogSummary.modelCount,
+            value1: catalogSummary.roleCount,
+          }, locale)}
+        </p>
+      )}
+      <div className="border-y border-white/10">
+        <RelayProviderRow t={t} label={uiMessage('settings.lumi-official-relay.7d3b1f9c24')} />
+      </div>
+      <div className="mt-5 rounded-xl border border-celestial-saturn/15 bg-celestial-saturn/[0.04] p-4">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <p className="max-w-2xl text-xs leading-relaxed text-white/55">
+            {uiMessage(LUMI_OFFICIAL_APPLY_DESCRIPTION_KEY, locale)}
+          </p>
+          <Button
+            type="button"
+            onClick={() => { void applyOfficialApi(); }}
+            disabled={applying}
+            data-testid="apply-official-api"
+            className="h-10 shrink-0 rounded-lg bg-celestial-saturn px-4 text-xs font-bold text-black hover:bg-yellow-300 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {applying ? <Loader2 size={15} className="mr-2 animate-spin" /> : <Zap size={15} className="mr-2" />}
+            {uiMessage(LUMI_OFFICIAL_APPLY_LABEL_KEY, locale)}
+          </Button>
+        </div>
+        {applyResult && (
+          <div className="mt-3 grid gap-1.5 border-t border-white/10 pt-3 text-[11px] text-white/55" role="status" aria-live="polite">
+            {Object.entries(applyResult.roles).map(([role, result]) => (
+              <div key={role} className="flex flex-wrap items-center gap-2">
+                <span className={result.status === 'applied' ? 'text-emerald-300' : result.status === 'failed' ? 'text-red-300' : 'text-amber-200'}>
+                  {result.status === 'applied' ? '✓' : result.status === 'failed' ? '!' : '·'}
+                </span>
+                <span>{roleLabels[role] || role}</span>
+                {result.model && <span className="font-mono text-white/40">{result.provider}/{result.model}</span>}
+                {result.reason && <span className="text-white/35">{lumiOfficialRoleReason(result.reason, locale)}</span>}
+              </div>
+            ))}
+            {applyResult.error && <p className="mt-1 text-red-300/80">{applyResult.error}</p>}
+          </div>
+        )}
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <LumiOfficialCapabilityBadge t={t} supported={true} capabilityKey="settings.capability-official-supported-roles.a3b4c5d6e7" />
+      </div>
+    </SettingsSection>
+  );
+}
+
+function ServiceProviderSettings({ t, providerStatus }: { t: any; providerStatus: Record<string, ProviderRuntimeStatus> }) {
   const failedProbes = Object.entries(providerStatus)
-    .filter(([, status]) => status.configured !== false && status.lastProbe?.ok === false);
+    // Relay belongs to the Lumi Official column; local runtimes belong to Local.
+    // Keep the health banner scoped to the providers rendered in this column.
+    .filter(([provider, status]) => (
+      provider !== 'relay'
+      && provider !== 'ollama'
+      && provider !== 'lmstudio'
+      && !(status.extension === true && status.local === true)
+      && status.configured !== false
+      && status.lastProbe?.ok === false
+    ));
   return (
     <div className="space-y-8">
-      <SettingsSection title={uiMessage('settings.cloud-model-providers.55a86c3fed')}>
+      <SettingsSection title={uiMessage('settings.service-model-providers.4f8a2c6d19')}>
         {failedProbes.length > 0 && (
           <div className="mb-6 flex flex-wrap items-center gap-2 border-y border-red-400/15 py-3 text-xs text-red-200/80">
             <AlertTriangle size={14} />
@@ -3074,11 +3337,10 @@ function CloudProviderSettings({ t, providerStatus }: { t: any; providerStatus: 
 
 function LocalProviderSettings({ t }: { t: any }) {
   return (
-    <SettingsSection title={uiMessage('settings.local-compatible-providers.f6a71d6a1e')}>
+    <SettingsSection title={uiMessage('settings.local-model-providers.8e1c4b6a20')}>
       <div className="border-y border-white/10">
         <OllamaProviderRow t={t} />
         <LmStudioProviderRow t={t} />
-        <RelayProviderRow t={t} />
       </div>
     </SettingsSection>
   );
@@ -3316,6 +3578,7 @@ function VoiceServicesPage({ t }: { t: any }) {
           <VoiceProviderSwitch t={t} />
           <VoiceDeviceSelector />
         </div>
+        <LumiOfficialCapabilityBadge t={t} supported={true} capabilityKey="settings.capability-speech-recognition-synthesis.c5d6e7f8a9" />
         <p className="text-sm text-white/40 max-w-xl mb-6">
           {t.voiceServicesDesc || uiMessage('settings.speech-recognition-asr-and-speech.4d604985a1')}
         </p>
@@ -3357,11 +3620,12 @@ function SpeechProviderSettings({ t }: { t: any }) {
         <ApiKeyField icon={<Volume2 size={18} className="text-emerald-400" />} label={t.doubaoSpeechLabel || 'Doubao Speech (STT + TTS)'} placeholder="New-console API Key value" storageKey="lumi_doubao_speech" serverKey="DOUBAO_SPEECH_KEY" consoleUrl="https://console.volcengine.com/speech/new/setting/apikeys" testEndpoint="/api/voice/doubao/probe" persistInBrowser={false} hint={uiMessage('settings.doubao-speech-api-key-only.4ab619f21d')} t={t} />
         <ApiKeyField icon={<Zap size={18} className="text-violet-400" />} label={t.dashscopeLabel || 'DashScope (Cloud STT + TTS)'} placeholder="sk-..." storageKey="lumi_dashscope_key" serverKey="DASHSCOPE_API_KEY" hint={t.dashscopeHint || uiMessage('settings.powers-qwen-asr-and-dashscope.519f4cb3da')} t={t} />
       </div>
+      <LumiOfficialCapabilityBadge t={t} supported={true} capabilityKey="settings.capability-speech-recognition-synthesis.c5d6e7f8a9" />
     </SettingsSection>
   );
 }
 
-function ApiKeyField({ icon, label, placeholder, disabled = false, storageKey, serverKey, hint, consoleUrl, testEndpoint, persistInBrowser = true, compact = false, secret = true, t }: { icon: React.ReactNode, label: string, placeholder: string, disabled?: boolean, storageKey: string, serverKey?: string, hint?: string, consoleUrl?: string, testEndpoint?: string, persistInBrowser?: boolean, compact?: boolean, secret?: boolean, t?: any }) {
+function ApiKeyField({ icon, label, placeholder, disabled = false, storageKey, serverKey, hint, consoleUrl, testEndpoint, persistInBrowser = false, compact = false, secret = true, t }: { icon: React.ReactNode, label: string, placeholder: string, disabled?: boolean, storageKey: string, serverKey?: string, hint?: string, consoleUrl?: string, testEndpoint?: string, persistInBrowser?: boolean, compact?: boolean, secret?: boolean, t?: any }) {
   const isZh = t?.langCode !== 'en';
   const ui = (zh: string, en: string) => (isZh ? zh : en);
   const [value, setValue] = useState(() => {
@@ -3525,6 +3789,8 @@ function ApiKeyField({ icon, label, placeholder, disabled = false, storageKey, s
 function RelayProviderRow({ t, label }: { t?: any; label?: string }) {
   const isZh = t?.langCode !== 'en';
   const ui = (zh: string, en: string) => (isZh ? zh : en);
+  // Relay secrets belong in the server credential store, never in browser
+  // localStorage. Existing installations are cleaned up on mount below.
   const [apiKey, setApiKey] = useState('');
   const [baseUrl, setBaseUrl] = useState(() => {
     return readStoredRelayBaseUrl() || LUMI_OFFICIAL_BASE_URL;
@@ -3556,6 +3822,7 @@ function RelayProviderRow({ t, label }: { t?: any; label?: string }) {
       setServerKeyOk(true);
       setServerUrlOk(true);
       setSaved(true);
+      refreshLumiOfficialCatalog();
       setTimeout(() => setSaved(false), 2000);
       toast.success(t?.apiKeySaved || uiMessage('settings.api-key-saved.a1dc4d42fb'));
     }).catch(err => toast.error(err.message || t?.failedToSaveKey || uiMessage('settings.failed-to-save.465b88f9c0')));
@@ -3563,13 +3830,14 @@ function RelayProviderRow({ t, label }: { t?: any; label?: string }) {
 
   const handleRemove = () => {
     saveServerKeys({ RELAY_API_KEY: '', RELAY_BASE_URL: '' }).then(() => {
-      clearLegacyRelaySecret();
+      localStorage.removeItem('lumi_relay_key');
       localStorage.removeItem('lumi_relay_url');
       setServerKeyOk(false);
       setServerUrlOk(false);
       setApiKey('');
       setBaseUrl('');
       setSaved(true);
+      refreshLumiOfficialCatalog();
       setTimeout(() => setSaved(false), 2000);
       toast.success(t?.apiKeyRemoved || uiMessage('settings.api-key-removed.bae3220b94'));
     }).catch(err => toast.error(err.message || t?.failedToRemoveKey || uiMessage('settings.failed-to-remove.5c5d9c7827')));
@@ -3618,7 +3886,7 @@ function RelayProviderRow({ t, label }: { t?: any; label?: string }) {
           {t?.remove || uiMessage('settings.remove.78190c6054')}
         </Button>
       </div>
-      <p className="mt-3 text-[12px] leading-relaxed text-white/45">{uiMessage('settings.openai-compatible-api-relay-enter.b0d5520635')}</p>
+      <p className="mt-3 text-[12px] leading-relaxed text-amber-200/65">{uiMessage('settings.lumi-official-endpoint-warning.f7a8b9c0d1')}</p>
     </SettingsDisclosure>
   );
 }
@@ -3867,7 +4135,7 @@ function AutonomousSettingsPanel({ t, operationMode }: { t: any; operationMode: 
       {/* Scheduler Tasks */}
       <div className="p-4 bg-white/5 rounded-2xl border border-white/5 space-y-3">
         <button onClick={() => setTasksExpanded(!tasksExpanded)} className="w-full flex items-center justify-between">
-          <div className="text-xs font-black uppercase tracking-widest text-white/60">{uiMessage('settings.background-tasks.015be0a9ad')}</div>
+          <div className="text-xs font-black uppercase tracking-widest text-white/60">{uiMessage('settings.scheduled-routines.5f06751a14', t?.langCode === 'en' ? 'en' : 'zh')}</div>
           <ChevronDown size={14} className={`text-white/40 transition-transform ${tasksExpanded ? 'rotate-180' : ''}`} />
         </button>
 

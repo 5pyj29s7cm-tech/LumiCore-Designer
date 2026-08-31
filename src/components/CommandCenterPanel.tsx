@@ -31,7 +31,27 @@ import type { CommandCenterView } from './commandCenterTypes';
 // Kept as type-only compatibility exports for older Designer fixtures. The
 // rendered command center is single-core and never instantiates agent/team
 // surfaces; these helpers only adapt legacy test payloads.
-import type { LocalAgentCosmosAgent, LocalAgentCosmosTask } from './LocalAgentSphere';
+/**
+ * Legacy shape used only by pre-single-core Designer fixtures.  Keep the
+ * projection local so removing the old agent workspace does not leave a
+ * runtime import (or resurrect the deleted LocalAgentSphere component).
+ */
+type LocalAgentCosmosAgent = {
+  id: string;
+  name: string;
+  category: string;
+  runtime: 'internal' | 'external';
+  state: string;
+  taskId?: string;
+  taskTitle?: string;
+};
+type LocalAgentCosmosTask = {
+  id: string;
+  title?: string;
+  state: string;
+  active: boolean;
+  workerIds: string[];
+};
 
 export type CommandCenterTask = {
   id: string;
@@ -229,9 +249,8 @@ export function buildCommandCenterCosmosTasks(
 ): LocalAgentCosmosTask[] {
   return tasks.map(task => ({
     id: task.id,
-    title: task.title || task.id,
-    status: task.status || 'unknown',
-    phase: task.phase,
+    title: task.title,
+    state: taskOrbitState(task),
     active: commandCenterTaskIsActive(task),
     workerIds: agents
       .filter(agent => (task.workerNames || []).some(worker => {

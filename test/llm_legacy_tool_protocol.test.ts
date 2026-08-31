@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseDeepSeekResponse, parseLegacyBracketToolCalls, parseLegacyXmlToolCalls } from '../server/llm/providers';
+import { parseDeepSeekResponse, parseLegacyXmlToolCalls } from '../server/llm/providers';
 
 describe('legacy XML tool protocol compatibility', () => {
   const declarations = [
@@ -27,6 +27,8 @@ describe('legacy XML tool protocol compatibility', () => {
     })]);
   });
 
+  /* Full-width DSML was part of the retired local-agent protocol. The public
+   * provider boundary now accepts native tool_calls plus bounded declared XML.
   it('converts the DeepSeek full-width DSML variant into a declared structured call', () => {
     expect(parseLegacyXmlToolCalls(
       '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="industry_workflow_start"><｜｜DSML｜｜parameter name="entryId" string="true">visualization</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>',
@@ -44,7 +46,7 @@ describe('legacy XML tool protocol compatibility', () => {
           content: '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="industry_workflow_start"><｜｜DSML｜｜parameter name="entryId" string="true">visualization</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>',
         },
       }],
-    }, declarations);
+    });
 
     expect(parsed.text).toBeNull();
     expect(parsed.toolCalls).toEqual([expect.objectContaining({
@@ -53,6 +55,10 @@ describe('legacy XML tool protocol compatibility', () => {
     })]);
   });
 
+  */
+
+  /* Bracket-call parsing was deliberately removed with the legacy local-agent
+   * protocol. Native tool_calls and the bounded XML gateway fallback remain.
   it('converts a declared DeepSeek bracket call into a structured call', () => {
     expect(parseLegacyBracketToolCalls(
       '[tool] industry_workflow_start({"entryId":"cad"})',
@@ -70,7 +76,7 @@ describe('legacy XML tool protocol compatibility', () => {
           content: '[调用 industry_workflow_start] {"entryId":"cad"}',
         },
       }],
-    }, declarations);
+    });
 
     expect(parsed.text).toBeNull();
     expect(parsed.toolCalls).toEqual([expect.objectContaining({
@@ -85,6 +91,8 @@ describe('legacy XML tool protocol compatibility', () => {
       declarations,
     )).toBeNull();
   });
+
+  */
 
   it('does not execute undeclared XML tool names', () => {
     expect(parseLegacyXmlToolCalls(

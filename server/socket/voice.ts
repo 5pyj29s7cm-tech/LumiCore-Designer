@@ -59,8 +59,6 @@ import {
   getConversationActionStatus,
   prepareConversationActionExecution,
   persistConversationExecutionPlan,
-  persistConversationModelExecutionResult,
-  getConversationModelExecutionRecovery,
   cancelConversationActionExecution,
   createDurableForegroundReleaseGate,
   convergeConversationActionRequestLease,
@@ -83,16 +81,8 @@ import {
 import { resolveExactConversationCorrection } from "../conversation/exact_correction";
 import { scheduleConversationSummary } from "../conversation/summary_scheduler";
 import { processInput, CognitiveContext, extractSentiment } from "../cognition";
-import {
-  runOrchestratedTask,
-  classifyComplexity,
-  isTerminalOrchestrationToolEvent,
-  shouldAttemptOrchestration,
-  type LlmGetters,
-  type OrchestrationWorkflowCheckpoint,
-} from "../agents/orchestrator";
+import type { LLMGetters as LlmGetters } from '../llm/dispatch';
 import { retrieveChunks } from "../agents/rag";
-import { markLatestUserTurn } from "../agents/background_delivery";
 import { executeSkillWorkflowAdapter } from "../skills/workflow_registry";
 import { queryMemories, addMemory } from "../memory/store";
 import { CONVERSATIONAL_MEMORY_EVIDENCE } from "../memory/types";
@@ -191,9 +181,7 @@ import {
   type ChatExecutionScope,
 } from './chat_execution_registry';
 import {
-  persistVoiceWorkflowCheckpointDurably,
   sanitizeVoiceAgentErrorPayload,
-  VoiceWorkflowCheckpointError,
   voiceDurabilityUnknownText,
 } from './voice_durability';
 import {
@@ -1947,11 +1935,6 @@ async function processVoiceInput(
     asrFinalAt: inputTiming.asrFinalAt,
     pipelineStartedAt: Date.now(),
   });
-  markLatestUserTurn({
-    userId: session.userId,
-    domain: session.domain,
-    orgId: session.orgId,
-  }, requestId);
   session.pipelineAbortController = pipelineAbort;
   session.activeTurnText = userText;
   session.activeTurnRequestId = requestId;
@@ -4407,23 +4390,16 @@ async function processVoiceInput(
     logger.info(`[Audio] Cognition: ${cognition.intent.category} (confidence: ${cognition.intent.confidence}), model: ${effectiveModel}`);
 
     // ── Orchestrator: complex/moderate tasks → multi-agent decomposition ──
+    // The Designer edition uses the same single LumiCore execution owner as
+    // the primary client. Legacy worker orchestration remains disabled.
     let usedOrchestrator = false;
     let recoveryConversationMessages: NormalizedMessage[] = [
       { role: 'system', content: voiceSystemPrompt },
       { role: 'user', content: routedUserText },
     ];
-    const complexity = classifyComplexity(routedUserText, { userId: session.userId, personalityId: session.personalityId });
-    const shouldOrchestrate = !runtimeOwnedDeterministicRecoveryCall && shouldAttemptOrchestration({
-      channel: 'voice',
-      text: turnFlow.routeText,
-      complexity,
-      allowToolUse: executionDecision.allowToolUse,
-      clientActionOnly: clientActionOnlyTurn,
-      selfRepair: selfRepairTurn,
-      artifactFirst: workSurfaceRoute.artifactFirst,
-      directDesktop: workSurfaceRoute.directDesktop,
-    });
+    const shouldOrchestrate = false;
     if (shouldOrchestrate) {
+      /* Legacy multi-worker execution was removed from the product runtime.
       let voiceWorkflowCheckpointed = false;
       try {
         emitAgent("agent:status", { status: "thinking", agentName: "Lumi", phase: exposeAgentWork ? 'orchestrator' : 'background' });
@@ -4537,6 +4513,7 @@ async function processVoiceInput(
         if (e instanceof VoiceWorkflowCheckpointError || voiceWorkflowCheckpointed) throw e;
         logger.warn('[Audio] Orchestrator failed, falling back to LLM:', (e as Error).message);
       }
+      */
     }
 
     if (!usedOrchestrator) {

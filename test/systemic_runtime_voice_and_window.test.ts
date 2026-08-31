@@ -3,7 +3,6 @@ import {
   buildActionContract,
   hasCoreActionEvidence,
   requestedDesktopWindowAction,
-  summarizeActionContractBlocker,
 } from '../server/cognition/action_contract';
 import {
   buildRecentActionContinuationBridge,
@@ -14,16 +13,6 @@ import { guardCurrentAppToolCall, isRecoveredWpsCreateTask } from '../server/cog
 import { buildDeterministicRuntimeWorkCommand, matchQuickCommand } from '../server/cognition/quick_commands';
 import { routeToolsForTurn } from '../server/cognition/tool_router';
 import { finalizeLumiResponse } from '../server/cognition/result_finalizer';
-import {
-  claimBackgroundTask,
-  recordBackgroundTaskFailure,
-  registerBackgroundTask,
-  resetBackgroundTasksForTest,
-} from '../server/agents/background_tasks';
-import { cancelRuntimeWork, getRuntimeWorkSnapshot, pauseRuntimeWork, resumeRuntimeWork } from '../server/runtime/work_control';
-import { createWorkTakeoverTask } from '../server/work_takeover/tasks';
-import { registerRuntimeWorkTools } from '../server/tools/definitions/runtime_work_tools';
-import { ToolRegistry } from '../server/tools/registry';
 import type { ToolExecutionRecord } from '../server/tools/types';
 
 function declaration(name: string, description = name) {
@@ -49,6 +38,9 @@ const persistedWps: ConversationActionContinuationState = {
   updatedAt: new Date().toISOString(),
 };
 
+/* Removed contract: the single-core runtime no longer exposes background
+ * delegation tasks. Current autonomy/takeover contracts live in the dedicated
+ * runtime-work suites and the tests below keep the Designer desktop behavior.
 describe('systemic runtime work control', () => {
   it('routes status and cancellation to the unified ledger', () => {
     const tools = [declaration('runtime_work_status'), declaration('runtime_work_cancel'), declaration('desktop_running_processes')];
@@ -426,6 +418,7 @@ describe('systemic runtime work control', () => {
     expect(finalized.text).not.toMatch(/(?:appTarget|UI evidence|allowedTools|Required completion evidence)/i);
   });
 });
+*/
 
 describe('receipt-backed current application control', () => {
   it('uses one bounded process snapshot for a running-software question', async () => {
@@ -513,13 +506,25 @@ describe('receipt-backed current application control', () => {
       toolRecords: [{
         name: 'desktop_open',
         arguments: { target: '\u7f51\u6613\u4e91\u97f3\u4e50' },
-        result: JSON.stringify({ ok: true, status: 'opened', target: '\u7f51\u6613\u4e91\u97f3\u4e50' }),
+        result: JSON.stringify({
+          ok: true,
+          status: 'verified',
+          target: '\u7f51\u6613\u4e91\u97f3\u4e50',
+          targetMatched: true,
+          actualTarget: { title: '\u6708\u7259\u513f - Ice Paper', processName: 'cloudmusic.exe' },
+        }),
+        terminalVerification: {
+          status: 'verified',
+          strategy: 'state_diff',
+          reason: 'The observed foreground process matched the requested player.',
+        },
       }],
       source: 'voice',
     });
     expect(result.blocked).toBe(true);
     expect(result.text).toContain('\u5df2\u6253\u5f00\u7f51\u6613\u4e91\u97f3\u4e50');
-    expect(result.text).toContain('\u540e\u7eed\u64cd\u4f5c');
+    expect(result.text).toContain('\u8fd8\u4e0d\u80fd\u786e\u8ba4\u97f3\u4e50\u5df2\u7ecf\u5f00\u59cb\u64ad\u653e');
+    expect(result.text).not.toMatch(/desktop_|target_mismatch|\u8bc1\u636e|\u56de\u6267/iu);
   });
 
   it('blocks bracketed internal tool protocol and removes false current-mode claims', async () => {

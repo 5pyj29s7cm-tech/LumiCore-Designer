@@ -28,10 +28,10 @@
 
 | Lane | Count |
 | --- | ---: |
-| agents | 44 |
+| agents | 33 |
 | cad | 4 |
 | client | 11 |
-| desktop | 42 |
+| desktop | 41 |
 | files | 8 |
 | general | 28 |
 | industry | 41 |

@@ -11,7 +11,7 @@ import {
 } from '../regions/packs/cn/voice_fast_path_messages';
 import { isGuardGeneratedConversationRecord } from '../conversation/guard_history';
 import { findLatestRepeatableAssistantReply } from '../conversation/assistant_restatement';
-import { buildActionContract } from './action_contract';
+import { buildActionContract, buildActionEvidenceContract } from './action_contract';
 import type { ToolPolicy } from '../personality/types';
 import { isConfirmationBlockedToolRecord } from '../tools/confirmation_block';
 import { isExplicitConfirmationReply } from '../tools/pending_confirmation';
@@ -38,7 +38,12 @@ import {
   type TaskCapsuleV1,
 } from '../conversation/task_capsule';
 import { isUnconfirmedRuntimeCandidate } from '../conversation/task_target_anchor';
-import { toolRecordTerminalPayload } from '../tools/receipt_payload';
+import {
+  parseNestedJson,
+  toolRecordHasTerminalPayload,
+  toolRecordTerminalPayload,
+} from '../tools/receipt_payload';
+import type { ToolExecutionRecord } from '../tools/types';
 
 export interface ActionContinuationHistoryItem {
   role?: string;
@@ -106,60 +111,6 @@ export interface PendingRuntimeCancellationRecheck {
   taskIds: string[];
   priorReceiptId: string;
   priorStatus: 'cancelling';
-}
-
-/**
- * Return immutable runtime targets from a cancellation that was accepted but
- * is still settling. This is reconciliation authority only; malformed or
- * widened target lists fail closed and never become cancel-all requests.
- */
-export function pendingRuntimeCancellationRecheck(
-  value: ConversationActionContinuationState | null | undefined,
-): PendingRuntimeCancellationRecheck | null {
-  const state = normalizeConversationActionState(value);
-  if (!state?.taskId || !state.unfinished) return null;
-  const hasCancellationContract = [state.goal, state.latestInstruction]
-    .filter(Boolean)
-    .some(candidate => {
-      const contract = buildActionContract(candidate);
-      return contract.kind === 'task_control'
-        && contract.preferredTools.includes('runtime_work_cancel');
-    });
-  if (!hasCancellationContract) return null;
-  const latestCancellation = [...(state.receipts || [])]
-    .reverse()
-    .find(receipt => receipt.name === 'runtime_work_cancel');
-  if (!latestCancellation) return null;
-  const payload = toolRecordTerminalPayload({
-    receipt: latestCancellation.receipt,
-    result: latestCancellation.result,
-  });
-  const result = payload && typeof payload === 'object' && !Array.isArray(payload)
-    ? payload as Record<string, any>
-    : null;
-  if (
-    result?.ok !== true
-    || String(result.status || '').toLowerCase() !== 'cancelling'
-    || Number(result.failedCount || 0) !== 0
-    || latestCancellation.terminalVerification?.status === 'verified'
-  ) return null;
-  const exactIds = (candidate: unknown): string[] | null => {
-    if (!Array.isArray(candidate) || candidate.length === 0 || candidate.length > 64) return null;
-    const ids = candidate.map(item => typeof item === 'string' ? item.trim() : '');
-    if (ids.some(id => !id || id.length > 180)) return null;
-    return Array.from(new Set(ids));
-  };
-  const authorized = exactIds(latestCancellation.arguments?.taskIds);
-  const requested = exactIds(result.requestedTaskIds);
-  if (!authorized || !requested) return null;
-  const authorizedSet = new Set(authorized);
-  if (requested.length !== authorizedSet.size || requested.some(id => !authorizedSet.has(id))) return null;
-  return {
-    taskId: state.taskId,
-    taskIds: requested,
-    priorReceiptId: String(latestCancellation.id || '').slice(0, 180),
-    priorStatus: 'cancelling',
-  };
 }
 
 export interface ConversationActionContinuationUpdate {
@@ -272,18 +223,6 @@ function recordText(item: ActionContinuationHistoryItem): string {
   return compact(item.message || item.content || item.text || item.response);
 }
 
-function parseNestedJson(value: unknown): unknown {
-  let parsed = value;
-  for (let index = 0; index < 3 && typeof parsed === 'string'; index += 1) {
-    try {
-      parsed = JSON.parse(parsed);
-    } catch {
-      break;
-    }
-  }
-  return parsed;
-}
-
 function parseToolCalls(item: ActionContinuationHistoryItem): any[] {
   if (isGuardGeneratedConversationRecord(item)) return [];
   const parsed = parseNestedJson(item.toolCalls);
@@ -323,7 +262,10 @@ function toolCallArguments(call: any): Record<string, any> {
 }
 
 function toolCallResult(call: any): unknown {
-  return parseNestedJson(call?.result);
+  return toolRecordTerminalPayload({
+    receipt: call?.receipt,
+    result: call?.result,
+  });
 }
 
 function toolCallFailure(call: any): string {
@@ -395,8 +337,15 @@ function toolCallSucceeded(call: any): boolean {
     name,
     arguments: toolCallArguments(call),
     result,
+    ...(call?.receipt !== undefined ? { receipt: call.receipt } : {}),
     error: compact(call?.error, 700) || undefined,
-  });
+    ...(call?.terminalVerification && typeof call.terminalVerification === 'object'
+      ? { terminalVerification: call.terminalVerification }
+      : {}),
+    ...(call?.capability && typeof call.capability === 'object'
+      ? { capability: call.capability }
+      : {}),
+  } as ToolExecutionRecord);
 }
 
 function normalizeApplicationTarget(value: unknown): string {
@@ -474,6 +423,14 @@ const MIXED_STATUS_QUESTION_RE =
 // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
 const AMBIGUOUS_UNFINISHED_TASK_STATUS_RE =
   /^(?:怎么回事|什么情况|出什么问题了|哪里(?:出|有)问题了|卡在哪(?:里)?|为什么(?:停了|没继续|没完成|没做完)|what happened|what went wrong|where (?:is|was) it blocked)[啊呀吧嘛呢，,。！？?!\s]*$/iu; // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
+
+// A user may satisfy the exact condition Lumi just asked for outside the
+// client (for example by foregrounding WPS), then report only that readiness
+// fact. These acknowledgements are executable continuation only while the
+// durable task is blocked; without that state they remain ordinary dialogue.
+// i18n-allow: Multilingual blocked-task readiness acknowledgement recognition; not user-visible copy.
+const BLOCKED_TASK_READINESS_RE =
+  /^(?:(?:(?:已经|已|现在|刚才|刚刚)\s*)?(?:把|将)?(?:它|这个|那个|文件|文档|窗口|应用|软件)?\s*(?:切换|切|换|放|调)\s*(?:到|至)?\s*(?:前台|当前窗口)(?:了)?|(?:已经|已|现在)\s*(?:打开|开启)(?:了|好了)?|(?:已经)?\s*(?:准备好|准备就绪)(?:了)?|(?:现在\s*)?可以了|(?:it(?:'s| is)\s+)?(?:in (?:the )?foreground|open|ready)(?:\s+now)?|ready\s+to\s+continue)[\s啊呀啦吧呢，,。！!]*$/iu;
 
 // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
 const STATUS_RESULT_DEMAND_RE =
@@ -589,7 +546,7 @@ function findTaskAnchorIndex(history: ActionContinuationHistoryItem[]): number {
     const hasTerminalEvidence = history.slice(index + 1).some(item =>
       parseToolCalls(item).some(call => Boolean(
         toolCallName(call)
-        && (toolCallFailure(call) || compact(call?.result, 240)),
+        && (toolCallFailure(call) || toolRecordHasTerminalPayload(call)),
       )),
     );
     if (hasTerminalEvidence) return index;
@@ -771,9 +728,7 @@ export function normalizeConversationActionState(
       .slice(0, 8),
     latestBlocker: status === 'completed' || status === 'waiting_confirmation' || status === 'cancelled'
       ? ''
-      : status === 'blocked'
-        ? compact(value.latestBlocker || receiptCompletion?.blocker, 380)
-        : compact(receiptCompletion?.blocker || value.latestBlocker, 380),
+      : compact(receiptCompletion?.blocker || value.latestBlocker, 380),
     unfinished,
     evidenceTools: Array.from(new Set(Array.isArray(value.evidenceTools) ? value.evidenceTools : []))
       .map(name => compact(name, 120))
@@ -813,6 +768,83 @@ export function normalizeConversationActionState(
   };
 }
 
+/**
+ * Return the exact immutable runtime targets of a cancellation that the
+ * server already accepted but has not terminally verified. A caller may use
+ * this only to recheck/reconcile that same cancellation; the helper never
+ * widens an empty or malformed target set into cancel-all authority.
+ */
+export function pendingRuntimeCancellationRecheck(
+  value: ConversationActionContinuationState | null | undefined,
+): PendingRuntimeCancellationRecheck | null {
+  const state = normalizeConversationActionState(value);
+  if (!state?.taskId || !state.unfinished) return null;
+  // New cleanup flows own a dedicated cancel task, so later status rechecks
+  // must keep authority from the immutable root goal. The latest instruction
+  // is retained only as a compatibility fallback for older ledgers that
+  // attached the accepted cleanup to an observe task.
+  const hasCancellationContract = [state.goal, state.latestInstruction]
+    .filter(Boolean)
+    .some(candidate => {
+      const contract = buildActionEvidenceContract(candidate);
+      return contract.kind === 'task_control'
+        && contract.preferredTools.includes('runtime_work_cancel');
+    });
+  if (!hasCancellationContract) {
+    return null;
+  }
+  const latestCancellation = [...(state.receipts || [])]
+    .reverse()
+    .find(receipt => receipt.name === 'runtime_work_cancel');
+  if (!latestCancellation) return null;
+  const payload = toolRecordTerminalPayload({
+    receipt: latestCancellation.receipt,
+    result: latestCancellation.result,
+  });
+  const result = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? payload as Record<string, any>
+    : null;
+  if (
+    result?.ok !== true
+    || String(result.status || '').toLowerCase() !== 'cancelling'
+    || Number(result.failedCount || 0) !== 0
+    || latestCancellation.terminalVerification?.status === 'verified'
+  ) return null;
+  // The original tool arguments are the only mutation authority. A handler
+  // receipt is evidence about that call; it cannot add targets by reporting a
+  // wider `requestedTaskIds` set. Require both sides to carry a non-empty
+  // exact-ID set and fail closed when the receipt over-reports even one id.
+  const exactTaskIds = (candidate: unknown): string[] | null => {
+    if (!Array.isArray(candidate) || candidate.length === 0 || candidate.length > 64) return null;
+    const normalized: string[] = [];
+    for (const item of candidate) {
+      if (typeof item !== 'string') return null;
+      const taskId = item.trim();
+      if (!taskId || taskId.length > 180) return null;
+      normalized.push(taskId);
+    }
+    const unique = Array.from(new Set(normalized));
+    return unique.length > 0 ? unique : null;
+  };
+  const authorizedTaskIds = exactTaskIds(latestCancellation.arguments?.taskIds);
+  const requestedTaskIds = exactTaskIds(result.requestedTaskIds);
+  if (!authorizedTaskIds || !requestedTaskIds) return null;
+  const authorizedTaskIdSet = new Set(authorizedTaskIds);
+  // Reconcile the complete original set. A subset cannot escalate authority,
+  // but accepting it would silently stop tracking omitted cancellations and
+  // could later claim the multi-target task completed from partial evidence.
+  if (
+    requestedTaskIds.length !== authorizedTaskIdSet.size
+    || requestedTaskIds.some(taskId => !authorizedTaskIdSet.has(taskId))
+  ) return null;
+  return {
+    taskId: state.taskId,
+    taskIds: requestedTaskIds,
+    priorReceiptId: compact(latestCancellation.id, 180),
+    priorStatus: 'cancelling',
+  };
+}
+
 export function classifyConversationActionFollowupIntent(
   text: string,
   state?: ConversationActionContinuationState | null,
@@ -820,7 +852,19 @@ export function classifyConversationActionFollowupIntent(
   if (isImmediateAssistantRestatementRequest(text)) return 'repeat';
   const durableState = normalizeConversationActionState(state);
   const compactText = compact(text, 500);
+  if (
+    durableState?.unfinished
+    && durableState.status === 'blocked'
+    && BLOCKED_TASK_READINESS_RE.test(compactText)
+  ) return 'execute';
   const normalizedIntent = normalizeActionIntent(text);
+  if (
+    durableState?.unfinished
+    && normalizedIntent.relation === 'correction'
+    && normalizedIntent.kind !== 'none'
+    && normalizedIntent.kind !== 'correction_explanation'
+    && normalizedIntent.operation !== 'status'
+  ) return 'execute';
   // A self-contained normalized action is new work. Resolve this before a
   // TaskCapsule path/detail heuristic, otherwise a new artifact path or client
   // navigation can be swallowed by an unrelated unfinished file task.
@@ -859,31 +903,15 @@ export function buildConversationActionContinuationState(
   const userText = compact(input.userText, 700);
   const assistantText = compact(input.assistantText, 700);
   const calls = coalesceToolExecutionRecords(parseToolCalls({ toolCalls: input.toolCalls }))
-    .filter(call => toolCallName(call) && (toolCallFailure(call) || compact(call?.result, 240)));
+    .filter(call => toolCallName(call) && (toolCallFailure(call) || toolRecordHasTerminalPayload(call)));
   if (!userText || calls.length === 0) return null;
 
   const previous = normalizeConversationActionState(input.previous);
   const followupIntent = classifyConversationActionFollowupIntent(userText, previous);
-  // Normalization intentionally releases execution leases for blocked and
-  // terminal states. The raw update can still carry the request that produced
-  // that authoritative state, which is identity evidence for this receipt --
-  // not permission to revive the old lease.
-  const previousRequestId = compact(
-    previous?.activeRequestId || input.previous?.activeRequestId,
-    180,
-  );
-  const sameRequest = Boolean(
-    previousRequestId
-    && input.requestId
-    && previousRequestId === input.requestId,
-  );
   const samePreparedTurn = Boolean(
     previous
     && previous.latestInstruction === userText
-    && (
-      sameRequest
-      || ['planning', 'executing', 'waiting_confirmation'].includes(previous.status || '')
-    ),
+    && ['planning', 'executing', 'waiting_confirmation'].includes(previous.status || ''),
   );
   const inheritsPrevious = (
     followupIntent === 'execute'
@@ -919,7 +947,7 @@ export function buildConversationActionContinuationState(
   const currentFailure = [...calls].reverse().find(record => !toolCallSucceeded(record));
   const waitingForConfirmation = calls.some(isConfirmationBlockedToolRecord);
   const hasFailure = completion.records.some(record => !toolCallSucceeded(record));
-  const receiptDerivedStatus: ConversationTaskStatus = followupIntent === 'status' && currentFailure
+  const status: ConversationTaskStatus = followupIntent === 'status' && currentFailure
     ? 'blocked'
     : completion.complete
     ? 'completed'
@@ -928,15 +956,6 @@ export function buildConversationActionContinuationState(
     : hasFailure
       ? 'blocked'
       : 'executing';
-  const preserveAuthoritativeTerminal = Boolean(
-    samePreparedTurn
-    && sameRequest
-    && previous
-    && ['blocked', 'completed', 'cancelled'].includes(previous.status || ''),
-  );
-  const status: ConversationTaskStatus = preserveAuthoritativeTerminal
-    ? previous!.status
-    : receiptDerivedStatus;
   const currentInstructionRef = compact(input.userMessageId, 180)
     || compact(input.requestId, 180);
 
@@ -946,13 +965,7 @@ export function buildConversationActionContinuationState(
     status,
     policySnapshot: snapshotTaskPolicy(input.toolPolicy) || (inheritsPrevious ? previous?.policySnapshot : undefined),
     receipts,
-    // A terminal assistant turn no longer owns a foreground execution lease.
-    // Keeping the request id after verified completion leaves the native task
-    // dashboard showing a ghost "executing" item even though the receipts are
-    // already terminal.
-    activeRequestId: ['completed', 'cancelled'].includes(status)
-      ? undefined
-      : input.requestId || (inheritsPrevious ? previous?.activeRequestId : undefined),
+    activeRequestId: input.requestId || (inheritsPrevious ? previous?.activeRequestId : undefined),
     supersededTaskId: !inheritsPrevious && previous?.unfinished ? previous.taskId : undefined,
     revision: (inheritsPrevious ? previous?.revision || 0 : 0) + 1,
     goal,
@@ -967,9 +980,7 @@ export function buildConversationActionContinuationState(
       ...(inheritsPrevious ? previous!.sourcePaths : []),
       ...current.sourcePaths,
     ])).slice(0, 8),
-    latestBlocker: preserveAuthoritativeTerminal && status === 'blocked'
-      ? previous!.latestBlocker
-      : waitingForConfirmation
+    latestBlocker: waitingForConfirmation
       ? ''
       : completion.blocker || (currentFailure ? toolCallFailure(currentFailure) : ''),
     unfinished: status !== 'completed',
@@ -985,9 +996,7 @@ export function buildConversationActionContinuationState(
     taskCapsule: inheritsPrevious ? previous?.taskCapsule : undefined,
     updatedAt: input.updatedAt || new Date().toISOString(),
     evidenceMessageId: input.evidenceMessageId,
-    completionSource: preserveAuthoritativeTerminal
-      ? previous?.completionSource
-      : completion.complete
+    completionSource: completion.complete
       ? 'tool_receipt'
       : inheritsPrevious
         ? previous?.completionSource
@@ -1004,7 +1013,7 @@ export function prepareConversationActionTaskState(
     /** Exact persisted user message, preferred over requestId as event identity. */
     userMessageId?: string;
     forceResume?: boolean;
-    /** The current explicit action must supersede, never resume, older unfinished work. */
+    /** The current explicit workflow must supersede, never resume, older unfinished work. */
     forceNewTask?: boolean;
     /** Canonical capability planning determined that this turn needs a ledger. */
     forceTask?: boolean;
@@ -1017,7 +1026,16 @@ export function prepareConversationActionTaskState(
   const resume = !input.forceNewTask && Boolean(
     previous && previous.unfinished && (input.forceResume || followupIntent === 'execute'),
   );
-  if (followupIntent === 'status' && previous) return { state: previous, kind: 'status' };
+  // A plain status question is observational. Internal deterministic recovery
+  // may deliberately resume that exact unfinished task so a fresh receipt can
+  // be adjudicated under a new request lease. Likewise, an accepted proposal
+  // may force a new task even when its terse wording is referential.
+  if (
+    followupIntent === 'status'
+    && previous
+    && !input.forceResume
+    && !input.forceNewTask
+  ) return { state: previous, kind: 'status' };
   const contract = buildActionContract(userText);
   const isAction = (contract.applies && contract.kind !== 'none') || input.forceTask === true;
   // An unrelated conversational turn may inspect the same conversation, but
@@ -1291,12 +1309,6 @@ export function buildRecentActionContinuationBridge(
     ? durableState.toolSummaries
     : summarizeToolCalls(executionTail);
   const state = durableState || extractRecentActionContinuationState(executionTail);
-  const hasTerminalToolEvidence = executionTail.some(item =>
-    parseToolCalls(item).some(call => Boolean(
-      toolCallName(call)
-      && (toolCallFailure(call) || compact(call?.result, 240)),
-    )),
-  );
   const taskCapsule = durableState
     ? buildTaskCapsuleV1(durableState, {
         previousCapsule: durableState.taskCapsule,
@@ -1311,11 +1323,7 @@ export function buildRecentActionContinuationBridge(
   // history-only bridge is allowed only when its actual user goal carries an
   // external-action contract. Durable state remains safe because it can only
   // be created from terminal tool evidence.
-  if (
-    !durableState
-    && !isActionBearingGoal(state.goal)
-    && !(followupIntent === 'status' && hasTerminalToolEvidence)
-  ) return '';
+  if (!durableState && !isActionBearingGoal(state.goal)) return '';
 
   if (
     userTurns.length === 0
@@ -1326,7 +1334,7 @@ export function buildRecentActionContinuationBridge(
 
   return [
     '## Recent action continuation context',
-    'The current message is referential or underspecified. Resolve it against the recent task below before routing, delegating, or choosing tools.',
+    'The current message is referential or underspecified. Resolve it against the recent task below before routing or choosing tools.',
     'Recovered structured action state:',
     `- followupIntent: ${followupIntent}`,
     durableState?.taskId ? `- taskId: ${durableState.taskId}` : '',

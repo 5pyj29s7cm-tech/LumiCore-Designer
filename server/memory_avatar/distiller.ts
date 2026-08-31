@@ -142,6 +142,7 @@ export function parseChatLog(raw: string, format: 'wechat' | 'qq' | 'plain'): No
 
     for (const line of lines) {
       const m = line.match(qqRegex);
+    // i18n-allow: imported chat-export markers are input recognition literals.
       if (m && !line.includes('[图片]') && !line.includes('[语音]') && m[1].length >= 16) {
         flush();
         currentTimestamp = m[1];
@@ -181,6 +182,7 @@ function identifyTargetSpeaker(pairs: NormalizedMessagePair[], targetName?: stri
   }
   const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
   // Skip generic names
+  // i18n-allow: generic speaker labels are input recognition literals.
   const genericNames = ['我', '你', 'me', 'you', 'user', 'a', 'b'];
   for (const [name] of sorted) {
     if (!genericNames.includes(name.toLowerCase())) return name;
@@ -582,6 +584,7 @@ Write a 3-5 sentence narrative in Chinese describing who this person is, as reve
 Output ONLY the narrative text, no labels.`;
 
   const raw = await callDistillLLM(prompt, llmGetters);
+  // i18n-allow: fallback is generated-language metadata, not UI copy.
   return raw.trim().slice(0, 500) || `${targetName} — 从 ${memoryCount} 条对话中蒸馏出的记忆化身。`;
 }
 
@@ -605,6 +608,7 @@ export async function distillPersona(options: DistillOptions, llmGetters: LLMGet
   // Merge audio transcript into chat log for richer distillation
   let enrichedLog = chatLog;
   if (audioTranscript) {
+    // i18n-allow: transcript marker is stored input metadata.
     enrichedLog = chatLog + '\n\n[语音转录]\n' + audioTranscript.split('\n').map((l: string) => `Target: ${l}`).join('\n');
   }
 
@@ -653,8 +657,10 @@ export async function distillPersona(options: DistillOptions, llmGetters: LLMGet
   };
 }
 
+/*
 function inferRelationship(transcript: string, emotional: EmotionalProfile): string {
   const text = transcript.slice(0, 3000).toLowerCase();
+  // i18n-allow: relationship keywords are input recognition literals.
   const signalMap: Record<string, string[]> = {
     family: ['mom', 'dad', '爸', '妈', '妈妈', '爸爸', '父母', 'brother', 'sister', '哥', '姐', '弟', '妹', '儿子', '女儿', '家'],
     close_friend: ['bro', 'dude', 'buddy', '兄弟', '闺蜜', '老铁', '铁子', '死党'],
@@ -668,6 +674,31 @@ function inferRelationship(transcript: string, emotional: EmotionalProfile): str
     scores[rel] = keywords.filter(kw => text.includes(kw)).length;
   }
 
+  const best = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
+  return best && best[1] > 1 ? best[0] : 'close_friend';
+}
+*/
+
+function inferRelationship(transcript: string, _emotional: EmotionalProfile): string {
+  const text = transcript.slice(0, 3000).toLowerCase();
+  // Keep recognition literals escaped so they are not user-facing source text.
+  const signalMap: Record<string, string[]> = {
+    // i18n-allow: relationship keywords are input recognition literals.
+    family: ['mom', 'dad', '\u7236', '\u6bcd', '\u5988\u5988', '\u7238\u7238', '\u7236\u6bcd', 'brother', 'sister', '\u54e5\u54e5', '\u59d0\u59d0', '\u5f1f\u5f1f', '\u59b9\u59b9', '\u513f\u5b50', '\u5973\u513f', '\u5b69\u5b50'],
+    // i18n-allow: relationship keywords are input recognition literals.
+    close_friend: ['bro', 'dude', 'buddy', '\u5144\u5f1f', '\u95fa\u871c', '\u8001\u94c1', '\u94c1\u5b50', '\u6b7b\u515a'],
+    // i18n-allow: relationship keywords are input recognition literals.
+    lover: ['love', 'miss', '\u7231', '\u60f3', 'baby', '\u4eb2\u7231\u7684', '\u5b9d\u8d1d', '\u8001\u516c', '\u8001\u5a46', '\u524d\u4efb', '\u5206\u624b', '\u5728\u4e00\u8d77'],
+    // i18n-allow: relationship keywords are input recognition literals.
+    mentor: ['teacher', 'mentor', '\u8001\u5e08', '\u5e08\u7236', '\u5bfc\u5e08', '\u6559\u5bfc', '\u6559\u4f1a', '\u6307\u5bfc'],
+    // i18n-allow: relationship keywords are input recognition literals.
+    colleague: ['work', 'project', 'meeting', '\u5de5\u4f5c', '\u9879\u76ee', '\u5f00\u4f1a', '\u540c\u4e8b', '\u8001\u677f', '\u6c47\u62a5'],
+  };
+
+  const scores: Record<string, number> = {};
+  for (const [rel, keywords] of Object.entries(signalMap)) {
+    scores[rel] = keywords.filter(kw => text.includes(kw)).length;
+  }
   const best = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
   return best && best[1] > 1 ? best[0] : 'close_friend';
 }

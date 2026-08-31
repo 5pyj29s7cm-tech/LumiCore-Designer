@@ -6,6 +6,7 @@ import {
   type ConversationActionContinuationState,
 } from '../cognition/action_continuation';
 import { normalizeActionIntent, type NormalizedActionIntent } from '../cognition/normalized_action_intent';
+import { buildActionEvidenceContract } from '../cognition/action_contract';
 import {
   mergeTaskReceipts,
   taskCompletionFromReceipts,
@@ -17,18 +18,13 @@ import {
   type ConversationTaskStatus,
 } from '../cognition/task_execution_ledger';
 import { buildToolExecutionEnvelope, toolRecordIdempotencyKey } from '../tools/execution_envelope';
+import { parseReceiptObject } from '../tools/receipt_payload';
 import { inspectPersistedToolExecutionReceipt } from '../tools/persisted_execution_receipt';
 import { isConfirmationBlockedToolRecord } from '../tools/confirmation_block';
 import type { ToolExecutionRecord } from '../tools/types';
 import type { CapabilityExecutionPlan } from '../cognition/capability_execution_plan';
 import { CN_ACTION_LEDGER_MESSAGES } from '../regions/packs/cn/action_ledger_messages';
 import { detectLanguage } from '../utils/language';
-import type {
-  ModelExecutionGraph,
-  ModelGraphArbitrationReceipt,
-  ModelGraphNodeReceipt,
-} from '../agents/model_execution_graph';
-import { getCurrentIndustryCapabilityProfile } from '../regions/packs/cn/industry_capability_profile';
 import { reconcileConversationFocusThread } from './focus_threads';
 
 export interface ConversationActionTaskRow {
@@ -103,11 +99,6 @@ export interface PersistedCapabilityExecutionPlan {
   persistedAt: string;
 }
 
-export interface ConversationModelExecutionRecovery {
-  graph: ModelExecutionGraph;
-  receipts: ModelGraphNodeReceipt[];
-}
-
 function stableValue(value: unknown, depth = 0): unknown {
   if (depth > 5) return '[nested]';
   if (Array.isArray(value)) return value.slice(0, 50).map(item => stableValue(item, depth + 1));
@@ -123,14 +114,29 @@ function digest(value: unknown): string {
 }
 
 function parseObject(value: unknown): Record<string, any> {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, any>;
-  if (typeof value === 'string' && value.trim()) {
-    try {
-      const parsed = JSON.parse(value);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
-    } catch {}
-  }
-  return {};
+  return parseReceiptObject(value) || {};
+}
+
+function conservativeFallbackLedgerOperation(
+  state: ConversationActionContinuationState,
+  cancellationContract: boolean,
+): string {
+  if (cancellationContract) return 'mutate';
+  const operations = (state.receipts || [])
+    .map(receipt => receipt.capability?.operation)
+    .filter(Boolean);
+  if (operations.some(operation => (
+    operation === 'mutate' || operation === 'communicate'
+  ))) return 'mutate';
+  if (operations.some(operation => operation === 'create')) return 'create';
+  if (
+    operations.length > 0
+    && operations.every(operation => operation === 'observe' || operation === 'test')
+  ) return 'read';
+  // An unclassified durable task is an audit boundary. Under-reporting an
+  // unknown side effect as read-only is worse than conservatively labelling it
+  // as a mutation until a capability receipt proves otherwise.
+  return 'mutate';
 }
 
 function taskPersistenceUnknownMarker(
@@ -477,7 +483,18 @@ export function syncConversationActionTaskLedger(
   const state = normalizeConversationActionState(input.state);
   if (!state?.taskId) return null;
   const now = input.now || state.updatedAt || new Date().toISOString();
-  const intent = normalizeActionIntent(input.userText || state.latestInstruction || state.goal);
+  const taskText = input.userText || state.latestInstruction || state.goal;
+  const intent = normalizeActionIntent(taskText);
+  const evidenceContract = intent.kind === 'none'
+    ? buildActionEvidenceContract(taskText)
+    : null;
+  const fallbackIntentKind = evidenceContract?.applies
+    ? evidenceContract.kind
+    : 'none';
+  const fallbackOperation = conservativeFallbackLedgerOperation(
+    state,
+    evidenceContract?.preferredTools.includes('runtime_work_cancel') === true,
+  );
   const tasks = db.conversationActionTasks as ConversationActionTaskRow[];
   let task = tasks.find(candidate => candidate.id === state.taskId);
   const currentContext = parseObject(task?.context);
@@ -552,6 +569,12 @@ export function syncConversationActionTaskLedger(
   }, now);
   const correctedTarget = currentTaskCorrectionTarget(state);
   const durableTarget = durableTaskCapsuleTarget(state);
+  // Status/recheck turns may add evidence to an existing mutation task, but
+  // they must not rewrite the task's semantic identity into a read-only status
+  // query. The task remains the exact operation the receipts are proving.
+  const preservesExistingTaskIntent = Boolean(
+    task && intent.kind === 'status_query' && intent.relation === 'status'
+  );
   const values: ConversationActionTaskRow = {
     id: state.taskId,
     conversationId: input.conversation.id,
@@ -560,8 +583,16 @@ export function syncConversationActionTaskLedger(
     orgId: input.conversation.orgId || '',
     parentTaskId: parent?.id || task?.parentTaskId || '',
     rootUserMessageId,
-    intentKind: intent.kind === 'none' ? task?.intentKind || 'desktop_operation' : intent.kind,
-    operation: intent.kind === 'none' ? task?.operation || 'mutate' : intent.operation,
+    intentKind: preservesExistingTaskIntent
+      ? task!.intentKind
+      : intent.kind === 'none'
+        ? task?.intentKind || fallbackIntentKind
+        : intent.kind,
+    operation: preservesExistingTaskIntent
+      ? task!.operation
+      : intent.kind === 'none'
+        ? task?.operation || fallbackOperation
+        : intent.operation,
     goal: redactGoal(state.goal, intent),
     // The durable capsule is the evidence-derived identity. Natural-language
     // intent commonly reports only a short alias (for example `计算器` or
@@ -1118,7 +1149,7 @@ export function appendConversationActionReceipts(
 /**
  * Create the durable action row owned by a scheduled/background plan before
  * it enters the runtime queue. The deterministic task id is also the restart
- * and idempotency boundary for the downstream orchestration.
+ * and idempotency boundary for downstream execution.
  */
 export function ensureBackgroundConversationActionTask(
   db: any,
@@ -1661,162 +1692,6 @@ export function attachConversationExecutionPlan(
   return task;
 }
 
-/** Stores the compiled graph and digest-only node receipts for restart recovery. */
-export function attachConversationModelExecutionGraph(
-  db: any,
-  input: {
-    conversationId: string;
-    userId: string;
-    taskId: string;
-    graph: ModelExecutionGraph;
-    receipts: ModelGraphNodeReceipt[];
-    arbitrationReceipt?: ModelGraphArbitrationReceipt;
-    now?: string;
-  },
-): ConversationActionTaskRow | null {
-  ensureTables(db);
-  const task = (db.conversationActionTasks as ConversationActionTaskRow[]).find(candidate => (
-    candidate.id === input.taskId
-    && candidate.conversationId === input.conversationId
-    && candidate.userId === input.userId
-  ));
-  if (!task || input.graph.taskId !== task.id) return null;
-  const now = input.now || new Date().toISOString();
-  const context = parseObject(task.context);
-  const persistedGraph = {
-    ...input.graph,
-    nodes: input.graph.nodes.map(node => ({
-      ...node,
-      candidates: node.candidates.map(candidate => ({ ...candidate })),
-      dependsOn: [...node.dependsOn],
-      inputRefs: [...node.inputRefs],
-      outputSchema: { ...node.outputSchema },
-    })),
-    edges: input.graph.edges.map(edge => ({ ...edge })),
-    budgets: { ...input.graph.budgets },
-    persistedAt: now,
-  };
-  const graphHistory = (Array.isArray(context.modelExecutionGraphs) ? context.modelExecutionGraphs : [])
-    .filter((candidate: any) => candidate?.graphId !== persistedGraph.graphId)
-    .slice(-7);
-  graphHistory.push(persistedGraph);
-  const priorReceipts = Array.isArray(context.modelNodeReceipts) ? context.modelNodeReceipts : [];
-  const receiptKeys = new Set(input.receipts.map(receipt => `${receipt.graphId}:${receipt.nodeId}`));
-  const modelNodeReceipts = [
-    ...priorReceipts.filter((receipt: any) => !receiptKeys.has(`${receipt?.graphId}:${receipt?.nodeId}`)),
-    ...input.receipts.map(receipt => ({
-      graphId: receipt.graphId,
-      taskId: receipt.taskId,
-      nodeId: receipt.nodeId,
-      status: receipt.status,
-      ...(receipt.selectedCandidate ? { selectedCandidate: { ...receipt.selectedCandidate } } : {}),
-      ...(receipt.agentId ? { agentId: receipt.agentId } : {}),
-      dependencyReceiptIds: [...receipt.dependencyReceiptIds],
-      startedAt: receipt.startedAt,
-      completedAt: receipt.completedAt,
-      durationMs: receipt.durationMs,
-      nodeFingerprint: receipt.nodeFingerprint,
-      outputDigest: receipt.outputDigest,
-      evidenceKind: receipt.evidenceKind,
-      evidenceRefs: [...receipt.evidenceRefs],
-      verified: receipt.verified,
-      ...(receipt.estimatedInputTokens !== undefined
-        ? { estimatedInputTokens: receipt.estimatedInputTokens }
-        : {}),
-      ...(receipt.estimatedCostUsd !== undefined
-        ? { estimatedCostUsd: receipt.estimatedCostUsd }
-        : {}),
-      ...(receipt.reusedFromReceipt ? { reusedFromReceipt: receipt.reusedFromReceipt } : {}),
-      // Model output and free-form errors can contain user data. Durable recovery
-      // intentionally stores only digests and bounded structural metadata.
-      ...(receipt.error ? { error: 'model_node_execution_failed' } : {}),
-    })),
-  ].slice(-120);
-  task.context = JSON.stringify({
-    ...context,
-    modelExecutionGraph: persistedGraph,
-    modelExecutionGraphs: graphHistory,
-    modelNodeReceipts,
-    ...(input.arbitrationReceipt ? {
-      modelArbitrationReceipt: {
-        ...input.arbitrationReceipt,
-        selectedNodeIds: [...input.arbitrationReceipt.selectedNodeIds],
-        consideredNodeIds: [...input.arbitrationReceipt.consideredNodeIds],
-      },
-    } : {}),
-  });
-  task.updatedAt = now;
-  return task;
-}
-
-/**
- * Loads restart state only from the exact scoped task. Legacy receipts without
- * a semantic node fingerprint are excluded and therefore cannot be replayed.
- */
-export function loadConversationModelExecutionRecovery(
-  db: any,
-  input: { conversationId: string; userId: string; taskId: string },
-): ConversationModelExecutionRecovery | null {
-  ensureTables(db);
-  const task = (db.conversationActionTasks as ConversationActionTaskRow[]).find(candidate => (
-    candidate.id === input.taskId
-    && candidate.conversationId === input.conversationId
-    && candidate.userId === input.userId
-  ));
-  if (!task) return null;
-  const context = parseObject(task.context);
-  const graph = context.modelExecutionGraph as ModelExecutionGraph | undefined;
-  if (!graph || graph.taskId !== task.id || !Array.isArray(graph.nodes)) return null;
-  const receipts = (Array.isArray(context.modelNodeReceipts) ? context.modelNodeReceipts : [])
-    .filter((receipt: any) => (
-      receipt
-      && receipt.taskId === task.id
-      && receipt.graphId === graph.graphId
-      && typeof receipt.nodeId === 'string'
-      && /^[a-f0-9]{64}$/.test(String(receipt.nodeFingerprint || ''))
-      && /^[a-f0-9]{64}$/.test(String(receipt.outputDigest || ''))
-      && receipt.status === 'succeeded'
-      && receipt.verified === true
-      && Array.isArray(receipt.evidenceRefs)
-      && receipt.evidenceRefs.length > 0
-      && (
-        (receipt.evidenceKind === 'tool_terminal_verification'
-          && receipt.evidenceRefs.every((value: unknown) => /^tool:[A-Za-z0-9._:-]{1,240}$/.test(String(value || ''))))
-        || (receipt.evidenceKind === 'validated_model_output'
-          && receipt.evidenceRefs.length === 1
-          && receipt.evidenceRefs[0] === `model_output:${receipt.outputDigest}`
-          && /^model_output:[a-f0-9]{64}$/.test(String(receipt.evidenceRefs[0] || '')))
-      )
-    ))
-    .map((receipt: any): ModelGraphNodeReceipt => ({
-      graphId: receipt.graphId,
-      taskId: receipt.taskId,
-      nodeId: receipt.nodeId,
-      status: 'succeeded',
-      ...(receipt.selectedCandidate ? { selectedCandidate: { ...receipt.selectedCandidate } } : {}),
-      ...(receipt.agentId ? { agentId: String(receipt.agentId) } : {}),
-      dependencyReceiptIds: Array.isArray(receipt.dependencyReceiptIds)
-        ? receipt.dependencyReceiptIds.map(String)
-        : [],
-      startedAt: String(receipt.startedAt || ''),
-      completedAt: String(receipt.completedAt || ''),
-      durationMs: Math.max(0, Number(receipt.durationMs) || 0),
-      nodeFingerprint: receipt.nodeFingerprint,
-      outputDigest: receipt.outputDigest,
-      evidenceKind: receipt.evidenceKind,
-      evidenceRefs: receipt.evidenceRefs.map(String),
-      verified: true,
-      ...(receipt.estimatedInputTokens !== undefined
-        ? { estimatedInputTokens: Math.max(0, Number(receipt.estimatedInputTokens) || 0) }
-        : {}),
-      ...(receipt.estimatedCostUsd !== undefined
-        ? { estimatedCostUsd: Math.max(0, Number(receipt.estimatedCostUsd) || 0) }
-        : {}),
-      ...(receipt.reusedFromReceipt ? { reusedFromReceipt: String(receipt.reusedFromReceipt) } : {}),
-    }));
-  return { graph, receipts };
-}
-
 export function findConversationActionTask(
   db: any,
   input: { conversationId: string; userId: string; query?: string; taskId?: string; latest?: boolean },
@@ -1854,18 +1729,9 @@ export function findConversationActionTask(
   }
   return scopedTasks
     .map(task => {
-      const taskContext = parseObject(task.context);
-      const workflowContext = parseObject(taskContext.industryWorkflow);
-      const actionState = normalizeConversationActionState(taskContext.actionState);
-      const haystack = [
-        task.intentKind,
-        task.goal,
-        task.target,
-        task.context,
-        workflowContext.entryId,
-        workflowContext.productLine,
-        workflowContext.workspace?.name,
-      ].filter(Boolean).join(' ').toLowerCase();
+      const context = parseObject(task.context);
+      const actionState = normalizeConversationActionState(context.actionState);
+      const haystack = `${task.intentKind} ${task.goal} ${task.target} ${task.context}`.toLowerCase();
       // Receipt context contains before/after snapshots. Those observations
       // prove an action but do not identify its target: a command-center action
       // may legitimately contain before.activeTab=home, for example.
@@ -1875,9 +1741,6 @@ export function findConversationActionTask(
         task.target,
         actionState?.appTarget || '',
         actionState?.latestInstruction || '',
-        workflowContext.entryId || '',
-        workflowContext.productLine || '',
-        workflowContext.workspace?.name || '',
       ].join(' ').toLowerCase();
       const taskReceipts = scopedReceipts.filter(receipt => receipt.taskId === task.id);
       let score = 0;
@@ -1901,23 +1764,10 @@ export function findConversationActionTask(
         if (taskReceipts.some(receipt => /^wps_/i.test(receipt.toolName))) score += 32;
       }
       if (taskReceipts.some(receipt => receipt.outcome === 'verified_success')) score += 4;
-      const state = conversationActionStateFromTask(task);
-      const hasVerifiedReceipt = taskReceipts.some(receipt => receipt.outcome === 'verified_success')
-        || Boolean(state?.receipts?.some(receipt => (
-          receipt.outcome === 'success' && receipt.terminalVerification?.status === 'verified'
-        )));
-      const evidenceRank = task.status === 'completed' && task.completionSource === 'tool_receipt' && hasVerifiedReceipt
-        ? 3
-        : hasVerifiedReceipt
-          ? 2
-          : task.status === 'blocked' && !(state?.receipts || []).length
-            ? 0
-            : 1;
-      return { task, score, evidenceRank, normalizedGoal: task.goal.trim().toLowerCase() };
+      return { task, score };
     })
     .sort((left, right) => (
       right.score - left.score
-      || (left.normalizedGoal === right.normalizedGoal ? right.evidenceRank - left.evidenceRank : 0)
       || (query
         ? right.task.updatedAt.localeCompare(left.task.updatedAt)
         : right.task.createdAt.localeCompare(left.task.createdAt)
@@ -1964,350 +1814,6 @@ export function getConversationActionStateFromLedger(
   return conversationActionStateFromTask(findConversationActionTask(db, input));
 }
 
-function industryWorkflowStatusLabel(status: ConversationTaskStatus, finalReceiptVerified = true): string {
-  if (status === 'completed') return finalReceiptVerified
-    ? '已完成（最终回执已验证）'
-    : '已完成（无行业最终回执）';
-  if (status === 'waiting_confirmation') return '等待确认';
-  if (status === 'blocked') return '受阻';
-  if (status === 'cancelled') return '已取消';
-  if (status === 'executing') return '执行中';
-  return '准备中';
-}
-
-function receiptPayload(receipt: any): Record<string, any> {
-  if (receipt?.receipt && typeof receipt.receipt === 'object') return receipt.receipt;
-  return parseObject(receipt?.result);
-}
-
-function describeIndustryConfirmationBoundary(values: unknown[]): string[] {
-  const text = values.map(String).join(' ').toLowerCase();
-  const labels: string[] = [];
-  const add = (label: string) => { if (!labels.includes(label)) labels.push(label); };
-  if (/customer messages?|communications?|\bmessages?\b|send(?:ing)?/.test(text)) add('发送客户消息');
-  if (/publish|publishing/.test(text)) add('发布内容');
-  if (/refund/.test(text)) add('退款');
-  if (/compensation/.test(text)) add('赔偿');
-  if (/binding promises?|promise/.test(text)) add('承诺处理结果');
-  if (/price changes?|repric/.test(text)) add('改价');
-  if (/listing changes?|\blisting\b|\bdelisting\b|list(?:ing)?\s+(?:or\s+)?delist/.test(text)) add('上下架');
-  if (/external store changes?|store mutation|platform mutation/.test(text)) add('店铺外部修改');
-  if (/advertising spend|\bad spend\b|campaign spend/.test(text)) add('广告投放');
-  if (/product selection/.test(text)) add('选品');
-  if (/procurement|purchas(?:e|ing)/.test(text)) add('采购');
-  if (/submit|submission|filing/.test(text)) add('提交或申报');
-  if (/payment/.test(text)) add('付款');
-  if (/sign(?:ing|ature)?/.test(text)) add('签署');
-  if (/external delivery|client delivery|client-facing claims?|customer delivery/.test(text)) add('客户外发');
-  if (/professional review|professional sign-off|structural|\bmep\b|site dimensions?/.test(text)) add('专业复核或签认');
-  if (/final quotations?|final selections?|commercial terms?|commercial acceptance/.test(text)) add('最终方案、报价或商业验收');
-  if (/overwrit(?:e|ing) source drawings?/.test(text)) add('覆盖源图');
-  if (/licensed assets?|copyright/.test(text)) add('版权素材');
-  return labels;
-}
-
-interface IndustryWorkflowLedgerSummary {
-  workflowType: string;
-  status: string;
-  keyResults: string[];
-  deliverables: string[];
-  confirmationBoundaries: string[];
-  blocker: string;
-}
-
-function summarizeIndustryWorkflowLedger(
-  task: ConversationActionTaskRow,
-  state: ConversationActionContinuationState,
-): IndustryWorkflowLedgerSummary | null {
-  const context = parseObject(task.context);
-  if (!context.industryWorkflow) return null;
-  const receipts = state.receipts || [];
-  const start = receipts.find(receipt => receipt.name === 'industry_workflow_start');
-  const completion = [...receipts].reverse().find(receipt => (
-    receipt.name === 'industry_workflow_complete'
-    && receipt.outcome === 'success'
-    && receipt.terminalVerification?.status === 'verified'
-  ));
-  const startResult = receiptPayload(start);
-  const deterministicCompletion = [...receipts].reverse().find(receipt => {
-    if (!receipt.name.startsWith('industry_')) return false;
-    if (['industry_workflow_start', 'industry_workspace_status', 'industry_workflow_complete'].includes(receipt.name)) return false;
-    if (receipt.outcome !== 'success' || receipt.terminalVerification?.status !== 'verified') return false;
-    const payload = receiptPayload(receipt);
-    return payload.ok === true
-      && (payload.status === 'verified' || payload.verification?.passed === true || payload.verification?.status === 'passed');
-  });
-  const terminalCompletion = completion || deterministicCompletion;
-  const completionResult = receiptPayload(terminalCompletion);
-  const workflowTask = parseObject(completionResult.task);
-  const workflowType = String(startResult?.entry?.displayName || workflowTask.title || context.industryWorkflow.entryId || '行业工作流');
-  const workspaceName = String(context.industryWorkflow?.workspace?.name || '').trim();
-  const meaningfulArtifacts = (Array.isArray(workflowTask.artifacts) ? workflowTask.artifacts : [])
-    .filter((artifact: any) => artifact && (
-      String(artifact.status || '').toLowerCase() !== 'planned'
-      || artifact.content
-      || artifact.filePath
-      || artifact.url
-    ));
-  const verificationChecks = Array.isArray(completionResult?.verification?.checks)
-    ? completionResult.verification.checks
-    : [];
-  const verifiedArtifactLabels = verificationChecks
-    .filter((check: any) => check?.id === 'artifact_labels' && check?.passed === true)
-    .flatMap((check: any) => String(check.detail || '')
-      .replace(/^(?:已记录|recorded)\s*[：:]\s*/iu, '')
-      .split(/[、,，;；]/u)
-      .map((label: string) => label.trim())
-      .filter(Boolean));
-  const deliverables = [...new Set([...meaningfulArtifacts
-    .map((artifact: any) => String(artifact.label || '').trim())
-    .filter(Boolean), ...verifiedArtifactLabels])];
-  const draftCount = Array.isArray(workflowTask.drafts) ? workflowTask.drafts.length : 0;
-  const verificationPassed = completionResult?.verification?.passed === true
-    || completionResult?.verificationStatus === 'passed'
-    || completionResult?.verification?.status === 'passed'
-    || completionResult?.status === 'verified';
-  const keyResults: string[] = [];
-  if (workspaceName) keyResults.push(`绑定并沿用“${workspaceName}”工作区`);
-  if (draftCount) keyResults.push(`生成并归档 ${draftCount} 份草稿`);
-  const deterministicMessage = deterministicCompletion
-    ? String(completionResult.message || '').split(/\r?\n/u).map(line => line.trim().replace(/[。；;]+$/u, '')).find(Boolean)
-    : '';
-  if (deterministicMessage) keyResults.push(deterministicMessage);
-  if (verificationPassed) keyResults.push('最终结果校验通过');
-  if (!keyResults.length) {
-    const verifiedReceipts = receipts.filter(receipt => (
-      receipt.outcome === 'success' && receipt.terminalVerification?.status === 'verified'
-    )).length;
-    keyResults.push(verifiedReceipts ? `核对 ${verifiedReceipts} 个已验证执行回执` : '尚无可验证执行结果');
-  }
-  const confirmationRequired = Array.isArray(workflowTask.confirmationRequired)
-    ? workflowTask.confirmationRequired
-    : [];
-  const verifiedConfirmationBoundaries = verificationChecks
-    .filter((check: any) => check?.id === 'confirmation_boundaries' && check?.passed === true)
-    .map((check: any) => String(check.detail || '').trim())
-    .filter(Boolean);
-  return {
-    workflowType,
-    status: industryWorkflowStatusLabel(task.status, Boolean(terminalCompletion)),
-    keyResults,
-    deliverables,
-    confirmationBoundaries: describeIndustryConfirmationBoundary([
-      ...confirmationRequired,
-      ...verifiedConfirmationBoundaries,
-    ]),
-    blocker: String(task.blocker || '').trim(),
-  };
-}
-
-function formatIndustryWorkflowLedgerStatus(
-  task: ConversationActionTaskRow,
-  state: ConversationActionContinuationState,
-): string | null {
-  const summary = summarizeIndustryWorkflowLedger(task, state);
-  if (!summary) return null;
-  const did = [...summary.keyResults];
-  if (summary.deliverables.length) did.push(`形成交付物“${summary.deliverables.slice(0, 3).join('、')}”`);
-  const didNot = summary.confirmationBoundaries.length
-    ? `未执行${summary.confirmationBoundaries.join('、')}；这些动作仍需逐项确认和真实平台回执。`
-    : '没有把未验证步骤描述成已完成。';
-  const blocker = summary.blocker ? `\n阻塞原因：${summary.blocker}` : '';
-  return [
-    `任务类型：${summary.workflowType}`,
-    `当前状态：${summary.status}`,
-    `已做：${did.join('；')}。`,
-    `未做：${didNot}${blocker}`,
-  ].join('\n');
-}
-
-function industryTaskEvidenceRank(db: any, task: ConversationActionTaskRow): number {
-  const state = conversationActionStateFromTask(task);
-  const hasVerifiedReceipt = (db.conversationActionReceipts as ConversationActionReceiptRow[])
-    .some(receipt => receipt.taskId === task.id && receipt.outcome === 'verified_success')
-    || Boolean(state?.receipts?.some(receipt => (
-      receipt.outcome === 'success' && receipt.terminalVerification?.status === 'verified'
-    )));
-  if (task.status === 'completed' && task.completionSource === 'tool_receipt' && hasVerifiedReceipt) return 3;
-  if (hasVerifiedReceipt) return 2;
-  if (task.status === 'blocked' && !(state?.receipts || []).length) return 0;
-  return 1;
-}
-
-function findLatestIndustryTaskForEntry(
-  db: any,
-  input: { conversationId: string; userId: string; entryId: string; acrossConversations?: boolean },
-): ConversationActionTaskRow | null {
-  const currentConversation = Array.isArray(db.conversations)
-    ? db.conversations.find((conversation: any) => conversation.id === input.conversationId)
-    : null;
-  const expectedDomain = String(currentConversation?.domain || 'personal');
-  const expectedOrgId = String(currentConversation?.orgId || '');
-  const candidates = (Array.isArray(db.conversationActionTasks) ? db.conversationActionTasks : [])
-    .filter(task => {
-      if (task.userId !== input.userId) return false;
-      if (input.acrossConversations) {
-        if (String(task.domain || 'personal') !== expectedDomain || String(task.orgId || '') !== expectedOrgId) return false;
-      } else if (task.conversationId !== input.conversationId) {
-        return false;
-      }
-      const workflow = parseObject(parseObject(task.context).industryWorkflow);
-      if (String(workflow.entryId || '') !== input.entryId) return false;
-      const state = conversationActionStateFromTask(task);
-      return Boolean(state?.receipts?.some(receipt => (
-        receipt.name === 'industry_workflow_start'
-        || receipt.name === 'industry_workflow_complete'
-        || (receipt.name.startsWith('industry_') && receipt.name !== 'industry_workspace_status')
-      )));
-    })
-    .map(task => ({
-      task,
-      evidenceRank: industryTaskEvidenceRank(db, task),
-      normalizedGoal: task.goal.trim().toLowerCase(),
-    }))
-    .sort((left, right) => (
-      left.normalizedGoal === right.normalizedGoal
-        ? right.evidenceRank - left.evidenceRank || right.task.updatedAt.localeCompare(left.task.updatedAt)
-        : right.task.updatedAt.localeCompare(left.task.updatedAt)
-    ));
-  return candidates[0]?.task || null;
-}
-
-function designProjectStageStatusLabel(stage: any): string {
-  const status = String(stage?.status || 'not_started');
-  const verificationStatus = String(stage?.verificationStatus || '').trim();
-  if (status === 'completed' && verificationStatus === 'passed') return '已完成（最终回执已验证）';
-  if (status === 'completed') return '已完成（等待最终验证）';
-  if (status === 'blocked') return `受阻${verificationStatus ? `（验证状态：${verificationStatus}）` : ''}`;
-  if (status === 'waiting_confirmation') return '等待确认';
-  if (status === 'in_progress') return '执行中';
-  return '尚未开始';
-}
-
-function formatDesignProjectWorkflowLedgerStatus(
-  db: any,
-  input: { conversationId: string; userId: string },
-  requestedEntries: Array<{ entryId: string; displayName: string; contract: { confirmationBoundaries: string[] } }>,
-  profileDisplayName: string,
-): string | null {
-  const currentConversation = Array.isArray(db.conversations)
-    ? db.conversations.find((conversation: any) => conversation.id === input.conversationId)
-    : null;
-  const expectedOrgId = String(currentConversation?.domain || 'personal') === 'work'
-    ? String(currentConversation?.orgId || '')
-    : `personal:${input.userId}`;
-  const ownedProjects = (Array.isArray(db.interiorProjects) ? db.interiorProjects : [])
-    .filter((project: any) => project?.ownerUserId === input.userId && project?.workflow?.stages)
-    .sort((left: any, right: any) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
-  const project = ownedProjects.find((candidate: any) => String(candidate.orgId || '') === expectedOrgId)
-    || ownedProjects[0];
-  if (!project) return null;
-
-  const sections = requestedEntries.map(entry => {
-    const stage = project.workflow.stages?.[entry.entryId];
-    if (!stage) {
-      return [
-        `【${entry.displayName}】`,
-        '最近任务状态：无项目阶段记录',
-        `关键结果：项目“${project.name}”中没有该阶段的持久化回执`,
-        '交付物：无最终回执记录',
-        '确认边界：没有把未验证步骤描述成已完成',
-      ].join('\n');
-    }
-    const taskId = String(stage.currentTaskId || '').trim();
-    const verificationStatus = String(stage.verificationStatus || '').trim();
-    const blocker = String(stage.blocker || '').trim();
-    const keyResults = [
-      `项目“${project.name}”`,
-      taskId ? `任务 ${taskId}` : '',
-      verificationStatus ? `验证状态 ${verificationStatus}` : '',
-      blocker ? `阻塞原因：${blocker}` : '',
-    ].filter(Boolean);
-    const deliverables = (Array.isArray(stage.artifacts) ? stage.artifacts : [])
-      .map((artifact: any) => {
-        const label = String(artifact?.label || '').trim();
-        const fileName = String(artifact?.fileName || '').trim();
-        return label && fileName && label !== fileName ? `${label}（${fileName}）` : label || fileName;
-      })
-      .filter(Boolean);
-    const boundaries = describeIndustryConfirmationBoundary(entry.contract.confirmationBoundaries || []);
-    return [
-      `【${entry.displayName}】`,
-      `最近任务状态：${designProjectStageStatusLabel(stage)}`,
-      `关键结果：${keyResults.join('；') || '尚无可验证执行结果'}`,
-      `交付物：${deliverables.length ? deliverables.join('、') : '最终回执中未记录交付物'}`,
-      `确认边界：${boundaries.length ? `${boundaries.join('、')}仍需逐项确认和真实平台回执` : '没有把未验证步骤描述成已完成'}`,
-    ].join('\n');
-  });
-  return [
-    `行业任务账本汇总（${profileDisplayName}）`,
-    ...sections,
-    '本次仅读取已存在的项目账本与最终回执；未重新执行工作流、未调用外部工具、未创建新任务、未进行客户外发、覆盖源图或专业签认。',
-  ].join('\n\n');
-}
-
-function formatMultiIndustryWorkflowLedgerStatus(
-  db: any,
-  input: { conversationId: string; userId: string; query?: string },
-): string | null {
-  const query = String(input.query || '').trim();
-  const profile = getCurrentIndustryCapabilityProfile();
-  if (!profile || !/(?:状态|账本|回执|最近任务|关键结果|交付物|确认边界)/u.test(query)) return null;
-  const requestedEntries = profile.entries.filter(entry => query.includes(entry.displayName));
-  if (requestedEntries.length < 2) return null;
-
-  if (profile.productLine === 'design') {
-    const designProjectStatus = formatDesignProjectWorkflowLedgerStatus(
-      db,
-      input,
-      requestedEntries,
-      profile.displayName,
-    );
-    if (designProjectStatus) return designProjectStatus;
-  }
-
-  const sections = requestedEntries.map(entry => {
-    const task = findLatestIndustryTaskForEntry(db, {
-      conversationId: input.conversationId,
-      userId: input.userId,
-      entryId: entry.entryId,
-      acrossConversations: true,
-    });
-    if (!task) {
-      return [
-        `【${entry.displayName}】`,
-        '最近任务状态：无已存在的行业任务记录',
-        '关键结果：无可验证执行结果',
-        '交付物：无最终回执记录',
-        '确认边界：无任务回执，未执行任何外部修改',
-      ].join('\n');
-    }
-    const state = conversationActionStateFromTask(task);
-    const summary = state ? summarizeIndustryWorkflowLedger(task, state) : null;
-    if (!summary) {
-      return [
-        `【${entry.displayName}】`,
-        `最近任务状态：${industryWorkflowStatusLabel(task.status)}`,
-        '关键结果：无可验证执行结果',
-        '交付物：无最终回执记录',
-        `确认边界：${task.blocker ? `任务受阻：${task.blocker}` : '没有把未验证步骤描述成已完成'}`,
-      ].join('\n');
-    }
-    return [
-      `【${entry.displayName}】`,
-      `最近任务状态：${summary.status}`,
-      `关键结果：${summary.keyResults.join('；')}${summary.blocker ? `；阻塞原因：${summary.blocker}` : ''}`,
-      `交付物：${summary.deliverables.length ? summary.deliverables.join('、') : '最终回执中未记录交付物'}`,
-      `确认边界：${summary.confirmationBoundaries.length ? `${summary.confirmationBoundaries.join('、')}仍需逐项确认和真实平台回执` : '没有把未验证步骤描述成已完成'}`,
-    ].join('\n');
-  });
-  return [
-    `行业任务账本汇总（${profile.displayName}）`,
-    ...sections,
-    '本次仅查询既有任务账本与最终回执；未重新执行工作流、未调用外部工具、未创建新任务、未进行外部修改。',
-  ].join('\n\n');
-}
-
 /**
  * Resolve the immutable task already bound to a request. Unlike the general
  * ledger selector, this cannot be displaced by a newer status/audit task.
@@ -2342,13 +1848,9 @@ export function formatConversationActionLedgerStatus(
   db: any,
   input: { conversationId: string; userId: string; query?: string; taskId?: string },
 ): string | null {
-  const multiIndustryStatus = formatMultiIndustryWorkflowLedgerStatus(db, input);
-  if (multiIndustryStatus) return multiIndustryStatus;
   const task = findConversationActionTask(db, input);
   const state = conversationActionStateFromTask(task);
   if (!state) return null;
-  const industryStatus = task ? formatIndustryWorkflowLedgerStatus(task, state) : null;
-  if (industryStatus) return industryStatus;
   const query = String(input.query || '');
   const taskReceipts = task
     ? (db.conversationActionReceipts as ConversationActionReceiptRow[])

@@ -21,7 +21,7 @@ const COPY = {
     nextSteps: 'Next steps',
     result: 'Result',
     error: 'Error',
-    workers: 'Workers',
+    workers: 'Active runs',
     updated: 'Updated',
     goal: 'Overall goal',
     phase: 'Current phase',
@@ -33,7 +33,7 @@ const COPY = {
     pause: 'Pause task',
     resume: 'Resume task',
     cancel: 'Cancel task',
-    cancelRequested: 'Cancellation requested; waiting for the active worker to stop safely.',
+    cancelRequested: 'Cancellation requested; waiting for the active run to stop safely.',
     controlError: 'Task control failed',
     empty: {
       completed: 'No completed item recorded.',
@@ -83,7 +83,7 @@ const COPY = {
     nextSteps: '下一步',
     result: '结果',
     error: '错误',
-    workers: '执行者',
+    workers: '运行项',
     updated: '更新时间',
     empty: {
       completed: '暂无已完成项。',

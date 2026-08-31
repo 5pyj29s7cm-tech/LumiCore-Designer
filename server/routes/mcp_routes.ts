@@ -69,41 +69,6 @@ export function mountMcpRoutes(router: Router) {
     }
   });
 
-  router.put("/mcp/:name/enabled", requireAuth, requireAdmin, requireLocalRequest, async (req, res) => {
-    const name = String(req.params.name || '').trim();
-    const enabled = req.body?.enabled;
-    if (typeof enabled !== 'boolean') {
-      return res.status(400).json({ error: 'enabled must be a boolean' });
-    }
-
-    const servers = getMCPConfig();
-    const current = servers[name];
-    if (!current) return res.status(404).json({ error: `Unknown MCP server: ${name}` });
-
-    servers[name] = { ...current, enabled };
-    mcpManager.saveConfig(servers);
-
-    if (!enabled) {
-      await mcpManager.disconnectServer(name);
-      await recoverServerTools(name, []);
-      return res.json({ success: true, name, enabled, tools: [] });
-    }
-
-    try {
-      const tools = await mcpManager.restartServer(name);
-      const registered = await recoverServerTools(name, tools);
-      return res.json({ success: true, name, enabled, tools, registered });
-    } catch (err: any) {
-      return res.status(503).json({
-        error: err?.message || `Failed to start MCP server: ${name}`,
-        name,
-        enabled,
-        setupHint: current.setupHint,
-        setupUrl: current.setupUrl,
-      });
-    }
-  });
-
   router.get("/mcp/health", requireAuth, requireAdmin, requireLocalRequest, (_req, res) => {
     res.json({ servers: projectMcpServerHealth(mcpManager.getServerHealth()) });
   });

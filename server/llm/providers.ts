@@ -198,33 +198,6 @@ function parseLegacyParameterValue(value: string): unknown {
   try { return JSON.parse(decoded); } catch { return decoded; }
 }
 
-/** Normalize only known DeepSeek DSML tool tags into the legacy XML shape. */
-export function normalizeLegacyToolProtocolText(text: string | null): string {
-  return String(text || '').replace(
-    /<\s*(\/?)\s*[|｜]{1,4}\s*DSML\s*[|｜]{1,4}\s*(tool_calls|function_calls|invoke|parameter)\b([^>]*)>/giu,
-    (_match, closing: string, name: string, suffix: string) => `<${closing}${name}${suffix}>`,
-  );
-}
-
-function parseLegacyBracketArguments(value: string): Record<string, any> {
-  const raw = String(value || '').trim();
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, any>
-      : {};
-  } catch {
-    const args: Record<string, any> = {};
-    for (const part of raw.split(/\s*,\s*/g)) {
-      const match = part.match(/^([A-Za-z][A-Za-z0-9_.:-]*)\s*(?:=|:)\s*([\s\S]+)$/);
-      if (!match) continue;
-      args[match[1]] = parseLegacyParameterValue(match[2]);
-    }
-    return args;
-  }
-}
-
 /**
  * Some OpenAI-compatible models occasionally print the older XML function-call
  * protocol in message content instead of returning structured tool_calls. Only
@@ -234,7 +207,7 @@ export function parseLegacyXmlToolCalls(
   text: string | null,
   toolDeclarations: ToolDeclaration[],
 ): ParsedToolCall[] | null {
-  const raw = normalizeLegacyToolProtocolText(text);
+  const raw = String(text || '');
   if (!/<(?:function_calls|invoke)\b/i.test(raw)) return null;
   const allowed = new Set(toolDeclarations.map(declaration => declaration.function.name));
   if (allowed.size === 0) return null;
@@ -259,55 +232,16 @@ export function parseLegacyXmlToolCalls(
   return calls.length > 0 ? calls : null;
 }
 
-/** Convert only declared compact bracket calls into structured tool calls. */
-export function parseLegacyBracketToolCalls(
-  text: string | null,
-  toolDeclarations: ToolDeclaration[],
-): ParsedToolCall[] | null {
-  const raw = String(text || '').trim();
-  const allowed = new Set(toolDeclarations.map(declaration => declaration.function.name));
-  if (!raw || allowed.size === 0) return null;
-
-  const candidates: Array<{ name: string; args: string }> = [];
-  const suffixCallRe = /\[(?:[^\]\r\n]{1,48})\]\s*([A-Za-z][A-Za-z0-9_.:-]{1,127})\s*\(([\s\S]*?)\)/giu;
-  for (const match of raw.matchAll(suffixCallRe)) {
-    candidates.push({ name: match[1], args: match[2] || '' });
-  }
-  const namedBracketRe = /\[(?:调用|call(?:ing)?|tool)\s+([A-Za-z][A-Za-z0-9_.:-]{1,127})\]\s*(\{[\s\S]*?\})?/giu;
-  for (const match of raw.matchAll(namedBracketRe)) {
-    candidates.push({ name: match[1], args: match[2] || '' });
-  }
-
-  const calls: ParsedToolCall[] = [];
-  for (const candidate of candidates) {
-    if (!allowed.has(candidate.name)) continue;
-    calls.push({
-      id: `legacy-bracket-${calls.length}-${candidate.name}`,
-      name: candidate.name,
-      arguments: parseLegacyBracketArguments(candidate.args),
-    });
-  }
-  return calls.length > 0 ? calls : null;
-}
-
 function createLegacyProtocolChunkFilter(onChunk: (chunk: string) => void) {
   let state: 'pending' | 'normal' | 'suppressed' = 'pending';
   let pending = '';
   const prefixes = ['<function_calls', '<tool_calls', '<invoke', '```xml<function_calls', '```xml<tool_calls'];
-  const dsmlPrefixes = ['<｜dsml｜', '<｜｜dsml｜｜', '<|dsml|', '<||dsml||'];
   return {
     emit(chunk: string) {
       if (state === 'normal') { onChunk(chunk); return; }
       if (state === 'suppressed') return;
       pending += chunk;
-      const rawProbe = pending.trimStart().replace(/\s+/g, '').toLowerCase();
-      if (dsmlPrefixes.some(prefix => prefix.startsWith(rawProbe))) return;
-      if (dsmlPrefixes.some(prefix => rawProbe.startsWith(prefix))) {
-        state = 'suppressed';
-        pending = '';
-        return;
-      }
-      const probe = normalizeLegacyToolProtocolText(pending).trimStart().replace(/\s+/g, '').toLowerCase();
+      const probe = pending.trimStart().replace(/\s+/g, '').toLowerCase();
       if (!probe) return;
       if (prefixes.some(prefix => prefix.startsWith(probe))) return;
       if (prefixes.some(prefix => probe.startsWith(prefix))) {
@@ -701,10 +635,7 @@ function extractUsage(rawResponse: any) {
   };
 }
 
-export function parseDeepSeekResponse(
-  rawResponse: any,
-  toolDeclarations: ToolDeclaration[] = [],
-): NormalizedLLMResponse {
+export function parseDeepSeekResponse(rawResponse: any): NormalizedLLMResponse {
   const message = rawResponse.choices?.[0]?.message;
   if (!message) return { text: null, toolCalls: null };
 
@@ -723,16 +654,6 @@ export function parseDeepSeekResponse(
       return { id: tc.id, name: tc.function?.name || '', arguments: args };
     });
     return { text, toolCalls, reasoningContent, usage };
-  }
-
-  const legacyToolCalls = parseLegacyXmlToolCalls(text, toolDeclarations);
-  if (legacyToolCalls) {
-    return { text: null, toolCalls: legacyToolCalls, reasoningContent, usage };
-  }
-
-  const bracketToolCalls = parseLegacyBracketToolCalls(text, toolDeclarations);
-  if (bracketToolCalls) {
-    return { text: null, toolCalls: bracketToolCalls, reasoningContent, usage };
   }
 
   return { text, toolCalls: null, reasoningContent, usage };
@@ -1432,7 +1353,7 @@ export async function makeLLMCallDirect(
         if (extensionProvider) throw extensionProviderFailure(config.provider, error);
         throw error;
       }
-      return parseDeepSeekResponse(response, toolDeclarations);
+      return parseDeepSeekResponse(response);
     });
   }
 
@@ -2078,10 +1999,6 @@ export async function makeLLMCallStreamingDirect(
         const legacyToolCalls = parseLegacyXmlToolCalls(text, toolDeclarations);
         if (legacyToolCalls) {
           return { text: null, toolCalls: legacyToolCalls, reasoningContent, usage };
-        }
-        const bracketToolCalls = parseLegacyBracketToolCalls(text, toolDeclarations);
-        if (bracketToolCalls) {
-          return { text: null, toolCalls: bracketToolCalls, reasoningContent, usage };
         }
         return { text, toolCalls: null, reasoningContent, usage };
       } catch (error) {
