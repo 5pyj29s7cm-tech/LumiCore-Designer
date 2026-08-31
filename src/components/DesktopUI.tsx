@@ -3497,12 +3497,6 @@ export function DesktopUI({
       }]);
     };
 
-    const onDelegation = (data: any) => {
-      const task = normalizeBackgroundTask(data);
-      if (!task) return;
-      recordBackgroundTaskStep(task);
-    };
-
     const onBackgroundTaskUpdate = (data: any) => {
       const task = normalizeBackgroundTask(data);
       if (!task) return;
@@ -3530,7 +3524,6 @@ export function DesktopUI({
     };
 
     socket.on('agent:status', onStatus);
-    socket.on('agent:delegation', onDelegation);
     socket.on('agent:background_task_update', onBackgroundTaskUpdate);
     socket.on('agent:desktop_control_state', onDesktopControlState);
     socket.on('agent:tool_call', onToolCall);
@@ -3565,12 +3558,6 @@ export function DesktopUI({
         });
       }
     };
-    const onAgentPromoted = (data: { agentName: string; skillName?: string }) => {
-      const msg = data.skillName
-        ? `Agent "${data.agentName}" auto-promoted with skill "${data.skillName}"`
-        : `Agent "${data.agentName}" has been auto-created`;
-      addNotification({ type: 'system', title: 'Agent Promoted', message: msg });
-    };
     const onAgentNotification = (data: { type: string; level: string; message: string }) => {
       addNotification({ type: data.level === 'critical' ? 'warning' : data.level === 'warning' ? 'warning' : 'info', title: data.type || 'Lumi', message: data.message });
     };
@@ -3597,7 +3584,6 @@ export function DesktopUI({
       // Token usage updated — TokenDashboard handles REST polling, this is real-time supplement
     };
     socket.on('preferences:changed', onPreferencesChanged);
-    socket.on('agent:promoted', onAgentPromoted);
     socket.on('agent:notification', onAgentNotification);
     socket.on('wake:detected', onWakeDetected);
     socket.on('wake:error', onWakeError);
@@ -3606,7 +3592,6 @@ export function DesktopUI({
 
     return () => {
       socket.off('agent:status', onStatus);
-      socket.off('agent:delegation', onDelegation);
       socket.off('agent:background_task_update', onBackgroundTaskUpdate);
       socket.off('agent:desktop_control_state', onDesktopControlState);
       socket.off('agent:tool_call', onToolCall);
@@ -3615,7 +3600,6 @@ export function DesktopUI({
       socket.off('agent:error', onError);
       socket.off('agent:proactive', onProactive);
       socket.off('preferences:changed', onPreferencesChanged);
-      socket.off('agent:promoted', onAgentPromoted);
       socket.off('agent:notification', onAgentNotification);
       socket.off('wake:detected', onWakeDetected);
       socket.off('wake:error', onWakeError);
