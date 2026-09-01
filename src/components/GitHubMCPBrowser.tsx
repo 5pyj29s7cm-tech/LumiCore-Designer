@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { motion } from 'motion/react';
-import { Search, Github, Star, ExternalLink, Download, Loader2, Package, Globe, ShieldCheck } from 'lucide-react';
+import { Search, Github, Star, ExternalLink, Download, Loader2, Package, Globe, ShieldCheck, Wrench } from 'lucide-react';
 import { toast } from 'sonner';
 import { uiMessage } from '../i18n/uiMessages';
 
@@ -38,7 +38,6 @@ export function GitHubMCPBrowser({ t, embedded = false }: { t?: any; embedded?: 
   const [results, setResults] = useState<MCPSearchResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
-  const [installing, setInstalling] = useState<string | null>(null);
   const [langFilter, setLangFilter] = useState('');
   const [sortBy, setSortBy] = useState<'stars' | 'relevance'>('stars');
   const [managedConnectors, setManagedConnectors] = useState<ManagedConnector[]>([]);
@@ -102,43 +101,6 @@ export function GitHubMCPBrowser({ t, embedded = false }: { t?: any; embedded?: 
     }
   };
 
-  const handleInstall = async (repo: MCPSearchResult) => {
-    setInstalling(String(repo.name));
-    try {
-      const skillName = source === 'github'
-        ? String(repo.name).split('/').pop() || String(repo.name)
-        : String(repo.name);
-      const body = source === 'github'
-        ? {
-            skillId: `github-${repo.id}`,
-            skillName,
-            installSource: 'github',
-            repoUrl: repo.url,
-          }
-        : {
-            skillId: `npm-${repo.name}`,
-            skillName,
-            installSource: 'npm',
-            npmPackage: repo.name,
-          };
-      const res = await fetch('/api/marketplace/skills/acquire', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify(body),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.success === false) {
-        throw new Error(data.error || data.message || 'Install failed');
-      }
-      toast.success(data.message || t?.mcpInstallSuccess || 'Installed and connected.');
-    } catch (err: any) {
-      toast.error(err?.message || t?.mcpInstallFailed || 'This package could not be installed as a runnable MCP skill.');
-    } finally {
-      setInstalling(null);
-    }
-  };
-
   const changeSource = (s: SearchSource) => {
     setSource(s);
     setResults([]);
@@ -165,15 +127,24 @@ export function GitHubMCPBrowser({ t, embedded = false }: { t?: any; embedded?: 
             <Globe size={20} className="text-purple-400" />
           )}
         </div>
-        <div>
+        <div className="min-w-0 flex-1">
           <h2 className="text-sm font-bold text-white/90">{t?.mcpBrowserTitle || 'MCP Browser'}</h2>
-          <p className="text-xs text-white/55">{t?.mcpBrowserDesc || 'Discover and install community MCP servers'}</p>
+          <p className="text-xs text-white/55">{t?.mcpBrowserDesc || 'Discover external MCP projects for review'}</p>
         </div>
+        <button
+          onClick={() => window.dispatchEvent(new CustomEvent('lumi:client-action', {
+            detail: { action: 'open_settings', section: 'mcp' },
+          }))}
+          className="inline-flex items-center gap-2 rounded-xl border border-purple-400/20 bg-purple-500/10 px-3 py-2 text-xs font-bold text-purple-200 transition-colors hover:bg-purple-500/20"
+        >
+          <Wrench size={13} />
+          {t?.mcpOpenSettings || 'Open MCP Settings'}
+        </button>
       </div>
 
       <div className="flex-1 p-6 space-y-4">
         <div className="rounded-xl border border-amber-400/15 bg-amber-500/10 px-4 py-3 text-xs leading-relaxed text-amber-100/75">
-          {t?.mcpInstallNotice || 'Only MCP-compatible packages can be installed. Lumi will clone/install/start the package first; if it cannot run as an MCP server, it will fail with a clear message instead of pretending to be ready.'}
+          {t?.mcpInstallNotice || 'Discovery is read-only. Review the source and permissions, then connect an approved MCP endpoint in Settings or use a curated Lumi candidate; search results are never executed directly.'}
         </div>
         {managedConnectors.length > 0 && (
           <section className="space-y-3 rounded-2xl border border-violet-400/15 bg-violet-500/5 p-4">
@@ -386,13 +357,6 @@ export function GitHubMCPBrowser({ t, embedded = false }: { t?: any; embedded?: 
                   >
                     <ExternalLink size={14} />
                   </a>
-                  <button
-                    onClick={() => handleInstall(repo)}
-                    disabled={installing === String(repo.name)}
-                    className="p-2 rounded-lg text-emerald-400/60 hover:text-emerald-400 hover:bg-emerald-500/10 transition-all"
-                  >
-                    {installing === String(repo.name) ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-                  </button>
                 </div>
               </motion.div>
             ))

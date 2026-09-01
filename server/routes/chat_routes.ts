@@ -19,9 +19,6 @@ import {
 import { buildLumiTurnDispatch } from "../cognition/turn_dispatch";
 import { buildLumiExecutionPipeline } from "../cognition/execution_pipeline";
 import {
-  buildModelToolProjection,
-} from "../cognition/capability_selection";
-import {
   createPreFinalizationTextGate,
   shouldDeferModelOutputUntilFinalized,
 } from "../cognition/response_delivery";
@@ -440,6 +437,44 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
       operationMode: 'assistant',
       targetIsLumi: true,
     });
+    const restBoundaryToolPolicy = restrictToolPolicyForExecutionBoundary({
+      allowedTools: ['*'],
+      requireConfirmation: [],
+      forbiddenTools: [],
+      maxIterations: 80,
+    }, executionBoundary);
+    const restBoundaryAllowedToolNames = new Set(restBoundaryToolPolicy.allowedTools || []);
+    const restBoundaryForbiddenTools = executionBoundary === 'remote_restricted'
+      ? toolRegistry.getToolDeclarations({
+          context: {
+            userId,
+            domain,
+            orgId,
+            source: 'rest_chat',
+            autonomous: false,
+          },
+        })
+          .map(declaration => declaration.function.name)
+          .filter(name => !restBoundaryAllowedToolNames.has('*') && !restBoundaryAllowedToolNames.has(name))
+      : [];
+    const restPersonalityToolPolicy = industryWorkflowTask
+      ? restrictToolPolicyForExecutionBoundary(
+          bindIndustryWorkflowToolPolicy(
+            restBoundaryToolPolicy,
+            industryWorkflowTask,
+            toolRegistry.getToolDeclarations({
+              context: {
+                userId,
+                domain,
+                orgId,
+                source: 'rest_chat',
+                autonomous: false,
+              },
+            }).map(declaration => declaration.function.name),
+          ),
+          executionBoundary,
+        )
+      : restBoundaryToolPolicy;
     const restExecutionPipeline = buildLumiExecutionPipeline({
       dispatch: {
         userId,
@@ -454,28 +489,13 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
       },
       prebuiltDispatch: restTurnDispatch,
       registry: toolRegistry,
+      personalityToolPolicy: restPersonalityToolPolicy,
+      additionalForbiddenTools: restBoundaryForbiddenTools,
       isSanctuary: !req.user,
     });
-    const restExecutionDecision = restExecutionPipeline.execution;
-    const baseRestModelToolPolicy = restExecutionPipeline.authorizationPolicy;
-    const boundRestModelToolPolicy = industryWorkflowTask
-      ? bindIndustryWorkflowToolPolicy(
-          baseRestModelToolPolicy,
-          industryWorkflowTask,
-          toolRegistry.getToolDeclarations().map(declaration => declaration.function.name),
-        )
-      : baseRestModelToolPolicy;
-    const restModelToolPolicy = restrictToolPolicyForExecutionBoundary(
-      boundRestModelToolPolicy,
-      executionBoundary,
-    );
-    restExecutionDecision.baseToolPolicy = restModelToolPolicy;
-    const restModelToolProjection = buildModelToolProjection(restExecutionDecision, {
-      lane: restExecutionPipeline.capabilityPlan.lane,
-      preferredTools: restExecutionPipeline.capabilityPlan.preferredTools,
-    });
-    const restToolSessionActive = restExecutionPipeline.executionRequested
-      && restModelToolProjection.toolNames.length > 0;
+    const restModelToolPolicy = restExecutionPipeline.authorizationPolicy;
+    const restModelToolProjection = restExecutionPipeline.modelToolProjection;
+    const restToolSessionActive = restExecutionPipeline.executionRequested;
     const deferRestStream =
       restToolSessionActive
       || shouldDeferModelOutputUntilFinalized({
@@ -483,6 +503,8 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
         flow: restTurnDispatch.flow,
       });
     const toolContext = {
+      currentTurnExecutionRequested: restExecutionPipeline.executionRequested,
+      trustedActionContinuation: restExecutionPipeline.trustedActionContinuation,
       userId,
       authenticated: Boolean(req.user),
       authRole: req.user?.role,
@@ -520,7 +542,7 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
         orgId,
         source: 'rest_chat',
       }),
-      restExecutionDecision.promptOverlay,
+      restExecutionPipeline.execution.promptOverlay,
       industryWorkflowTask
         ? [
             '## Bound Industry Workflow Execution',

@@ -40,6 +40,8 @@ import {
 import { recordRoutingShadowComparison } from '../runtime/capability_metrics';
 import { hasExplicitNoMutationInstruction } from './tool_intent';
 import type { PendingAssistantOfferContext } from './pending_assistant_offer';
+import { buildActionContract } from './action_contract';
+import type { ToolContext } from '../tools/types';
 
 export interface LumiCapabilityPlan extends LumiCapabilitySelection {
   schemaVersion: 1;
@@ -56,6 +58,12 @@ export interface LumiExecutionPipeline {
   authorizationPolicy: ToolPolicy;
   modelToolProjection: ReturnType<typeof buildModelToolProjection>;
   executionRequested: boolean;
+  /**
+   * True only when the current request is an exact server-bound continuation
+   * of the unfinished durable task.  Manifest visibility alone can never set
+   * this bit.
+   */
+  trustedActionContinuation: boolean;
   intentTrace: LumiIntentTrace;
   shadowComparison: LumiRoutingShadowComparison;
 }
@@ -136,6 +144,7 @@ function applyCurrentTurnNoMutationConstraint(
   registry: ToolRegistry,
   text: string,
   exactIndustryWorkflow = false,
+  visibilityContext?: Pick<ToolContext, 'userId' | 'domain' | 'orgId' | 'autonomous' | 'source'>,
 ): LumiExecutionDecision {
   // A confirmation-only external-commit request deliberately says both
   // "prepare to send" and "do not send now". It must expose the exact
@@ -187,7 +196,7 @@ function applyCurrentTurnNoMutationConstraint(
     )
   ) return execution;
   if (!hasExplicitNoMutationInstruction(text)) return execution;
-  const mutationTools = registry.getCapabilityManifest(undefined)
+  const mutationTools = registry.getCapabilityManifest(undefined, { context: visibilityContext })
     .filter(entry => (
       entry.operation === 'create'
       || entry.operation === 'mutate'
@@ -228,6 +237,7 @@ function applySelectedWorkflowAdapterPolicy(
   registry: ToolRegistry,
   personalityToolPolicy?: ToolPolicy,
   isSanctuary?: boolean,
+  visibilityContext?: Pick<ToolContext, 'userId' | 'domain' | 'orgId' | 'autonomous' | 'source'>,
 ): LumiExecutionDecision {
   const workflow = turnIntent.flow.specialWorkflow;
   if (!workflow || isSanctuary) return execution;
@@ -236,7 +246,7 @@ function applySelectedWorkflowAdapterPolicy(
   const configuredWildcard = configuredAllowed.has('*');
   const hasConfiguredBoundary = Boolean(personalityToolPolicy);
   const executable = new Map(registry
-    .getCapabilityManifest(undefined, { executableOnly: true })
+    .getCapabilityManifest(undefined, { executableOnly: true, context: visibilityContext })
     .map(entry => [entry.toolName, entry]));
   const requiredTools = workflow.requiredTools.filter(toolName => (
     executable.has(toolName)
@@ -249,7 +259,7 @@ function applySelectedWorkflowAdapterPolicy(
     toolNames: [],
     categories: [],
     reasons: [],
-    totalAvailable: registry.getToolDeclarations().length,
+    totalAvailable: registry.getToolDeclarations({ context: visibilityContext }).length,
     maxTools: requiredTools.length,
     truncated: false,
   };
@@ -307,20 +317,29 @@ export function buildLumiExecutionPipeline(
   // semantic roles (for example, turning "generate an image" into a status
   // query because an active-task bridge contains the word "status").
   const normalizedIntent = normalizeActionIntent(input.dispatch.text);
+  const visibilityContext = {
+    userId: input.dispatch.userId,
+    domain: input.dispatch.domain === 'work' ? 'work' as const : 'personal' as const,
+    orgId: input.dispatch.orgId,
+    autonomous: turnIntent.flow.effectiveOperationMode === 'autonomous'
+      || ['autonomy', 'scheduler'].includes(input.dispatch.channel),
+    source: input.dispatch.source || input.dispatch.channel,
+  };
   const trustedActionContinuation = hasTrustedActionContinuation(input);
   const legacyExecution = buildLumiExecutionDecision({
     flow: turnIntent.flow,
     text: decisionText,
     currentTurnText: input.dispatch.text,
-    toolDeclarations: input.registry.getToolDeclarations(),
+    toolDeclarations: input.registry.getToolDeclarations({ context: visibilityContext }),
     toolRegistry: input.registry,
     personalityToolPolicy: input.personalityToolPolicy,
     actionTaskState: input.actionTaskState,
     trustedActionContinuation,
     pendingAssistantOfferContext: input.pendingAssistantOfferContext,
     isSanctuary: input.isSanctuary,
+    visibilityContext,
   });
-  const unrestrictedManifest = input.registry.getCapabilityManifest(legacyExecution.toolPolicy);
+  const unrestrictedManifest = input.registry.getCapabilityManifest(legacyExecution.toolPolicy, { context: visibilityContext });
   const shadowComparison = compareLumiRoutingShadow({
     normalizedIntent,
     execution: legacyExecution,
@@ -343,10 +362,12 @@ export function buildLumiExecutionPipeline(
           input.registry,
           input.personalityToolPolicy,
           input.isSanctuary,
+          visibilityContext,
         ),
         input.registry,
         input.dispatch.text,
         Boolean(turnIntent.flow.industryWorkflowEntryId),
+        visibilityContext,
       ),
       inactiveIndustryTools,
     ),
@@ -362,7 +383,7 @@ export function buildLumiExecutionPipeline(
     normalizedIntent,
     registry: input.registry,
   });
-  const manifest = input.registry.getCapabilityManifest(execution.toolPolicy);
+  const manifest = input.registry.getCapabilityManifest(execution.toolPolicy, { context: visibilityContext });
   const capabilityIds = Array.from(new Set(
     (execution.toolRoute?.toolNames || [])
       .map(toolName => manifest.find(entry => entry.toolName === toolName)?.capabilityId)
@@ -372,13 +393,38 @@ export function buildLumiExecutionPipeline(
   const pinnedContinuationTools = trustedContinuationEvidenceTools({
     actionTaskState: input.actionTaskState,
     trustedActionContinuation,
-  }, new Set(input.registry.getToolDeclarations().map(declaration => declaration.function.name)));
+  }, new Set(input.registry.getToolDeclarations({ context: visibilityContext }).map(declaration => declaration.function.name)));
+  const workflowRequiredTools = (
+    turnIntent.flow.workflowHint || turnIntent.flow.specialWorkflow
+  )?.requiredTools || [];
+  const actionVerificationTools = buildActionContract(decisionText).verificationTools || [];
   const modelToolProjection = buildModelToolProjection(execution, {
     lane: selection.lane,
     preferredTools: selection.preferredTools,
     pinnedTools: pinnedContinuationTools,
+    requiredTools: [
+      ...workflowRequiredTools,
+      ...actionVerificationTools,
+    ],
   });
-  const executionRequested = Boolean(execution.allowToolUse && modelToolProjection.toolNames.length > 0);
+  // Operation modes and manifest visibility define the authorization ceiling;
+  // neither is current-turn execution authority. Main Chat deliberately lets
+  // the model know which capabilities exist, but a greeting, correction about
+  // Lumi's behaviour, or ordinary conversation must not become executable
+  // merely because that manifest is visible. Only the current semantic turn,
+  // an exact server-bound continuation, or a task-owned entry may open the
+  // canonical tool loop.
+  const turnOwnsExecution = Boolean(
+    turnIntent.flow.allowToolUseForTurn
+    || trustedActionContinuation
+    || turnIntent.boundary === 'task_center'
+    || turnIntent.boundary === 'work_takeover',
+  );
+  const executionRequested = Boolean(
+    turnOwnsExecution
+    && execution.allowToolUse
+    && modelToolProjection.toolNames.length > 0,
+  );
   const capabilityPlan: LumiCapabilityPlan = {
     ...selection,
     schemaVersion: 1,
@@ -430,6 +476,7 @@ export function buildLumiExecutionPipeline(
     authorizationPolicy,
     modelToolProjection,
     executionRequested,
+    trustedActionContinuation,
     intentTrace,
     shadowComparison,
   };
