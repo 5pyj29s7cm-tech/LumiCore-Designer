@@ -3,7 +3,6 @@ import {
   Building2, BookOpen, Package, Users, Settings,
   ClipboardCheck, ScrollText, MessageSquare,
   Shield, User, Briefcase, Home, Scale, GitBranch, Loader2, MessagesSquare,
-  ArrowLeft, ChevronDown, ChevronRight, Layers,
 } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { useT } from '../../lib/useT';
@@ -63,7 +62,6 @@ export function OrgHub() {
   const [subView, setSubView] = useState<SubView>(() => initialRoute?.view || 'dashboard');
   const [editingArticleId, setEditingArticleId] = useState<string | undefined>(() => initialRoute?.articleId);
   const [switchBusy, setSwitchBusy] = useState(false);
-  const [orgModulesOpen, setOrgModulesOpen] = useState(false);
   const t = useT();
   const isZh = t.langCode !== 'en';
   const ui = (zh: string, en: string) => (isZh ? zh : en);
@@ -111,11 +109,6 @@ export function OrgHub() {
   );
   const hiddenModuleIds = useMemo(() => new Set<SubView>(['legal', 'spatial-design']), []);
   const primaryNavItems = visibleItems.filter(item => item.showInNav !== false && !hiddenModuleIds.has(item.id));
-  const moduleNavItems = visibleItems.filter(item => hiddenModuleIds.has(item.id) && item.id !== 'spatial-design');
-  const isModuleView = moduleNavItems.some(item => item.id === subView);
-  React.useEffect(() => {
-    if (isModuleView) setOrgModulesOpen(true);
-  }, [isModuleView]);
   const roleInfo = roleLabel[orgRole] || roleLabel.member;
   const currentItem = visibleItems.find(item => item.id === subView) || allNavItems.find(item => item.id === subView) || allNavItems[0];
 
@@ -222,45 +215,6 @@ export function OrgHub() {
               <span className="lumi-org-nav-copy hidden min-w-0 truncate sm:block">{item.label}</span>
             </button>
           ))}
-          {moduleNavItems.length > 0 && (
-            <div className="pt-1">
-              <button
-                type="button"
-                onClick={() => setOrgModulesOpen(prev => !prev)}
-                aria-label={uiMessage('org-hub.organization-modules.75dd9b5603')}
-                title={uiMessage('org-hub.organization-modules.75dd9b5603')}
-                className={`flex w-full items-center justify-center gap-2 rounded-xl border px-2 py-2 text-sm transition-colors sm:justify-start sm:px-3 ${
-                  isModuleView
-                    ? 'border-blue-400/20 bg-blue-500/10 text-blue-200'
-                    : 'border-white/[0.08] bg-white/[0.03] text-white/55 hover:bg-white/[0.06] hover:text-white/80'
-                }`}
-              >
-                <Layers size={16} className="shrink-0" />
-                <span className="lumi-org-nav-copy hidden min-w-0 flex-1 truncate text-left sm:block">{uiMessage('org-hub.organization-modules.75dd9b5603')}</span>
-                <span className="lumi-org-nav-copy lumi-org-nav-disclosure hidden sm:block">{orgModulesOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span>
-              </button>
-              {orgModulesOpen && (
-                <div className="lumi-org-module-items mt-1 space-y-1 sm:pl-3">
-                  {moduleNavItems.map(item => (
-                    <button
-                      key={item.id}
-                      onClick={() => openSubView(item.id)}
-                      aria-label={item.label}
-                      title={item.label}
-                      className={`flex w-full items-center justify-center gap-2 rounded-xl px-2 py-2 text-sm transition-colors sm:justify-start sm:px-3 ${
-                        subView === item.id
-                          ? 'border border-blue-400/20 bg-blue-500/10 text-blue-200'
-                          : 'border border-transparent text-white/45 hover:border-white/[0.08] hover:bg-white/[0.05] hover:text-white/80'
-                      }`}
-                    >
-                      <span className="shrink-0">{item.icon}</span>
-                      <span className="lumi-org-nav-copy hidden min-w-0 truncate sm:block">{item.label}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
           <div className="my-2 border-t border-white/[0.08]" />
           <button
             onClick={() => openSubView('spatial-design')}
@@ -274,19 +228,6 @@ export function OrgHub() {
           >
             <Building2 size={16} />
             <span className="lumi-org-nav-copy hidden min-w-0 truncate sm:block">{interiorDesignMessage('workspaceTitle', isZh ? 'zh' : 'en')}</span>
-          </button>
-          <button
-            onClick={() => {
-              void switchDomain('personal').finally(() => {
-                window.dispatchEvent(new CustomEvent('lumi:navigate', { detail: { tab: 'home' } }));
-              });
-            }}
-            aria-label={t.orgExitWorkSpace}
-            title={t.orgExitWorkSpace}
-            className="flex w-full items-center justify-center gap-2 rounded-xl border border-transparent px-2 py-2 text-sm text-white/40 transition-colors hover:border-white/[0.08] hover:bg-white/[0.05] hover:text-white/70 sm:justify-start sm:px-3"
-          >
-            <ArrowLeft size={16} />
-            <span className="lumi-org-nav-copy hidden min-w-0 truncate sm:block">{t.orgExitWorkSpace}</span>
           </button>
         </nav>
       </div>
