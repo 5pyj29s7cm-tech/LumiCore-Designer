@@ -235,7 +235,9 @@ function evidenceProjection(receipt: AutonomousTask['terminalReceipt']): Runtime
 }
 
 function autonomyItem(task: AutonomousTask): RuntimeWorkItem {
-  const phase = phaseForStatus(task.status);
+  const phase = task.cancelRequestedAt && ['running', 'pausing'].includes(task.status)
+    ? 'cancelling'
+    : phaseForStatus(task.status);
   const planNodes = task.executionPlan?.nodes || [];
   const completedNodeIds = task.checkpoint?.receiptIds || [];
   const title = bounded(task.title, 240) || task.id;
@@ -550,8 +552,17 @@ export function cancelRuntimeWork(input: {
   const matched = hasExactTargetSet
     ? before.items.filter(item => requestedTaskIdSet.has(item.id) && item.controls.canCancel)
     : before.items.filter(item => item.controls.canCancel);
+  // Rechecking an exact cancellation is idempotent. A task that already
+  // entered `cancelling` must remain an accepted in-progress target instead of
+  // being misreported as a fresh failure merely because canCancel is now false.
+  const alreadyCancelling = hasExactTargetSet
+    ? before.items.filter(item => (
+        requestedTaskIdSet.has(item.id)
+        && item.phase === 'cancelling'
+      ))
+    : [];
 
-  const acceptedIds = new Set<string>();
+  const acceptedIds = new Set<string>(alreadyCancelling.map(item => item.id));
   for (const item of matched) {
     if (item.kind === 'autonomy') {
       if (cancelTask(item.id, input.userId)) acceptedIds.add(item.id);
@@ -565,7 +576,10 @@ export function cancelRuntimeWork(input: {
   }
 
   const afterItems = getRuntimeWorkSnapshot(input.userId, [...selected], input.scope).items;
-  const outcomeItems = matched.filter(item => acceptedIds.has(item.id)).map(item => {
+  const outcomeCandidates = Array.from(new Map(
+    [...matched, ...alreadyCancelling].map(item => [item.id, item]),
+  ).values());
+  const outcomeItems = outcomeCandidates.filter(item => acceptedIds.has(item.id)).map(item => {
     const remaining = afterItems.find(candidate => candidate.id === item.id);
     if (!remaining) return {
       ...item,

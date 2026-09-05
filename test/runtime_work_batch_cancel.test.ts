@@ -3,6 +3,8 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { initDatabase } from '../db_layer';
 import {
   enqueue,
+  markCancelled,
+  markRunning,
   resetAutonomousTaskQueueForTest,
 } from '../server/autonomy/task_queue';
 import {
@@ -17,6 +19,50 @@ describe('runtime work exact batch cancellation', () => {
 
   afterEach(() => {
     resetAutonomousTaskQueueForTest({ markHydrated: true });
+  });
+
+  it('keeps repeated exact cancellation pending until the running worker stops', () => {
+    resetAutonomousTaskQueueForTest({ markHydrated: true });
+    const userId = `runtime-pending-batch-${Date.now()}-${Math.random()}`;
+    const task = enqueue({
+      userId,
+      title: 'running worker',
+      description: 'isolated cancellation receipt',
+      source: 'user_request',
+      priority: 5,
+      mode: 'analysis',
+    })!;
+    expect(markRunning(task.id)).toMatchObject({ status: 'running' });
+    const request = { userId, taskIds: [task.id], scope: { domain: 'personal' as const } };
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      expect(cancelRuntimeWork(request)).toMatchObject({
+        ok: true,
+        status: 'cancelling',
+        cancelledCount: 0,
+        cancellingCount: 1,
+        failedCount: 0,
+        cancelledTaskIds: [],
+        cancellingTaskIds: [task.id],
+        notCancelledTaskIds: [],
+        targetResults: [{ taskId: task.id, status: 'cancelling' }],
+      });
+    }
+    expect(getRuntimeWorkSnapshot(userId, ['autonomy'], request.scope).items)
+      .toEqual([expect.objectContaining({
+        id: task.id,
+        phase: 'cancelling',
+        evidence: expect.objectContaining({ terminal: false }),
+      })]);
+    expect(markCancelled(task.id)).toMatchObject({ status: 'cancelled' });
+    expect(cancelRuntimeWork(request)).toMatchObject({
+      ok: true,
+      status: 'idle',
+      cancelledTaskIds: [],
+      cancellingTaskIds: [],
+      failedCount: 0,
+      targetResults: [{ taskId: task.id, status: 'already_terminal' }],
+    });
   });
 
   it('treats an explicit empty target set as cancel-zero, never cancel-all', () => {
