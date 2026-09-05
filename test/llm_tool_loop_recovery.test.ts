@@ -1,3 +1,5 @@
+import os from 'node:os';
+import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -13,6 +15,7 @@ vi.mock('../server/llm/providers', async () => {
 });
 
 import { buildConfirmedStepContinuationMessages, runWithTools } from '../server/llm/adapter';
+import { clearWorkflows, getRecentWorkflows } from '../server/skills/worklog';
 import { encodeToolResult } from '../server/tools/result_envelope';
 import { ToolRegistry } from '../server/tools/registry';
 import type { ToolExecutionRecord } from '../server/tools/types';
@@ -58,9 +61,55 @@ function registerReadOnlyProbe(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  clearWorkflows();
 });
 
 describe('LLM tool-loop recovery and terminal truth', () => {
+  it('records the original user request instead of a server recovery prompt', async () => {
+    const registry = new ToolRegistry();
+    registerReadOnlyProbe(registry, 'workflow_recovery_probe', async () => encodeToolResult(
+      'the requested state was verified',
+      { ok: true, status: 'verified' },
+    ));
+    mocks.makeLLMCall
+      .mockResolvedValueOnce({
+        text: 'checking the requested state',
+        toolCalls: [{ id: 'workflow-probe-1', name: 'workflow_recovery_probe', arguments: {} }],
+      })
+      .mockResolvedValueOnce({ text: 'The requested state is verified.' });
+
+    const originalRequest = 'Check the current application state.';
+    await runWithTools(
+      [
+        { role: 'user', content: originalRequest },
+        {
+          role: 'user',
+          content: 'Internal execution recovery. Continue the bounded original task from preserved receipts.',
+        },
+      ],
+      registry,
+      { provider: 'deepseek', model: 'test-model', userId: 'workflow-recovery-user' },
+      undefined,
+      2,
+      ...getters,
+      undefined,
+      {
+        userId: 'workflow-recovery-user',
+        source: 'chat_guard_recovery',
+        actionIntent: originalRequest,
+        routedTaskText: originalRequest,
+      },
+    );
+
+    const workflows = getRecentWorkflows('workflow-recovery-user');
+    expect(workflows).toHaveLength(1);
+    expect(workflows[0]).toMatchObject({
+      userIntent: originalRequest,
+      conversationExcerpt: originalRequest,
+    });
+    expect(JSON.stringify(workflows[0])).not.toContain('Internal execution recovery');
+  });
+
   it('attributes a confirmation continuation to the accepted confirmation row, not the old goal', () => {
     const messages = buildConfirmedStepContinuationMessages(
       'Delete the exact reviewed cache entry, then verify it is gone.',
@@ -803,7 +852,9 @@ describe('LLM tool-loop recovery and terminal truth', () => {
 
   it('stops after verified current-document evidence instead of recovering an old discovery failure', async () => {
     const registry = new ToolRegistry();
-    const exactPath = 'C:\\Users\\Administrator\\Desktop\\Lumi_\u8def\u6f14.pptx';
+    const desktopDirectory = path.join(os.homedir(), 'Desktop');
+    const documentsDirectory = path.join(os.homedir(), 'Documents');
+    const exactPath = path.join(desktopDirectory, 'Lumi_\u8def\u6f14.pptx');
     registerReadOnlyProbe(registry, 'search_files', async () => encodeToolResult(
       JSON.stringify({ files: [] }),
       { ok: true, status: 'verified' },
@@ -833,7 +884,7 @@ describe('LLM tool-loop recovery and terminal truth', () => {
         toolCalls: [{
           id: 'premature-search',
           name: 'search_files',
-          arguments: { path: 'C:\\Users\\Administrator\\Documents', pattern: 'Lumi_\u8def\u6f14.pptx' },
+          arguments: { path: documentsDirectory, pattern: 'Lumi_\u8def\u6f14.pptx' },
         }],
       })
       .mockResolvedValueOnce({
@@ -845,7 +896,7 @@ describe('LLM tool-loop recovery and terminal truth', () => {
         toolCalls: [{
           id: 'desktop-files',
           name: 'desktop_list_files',
-          arguments: { directory: 'C:\\Users\\Administrator\\Desktop' },
+          arguments: { directory: desktopDirectory },
         }],
       })
       .mockResolvedValueOnce({

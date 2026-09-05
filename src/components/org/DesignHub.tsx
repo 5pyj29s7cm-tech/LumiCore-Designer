@@ -236,33 +236,35 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
   const presentation = VIEW_PRESENTATION[view];
 
   return (
-    <div className={`flex h-full min-h-0 transition-colors duration-300 ${presentation.shell}`} data-design-workspace={view}>
-      <aside className={`flex w-64 shrink-0 flex-col border-r border-white/[0.08] ${presentation.sidebar}`}>
-        <div className="border-b border-white/[0.08] p-4">
+    <div data-organization-wallpaper-module="design" className={`lumi-org-module-shell lumi-design-hub flex h-full min-h-0 transition-colors duration-300 ${presentation.shell}`} data-design-workspace={view}>
+      <aside data-wallpaper-tool="organization-module-tools" className={`lumi-org-module-tools lumi-design-sidebar flex w-64 shrink-0 flex-col border-r border-white/[0.08] ${presentation.sidebar}`}>
+        <div className="lumi-org-module-tool-header border-b border-white/[0.08] p-4">
           <h3 className="flex items-center gap-2 text-sm font-black uppercase tracking-[0.12em] text-white/85">
             <span className={`flex h-8 w-8 items-center justify-center rounded-xl border ${presentation.brand}`}>
               <Layout size={16} />
             </span>
-            <span className="min-w-0 truncate">{m('workspaceTitle')}</span>
+            <span className="lumi-org-module-tool-copy min-w-0 truncate">{m('workspaceTitle')}</span>
           </h3>
-          <p className="mt-2 text-xs leading-relaxed text-white/40">{m('workspaceDescription')}</p>
-          <span className="mt-3 inline-flex rounded-full border border-emerald-300/15 bg-emerald-400/10 px-2.5 py-1 text-[10px] font-black uppercase tracking-[0.12em] text-emerald-200/80">
+          <p className="lumi-org-module-tool-copy mt-2 text-xs leading-relaxed text-white/40">{m('workspaceDescription')}</p>
+          <span className="lumi-org-module-tool-copy mt-3 inline-flex rounded-full border border-emerald-300/15 bg-emerald-400/10 px-2.5 py-1 text-[10px] font-black uppercase tracking-[0.12em] text-emerald-200/80">
             {m('scopeBadge')}
           </span>
         </div>
-        <nav className="custom-scrollbar flex-1 space-y-1 overflow-y-auto p-2">
+        <nav className="lumi-org-module-tool-nav custom-scrollbar flex-1 space-y-1 overflow-y-auto p-2">
           {navItems.map(item => (
             <button
               key={item.id}
               onClick={() => setView(item.id)}
-              className={`flex w-full items-start gap-2 rounded-xl border px-3 py-2.5 text-left transition-colors ${
+              title={item.label}
+              aria-label={item.label}
+              className={`lumi-org-module-tool-button flex w-full items-start gap-2 rounded-xl border px-3 py-2.5 text-left transition-colors ${
                 view === item.id
                   ? presentation.activeNav
                   : 'border-transparent text-white/50 hover:border-white/[0.08] hover:bg-white/[0.05] hover:text-white/80'
               }`}
             >
-              <span className="mt-0.5 shrink-0">{item.icon}</span>
-              <span className="min-w-0">
+              <span className="lumi-org-module-tool-icon mt-0.5 shrink-0">{item.icon}</span>
+              <span className="lumi-org-module-tool-copy min-w-0">
                 <span className="block truncate text-sm font-bold">{item.label}</span>
                 <span className="mt-0.5 line-clamp-2 block text-[12px] leading-relaxed text-white/35">{item.desc}</span>
               </span>
@@ -284,7 +286,7 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
           ))}
         </nav>
       </aside>
-      <main className={`custom-scrollbar min-w-0 flex-1 overflow-y-auto ${presentation.canvas}`}>
+      <main data-wallpaper-tool="organization-module-workspace" className={`lumi-org-module-workspace lumi-design-workspace custom-scrollbar min-w-0 flex-1 overflow-y-auto ${presentation.canvas}`}>
         {view === 'project' ? (
           <InteriorProjectPanel
             domain={workDomain}
@@ -571,7 +573,7 @@ function GenericDesignToolView({
   };
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-5 p-6">
+    <div className="lumi-design-tool mx-auto flex max-w-5xl flex-col gap-5 p-6">
       <section className="border-b border-white/[0.08] pb-5">
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
@@ -659,7 +661,7 @@ function GenericDesignToolView({
       </section>
 
       {result && (
-        <section className="lumi-panel custom-scrollbar max-h-[560px] overflow-y-auto whitespace-pre-wrap p-5 text-sm leading-relaxed text-white/80">
+        <section className="lumi-design-result lumi-panel custom-scrollbar max-h-[560px] overflow-y-auto p-5 text-sm leading-relaxed whitespace-pre-wrap text-white/80">
           {result}
         </section>
       )}

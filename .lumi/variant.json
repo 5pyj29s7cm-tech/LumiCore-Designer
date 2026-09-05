@@ -25,7 +25,7 @@
     "repository": "https://github.com/5pyj29s7cm-tech/lumi-CEO.git",
     "branch": "main",
     "baselineCommit": "59d473e9abeb0b6922db1d7dea1cf0765b5ccb0d",
-    "lastSyncedCommit": "f6eec0ee73ff0f9e252279ab9c1618ed10f8dc4d"
+    "lastSyncedCommit": "ff67359a7d1b2c000fd903cfd6cf5fbea8217e72"
   },
   "repository": "https://github.com/5pyj29s7cm-tech/lumi-designer-client.git",
   "syncPolicy": {
@@ -34,7 +34,7 @@
     "defaultBranchUpdate": "verified fast-forward only"
   },
   "createdAt": "2026-08-03T16:13:55.985Z",
-    "lastSyncedAt": "2026-09-01T21:12:12.272+08:00",
+  "lastSyncedAt": "2026-09-05T09:22:14.910Z",
   "delivery": {
     "localBranch": "variant/designer-client",
     "remoteBranch": "main",

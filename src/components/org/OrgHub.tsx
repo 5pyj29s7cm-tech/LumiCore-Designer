@@ -3,6 +3,7 @@ import {
   Building2, BookOpen, Package, Users, Settings,
   ClipboardCheck, ScrollText, MessageSquare,
   Shield, User, Briefcase, Home, Scale, GitBranch, Loader2, MessagesSquare,
+  ArrowLeft, ChevronDown, ChevronRight, Layers,
 } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { useT } from '../../lib/useT';
@@ -62,6 +63,7 @@ export function OrgHub() {
   const [subView, setSubView] = useState<SubView>(() => initialRoute?.view || 'dashboard');
   const [editingArticleId, setEditingArticleId] = useState<string | undefined>(() => initialRoute?.articleId);
   const [switchBusy, setSwitchBusy] = useState(false);
+  const [orgModulesOpen, setOrgModulesOpen] = useState(false);
   const t = useT();
   const isZh = t.langCode !== 'en';
   const ui = (zh: string, en: string) => (isZh ? zh : en);
@@ -109,6 +111,11 @@ export function OrgHub() {
   );
   const hiddenModuleIds = useMemo(() => new Set<SubView>(['legal', 'spatial-design']), []);
   const primaryNavItems = visibleItems.filter(item => item.showInNav !== false && !hiddenModuleIds.has(item.id));
+  const moduleNavItems = visibleItems.filter(item => hiddenModuleIds.has(item.id) && item.id !== 'spatial-design');
+  const isModuleView = moduleNavItems.some(item => item.id === subView);
+  React.useEffect(() => {
+    if (isModuleView) setOrgModulesOpen(true);
+  }, [isModuleView]);
   const roleInfo = roleLabel[orgRole] || roleLabel.member;
   const currentItem = visibleItems.find(item => item.id === subView) || allNavItems.find(item => item.id === subView) || allNavItems[0];
 
@@ -165,22 +172,22 @@ export function OrgHub() {
   };
 
   return (
-    <div className="lumi-work-surface lumi-surface flex h-full overflow-hidden rounded-none border-0 bg-black/20">
+    <div data-organization-wallpaper-surface className="lumi-work-surface lumi-surface flex h-full overflow-hidden rounded-none border-0 bg-black/20">
       {/* Sidebar */}
-      <div className="lumi-org-sidebar flex w-16 shrink-0 flex-col border-r border-white/[0.08] bg-black/25 sm:w-60">
+      <div data-wallpaper-tool="organization-navigation" className="lumi-org-sidebar flex w-16 shrink-0 flex-col border-r border-white/[0.08] bg-black/25 sm:w-60">
         <div className="space-y-3 border-b border-white/[0.08] p-2 sm:p-4">
           <h3 className="flex items-center justify-center gap-2 text-sm font-black uppercase tracking-[0.12em] text-white/85 sm:justify-start">
             <span className="flex h-8 w-8 items-center justify-center rounded-xl border border-blue-300/15 bg-blue-400/10 text-blue-200">
               <Building2 size={16} />
             </span>
-            <span className="hidden min-w-0 truncate sm:block">{t.orgWorkSpace}</span>
+            <span className="lumi-org-nav-copy hidden min-w-0 truncate sm:block">{t.orgWorkSpace}</span>
           </h3>
           {orgConnection?.orgName && (
-            <p className="hidden truncate text-xs text-white/55 sm:block">{orgConnection.orgName}</p>
+            <p className="lumi-org-nav-copy lumi-org-nav-name hidden truncate text-xs text-white/55 sm:block">{orgConnection.orgName}</p>
           )}
           {/* Role badge */}
           <span title={roleInfo.label} className={`mx-auto flex w-fit items-center gap-1 rounded-full px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] sm:mx-0 sm:py-0.5 ${roleInfo.color}`}>
-            {roleInfo.icon} <span className="hidden sm:inline">{roleInfo.label}</span>
+            {roleInfo.icon} <span className="lumi-org-nav-copy hidden sm:inline">{roleInfo.label}</span>
           </span>
           <button
             onClick={handleDomainToggle}
@@ -194,7 +201,7 @@ export function OrgHub() {
             }`}
           >
             {switchBusy ? <Loader2 size={12} className="animate-spin" /> : workDomain === 'work' ? <Briefcase size={12} /> : <User size={12} />}
-            <span className="hidden sm:inline">{switchBusy ? (t.switching || uiMessage('org-hub.switching.c197a0b742')) : displayedDomain}</span>
+            <span className="lumi-org-nav-copy hidden sm:inline">{switchBusy ? (t.switching || uiMessage('org-hub.switching.c197a0b742')) : displayedDomain}</span>
           </button>
         </div>
 
@@ -212,9 +219,48 @@ export function OrgHub() {
               }`}
             >
               <span className="shrink-0">{item.icon}</span>
-              <span className="hidden min-w-0 truncate sm:block">{item.label}</span>
+              <span className="lumi-org-nav-copy hidden min-w-0 truncate sm:block">{item.label}</span>
             </button>
           ))}
+          {moduleNavItems.length > 0 && (
+            <div className="pt-1">
+              <button
+                type="button"
+                onClick={() => setOrgModulesOpen(prev => !prev)}
+                aria-label={uiMessage('org-hub.organization-modules.75dd9b5603')}
+                title={uiMessage('org-hub.organization-modules.75dd9b5603')}
+                className={`flex w-full items-center justify-center gap-2 rounded-xl border px-2 py-2 text-sm transition-colors sm:justify-start sm:px-3 ${
+                  isModuleView
+                    ? 'border-blue-400/20 bg-blue-500/10 text-blue-200'
+                    : 'border-white/[0.08] bg-white/[0.03] text-white/55 hover:bg-white/[0.06] hover:text-white/80'
+                }`}
+              >
+                <Layers size={16} className="shrink-0" />
+                <span className="lumi-org-nav-copy hidden min-w-0 flex-1 truncate text-left sm:block">{uiMessage('org-hub.organization-modules.75dd9b5603')}</span>
+                <span className="lumi-org-nav-copy lumi-org-nav-disclosure hidden sm:block">{orgModulesOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span>
+              </button>
+              {orgModulesOpen && (
+                <div className="lumi-org-module-items mt-1 space-y-1 sm:pl-3">
+                  {moduleNavItems.map(item => (
+                    <button
+                      key={item.id}
+                      onClick={() => openSubView(item.id)}
+                      aria-label={item.label}
+                      title={item.label}
+                      className={`flex w-full items-center justify-center gap-2 rounded-xl px-2 py-2 text-sm transition-colors sm:justify-start sm:px-3 ${
+                        subView === item.id
+                          ? 'border border-blue-400/20 bg-blue-500/10 text-blue-200'
+                          : 'border border-transparent text-white/45 hover:border-white/[0.08] hover:bg-white/[0.05] hover:text-white/80'
+                      }`}
+                    >
+                      <span className="shrink-0">{item.icon}</span>
+                      <span className="lumi-org-nav-copy hidden min-w-0 truncate sm:block">{item.label}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           <div className="my-2 border-t border-white/[0.08]" />
           <button
             onClick={() => openSubView('spatial-design')}
@@ -227,14 +273,27 @@ export function OrgHub() {
             }`}
           >
             <Building2 size={16} />
-            <span className="hidden min-w-0 truncate sm:block">{interiorDesignMessage('workspaceTitle', isZh ? 'zh' : 'en')}</span>
+            <span className="lumi-org-nav-copy hidden min-w-0 truncate sm:block">{interiorDesignMessage('workspaceTitle', isZh ? 'zh' : 'en')}</span>
+          </button>
+          <button
+            onClick={() => {
+              void switchDomain('personal').finally(() => {
+                window.dispatchEvent(new CustomEvent('lumi:navigate', { detail: { tab: 'home' } }));
+              });
+            }}
+            aria-label={t.orgExitWorkSpace}
+            title={t.orgExitWorkSpace}
+            className="flex w-full items-center justify-center gap-2 rounded-xl border border-transparent px-2 py-2 text-sm text-white/40 transition-colors hover:border-white/[0.08] hover:bg-white/[0.05] hover:text-white/70 sm:justify-start sm:px-3"
+          >
+            <ArrowLeft size={16} />
+            <span className="lumi-org-nav-copy hidden min-w-0 truncate sm:block">{t.orgExitWorkSpace}</span>
           </button>
         </nav>
       </div>
 
       {/* Content */}
-      <div className="flex min-w-0 flex-1 flex-col">
-        <div className="sticky top-0 z-20 flex items-center justify-between gap-3 border-b border-white/[0.08] bg-black/30 px-3 py-3 backdrop-blur-xl sm:gap-4 sm:px-5">
+      <div data-wallpaper-tool="organization-workspace" className="lumi-org-workspace flex min-w-0 flex-1 flex-col">
+        <div data-wallpaper-tool="organization-context" className="lumi-org-context-bar sticky top-0 z-20 flex items-center justify-between gap-3 border-b border-white/[0.08] bg-black/30 px-3 py-3 backdrop-blur-xl sm:gap-4 sm:px-5">
           <div className="min-w-0">
             <div className="flex items-center gap-2 text-white/85">
               <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-blue-300/15 bg-blue-400/10 text-blue-200">{currentItem.icon}</span>
@@ -248,7 +307,7 @@ export function OrgHub() {
             {roleInfo.icon}<span className="hidden sm:inline">{roleInfo.label}</span>
           </span>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto custom-scrollbar">
+        <div className="lumi-org-content-scroll min-h-0 flex-1 overflow-y-auto custom-scrollbar">
           <Suspense fallback={<OrgViewFallback />}>
             {renderView()}
           </Suspense>
