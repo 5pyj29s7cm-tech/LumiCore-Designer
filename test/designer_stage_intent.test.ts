@@ -210,7 +210,8 @@ describe('designer stage intent', () => {
     });
     expect(pipeline.normalizedIntent.kind).toBe('media_generation');
     expect(pipeline.execution.toolPolicy.allowedTools).toContain('generate_image');
-    expect(pipeline.execution.promptOverlay).not.toContain('External Commit Shadow Gate');
+    expect(pipeline.shadowComparison.externalCommitBlocked).toBe(false);
+    expect(pipeline.execution.toolPolicy.allowedTools).not.toContain('generate_video');
   });
 
   it('prioritizes the explicitly executed handoff stage over its presentation dependency list', () => {

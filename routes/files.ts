@@ -8,19 +8,19 @@
  */
 import { Router, Request, Response } from 'express';
 import multer from 'multer';
-import jwt from 'jsonwebtoken';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
 import iconv from 'iconv-lite';
-import { readDB, writeDB } from '../db_layer';
+import { readDB, writeDB, flushDBOrThrow } from '../db_layer';
 import { chunkText, ingestDocument, verifyIngestedDocument } from '../server/agents/rag';
 import type { KnowledgeIngestionManifest } from '../server/knowledge/ingestion_manifest';
+import { hasCurrentMemoryEmbedding, invalidateMemoryEmbedding } from '../server/memory/embedding_identity';
+import { createRequestAbortController } from '../server/http/request_abort';
 import { buildKnowledgeIngestionManifest, evaluateKnowledgeManifest, hashKnowledgeContent } from '../server/knowledge/ingestion_manifest';
 import { getDataPath, getGeneratedOutputDir } from '../server/config/data_path';
-import { getJwtSecret } from '../server/config/local_identity';
 import {
   requireAdmin as requireUnifiedAdmin,
   requireAuth as requireUnifiedAuth,
@@ -33,6 +33,7 @@ import {
   createInteriorProjectAsset,
   normalizeInteriorAssetCategory,
 } from '../server/design/project_assets';
+import { captureOrganizationMembershipAuthorization, isOrganizationMembershipAuthorizationCurrent } from '../server/org/membership_authorization';
 import { analyzeScreen } from '../server/llm/adapter';
 import { getUserPreferredVision, type VisionProvider } from '../server/llm/vision_preferences';
 import { AUDIO_FILE_EXTS, isAudioTranscriptionUnavailable, transcribeAudioFile } from '../server/stt/file_transcription';
@@ -50,36 +51,14 @@ fs.mkdirSync(PERSONAL_KNOWLEDGE_DIR, { recursive: true });
 
 const router = Router();
 
-const JWT_SECRET = getJwtSecret();
-
-function requireAuth(req: Request, res: Response, next: () => void): void {
-  let token = req.cookies.token;
-  if (!token && req.headers.authorization?.startsWith('Bearer ')) {
-    token = req.headers.authorization.slice(7);
-  }
-  if (!token) { res.status(401).json({ error: 'Login required' }); return; }
-  try { jwt.verify(token, JWT_SECRET); next(); }
-  catch { res.status(401).json({ error: 'Invalid token' }); }
-}
+const requireAuth = requireUnifiedAuth;
 
 function getUserId(req: Request): string {
-  try {
-    let token = req.cookies.token;
-    if (!token && req.headers.authorization?.startsWith('Bearer ')) token = req.headers.authorization.slice(7);
-    if (token) return (jwt.verify(token, JWT_SECRET) as any).uid;
-  } catch {}
-  return 'anonymous';
+  return req.user?.uid || 'anonymous';
 }
 
 function getAuthPayload(req: Request): any | null {
-  try {
-    let token = req.cookies?.token;
-    if (!token && req.headers.authorization?.startsWith('Bearer ')) token = req.headers.authorization.slice(7);
-    if (!token) return null;
-    return jwt.verify(token, JWT_SECRET) as any;
-  } catch {
-    return null;
-  }
+  return req.user || null;
 }
 
 // ── Multer: files staged in OS temp, then moved to knowledge dir ──
@@ -213,11 +192,107 @@ interface FileScope {
 }
 
 interface KnowledgeFileInput {
+  signal?: AbortSignal;
   sourcePath: string;
   originalName: string;
   size?: number;
   mimeType?: string;
   move?: boolean;
+  assertAuthorized?: () => void;
+}
+
+interface UploadItemIdentity { batchId: string; itemId: string }
+const activeUploadItems = new Map<string, Promise<any>>();
+
+function captureUploadAuthorization(scope: FileScope) {
+  const snapshot = scope.domain === 'work' ? captureOrganizationMembershipAuthorization(scope.orgId!, scope.userId) : undefined;
+  let revoked = false;
+  return {
+    key: snapshot ? JSON.stringify(snapshot) : scope.userId,
+    assertCurrent() {
+      if (snapshot && !isOrganizationMembershipAuthorizationCurrent(snapshot, scope.orgId!, scope.userId)) revoked = true;
+      if (revoked) throw Object.assign(new Error('Organization access changed during this upload.'), { status: 403 });
+    },
+  };
+}
+
+function uploadItemIdentities(body: any, count: number): Array<UploadItemIdentity | undefined> {
+  if (!body?.uploadBatchId) return Array(count).fill(undefined); // Older clients remain supported.
+  const batchId = String(body.uploadBatchId);
+  let items: unknown;
+  try { items = typeof body.uploadItemIds === 'string' ? JSON.parse(body.uploadItemIds) : body.uploadItemIds; } catch {}
+  if (!/^[a-zA-Z0-9_-]{8,100}$/.test(batchId) || !Array.isArray(items) || items.length !== count
+    || items.some(item => typeof item !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(item))
+    || new Set(items).size !== items.length) {
+    throw Object.assign(new Error('Invalid upload batch identity'), { status: 400 });
+  }
+  return items.map(itemId => ({ batchId, itemId }));
+}
+
+async function hashUploadFile(filePath: string): Promise<string> {
+  const info = fs.lstatSync(filePath);
+  if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_UPLOAD_BYTES) throw new Error('Invalid upload source');
+  const digest = crypto.createHash('sha256');
+  for await (const chunk of fs.createReadStream(filePath)) digest.update(chunk);
+  return digest.digest('hex');
+}
+
+/** Retry the same authenticated batch item, without changing normal copy-upload semantics. */
+async function saveUploadedKnowledgeFile(
+  input: KnowledgeFileInput, userId: string, scope: FileScope, db: any,
+  authorization: ReturnType<typeof captureUploadAuthorization>, identity?: UploadItemIdentity,
+): Promise<any> {
+  authorization.assertCurrent();
+  input.signal?.throwIfAborted();
+  input.assertAuthorized = authorization.assertCurrent;
+  if (!identity) return saveKnowledgeFile(input, userId, scope, db);
+  const digest = await hashUploadFile(input.sourcePath);
+  input.signal?.throwIfAborted();
+  authorization.assertCurrent();
+  const key = crypto.createHash('sha256').update(JSON.stringify([
+    userId, scope.domain, scope.orgId || '', identity.batchId, identity.itemId,
+    authorization.key, sanitizeKnowledgeFilename(input.originalName), input.mimeType || '', digest,
+  ])).digest('hex');
+  const inFlight = activeUploadItems.get(key);
+  if (inFlight) {
+    const result = await inFlight;
+    input.signal?.throwIfAborted();
+    authorization.assertCurrent();
+    return { ...result, reused: true };
+  }
+  const operation = (async () => {
+    const candidates = [...(db.knowledgeFiles || [])].reverse().filter((meta: any) => (
+      metaMatchesScope(meta, scope) && meta.userId === userId && meta.uploadReceipt?.key === key
+      && meta.uploadReceipt.response?.id === meta.filename
+    ));
+    for (const meta of candidates) {
+      const savedPath = path.join(scope.dir, path.basename(meta.filename));
+      try {
+        if (meta.filename !== path.basename(meta.filename) || await hashUploadFile(savedPath) !== digest) continue;
+      } catch { continue; }
+      authorization.assertCurrent();
+      // A previous flush may have failed. Never return a success before retrying that boundary.
+      writeDB(db);
+      await flushDBOrThrow();
+      authorization.assertCurrent();
+      input.signal?.throwIfAborted();
+      return { ...meta.uploadReceipt.response, path: savedPath, reused: true };
+    }
+    const entry = await saveKnowledgeFile(input, userId, scope, db);
+    input.signal?.throwIfAborted();
+    authorization.assertCurrent();
+    const meta = findFileMeta(db, entry.id, scope);
+    if (!meta) throw new Error('Uploaded file metadata is unavailable');
+    meta.uploadReceipt = { key, contentSha256: digest, response: entry };
+    writeDB(db);
+    await flushDBOrThrow();
+    authorization.assertCurrent();
+    input.signal?.throwIfAborted();
+    return entry;
+  })();
+  activeUploadItems.set(key, operation);
+  try { return await operation; }
+  finally { if (activeUploadItems.get(key) === operation) activeUploadItems.delete(key); }
 }
 
 const MOJIBAKE_TOKENS = [
@@ -339,6 +414,13 @@ const DOWNLOAD_MIME_TYPES: Record<string, string> = {
   '.dxf': 'application/dxf',
   '.dwg': 'application/octet-stream',
 };
+
+// Only passive formats are rendered under the application's origin.
+const SAFE_INLINE_EXTENSIONS = new Set([
+  '.txt', '.log', '.md', '.json', '.csv',
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf',
+  '.mp3', '.mpeg', '.wav', '.m4a', '.ogg', '.oga', '.flac', '.aac', '.wma', '.webm', '.mp4', '.mov',
+]);
 
 function getDownloadMime(filePath: string): string | undefined {
   const ext = path.extname(filePath).toLowerCase() || (filePath.startsWith('.') ? filePath.toLowerCase() : '');
@@ -479,7 +561,7 @@ function resolveKnowledgeVisionProvider(userId: string): VisionProvider | null {
   return null;
 }
 
-async function extractImageKnowledge(filePath: string, userId: string): Promise<KnowledgeExtractionResult> {
+async function extractImageKnowledge(filePath: string, userId: string, signal?: AbortSignal): Promise<KnowledgeExtractionResult> {
   let meta: any = {};
   try {
     const sharp = await getSharp();
@@ -525,7 +607,7 @@ async function extractImageKnowledge(filePath: string, userId: string): Promise<
     const analysis = await analyzeScreen(
       imagePayload,
       prompt,
-      { provider, model, userId, maxTokens: 2200 },
+      { provider, model, userId, maxTokens: 2200, signal },
       g.getDeepSeek,
       g.getGemini,
       g.getOpenAI,
@@ -603,12 +685,13 @@ async function extractPdfText(filePath: string): Promise<string> {
   }
 }
 
-async function extractAudioKnowledge(filePath: string): Promise<KnowledgeExtractionResult> {
+async function extractAudioKnowledge(filePath: string, signal?: AbortSignal): Promise<KnowledgeExtractionResult> {
   const displayName = repairFilename(path.basename(filePath));
   try {
     const result = await transcribeAudioFile(fs.readFileSync(filePath), {
       fileName: displayName,
       language: 'zh',
+      signal,
     });
     const transcript = result.text.trim();
     if (!transcript) {
@@ -676,7 +759,30 @@ function extractGeneratedTextKnowledge(filename: string, content: string): Knowl
   return { content, method: 'text', status: 'indexed' };
 }
 
-export async function extractKnowledgeFileContent(filePath: string, userId = 'anonymous'): Promise<KnowledgeExtractionResult> {
+function captureKnowledgeSource(filePath: string): () => void {
+  const before = fs.statSync(filePath);
+  return () => {
+    let after: fs.Stats;
+    try { after = fs.statSync(filePath); } catch {
+      throw Object.assign(new Error('Knowledge source was removed during processing.'), { status: 409 });
+    }
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+      throw Object.assign(new Error('Knowledge source changed during processing. Retry with the current file.'), { status: 409 });
+    }
+  };
+}
+
+export async function extractKnowledgeFileContent(filePath: string, userId = 'anonymous', signal?: AbortSignal): Promise<KnowledgeExtractionResult> {
+  signal?.throwIfAborted();
+  const assertSourceCurrent = captureKnowledgeSource(filePath);
+  const result = await extractKnowledgeFileContentUnchecked(filePath, userId, signal);
+  signal?.throwIfAborted();
+  assertSourceCurrent();
+  return result;
+}
+
+async function extractKnowledgeFileContentUnchecked(filePath: string, userId: string, signal?: AbortSignal): Promise<KnowledgeExtractionResult> {
   const extName = path.extname(filePath);
   try {
     if (TEXT_KNOWLEDGE_EXTS.test(extName)) {
@@ -730,10 +836,10 @@ export async function extractKnowledgeFileContent(filePath: string, userId = 'an
           };
     }
     if (AUDIO_KNOWLEDGE_EXTS.test(extName)) {
-      return await extractAudioKnowledge(filePath);
+      return await extractAudioKnowledge(filePath, signal);
     }
     if (IMAGE_KNOWLEDGE_EXTS.test(extName)) {
-      return await extractImageKnowledge(filePath, userId);
+      return await extractImageKnowledge(filePath, userId, signal);
     }
   } catch (err: any) {
     console.warn(`[Files] Failed to extract "${path.basename(filePath)}": ${err.message}`);
@@ -1082,8 +1188,14 @@ function hasCurrentVerifiedManifest(meta: any, content: string, existingMemoryId
   if (!manifest || manifest.schemaVersion !== 1) return false;
   if (manifest.sourceRevision !== hashKnowledgeContent(content)) return false;
   const existing = new Set(existingMemoryIds);
+  const actualMemories = new Map((readDB().memories || [])
+    .filter((memory: any) => existing.has(String(memory.id)))
+    .map((memory: any) => [String(memory.id), memory]));
   return manifest.chunks.length > 0
-    && manifest.chunks.every(chunk => Boolean(chunk.memoryId) && existing.has(String(chunk.memoryId)))
+    && manifest.chunks.every(chunk => {
+      const memory = actualMemories.get(String(chunk.memoryId));
+      return Boolean(memory && hasCurrentMemoryEmbedding(memory as any));
+    })
     && manifest.coverage?.chunkStorageCoverage === 1;
 }
 
@@ -1104,8 +1216,32 @@ async function ensureOrgArticleFromFile(
   content: string | null,
   articleId?: string,
   metadata?: MarkdownKnowledgeMetadata,
+  signal?: AbortSignal,
 ): Promise<any | null> {
+  signal?.throwIfAborted();
   if (scope.domain !== 'work' || !scope.orgId) return null;
+  const sourcePath = path.join(scope.dir, filename);
+  const sourceStat = fs.statSync(sourcePath);
+  const fileMeta = findFileMeta(readDB(), filename, scope);
+  if (!fileMeta) throw Object.assign(new Error('Knowledge file metadata is unavailable.'), { status: 409 });
+  const indexCurrentArticle = async (article: any) => {
+    // Bind before the first await so deletion owns the newly created article.
+    fileMeta.orgArticleId = article.id;
+    writeDB(readDB());
+    await OrgKB.indexArticle(scope.orgId!, article.id, userId, { signal });
+    signal?.throwIfAborted();
+    const currentMeta = findFileMeta(readDB(), filename, scope);
+    const currentArticle = OrgKB.getArticle(scope.orgId!, article.id);
+    let currentStat: fs.Stats | undefined;
+    try { currentStat = fs.statSync(sourcePath); } catch {}
+    if (!currentStat || currentMeta !== fileMeta || currentMeta.orgArticleId !== article.id || !currentArticle
+      || currentStat.dev !== sourceStat.dev || currentStat.ino !== sourceStat.ino
+      || currentStat.size !== sourceStat.size || currentStat.mtimeMs !== sourceStat.mtimeMs
+      || currentStat.ctimeMs !== sourceStat.ctimeMs) {
+      throw Object.assign(new Error('Knowledge source changed during indexing. Retry with the current file.'), { status: 409 });
+    }
+    return currentArticle;
+  };
   const articleContent = (content && content.trim())
     ? content
     : `文件已上传到组织知识库。\n\n文件名：${repairFilename(filename)}`;
@@ -1119,8 +1255,7 @@ async function ensureOrgArticleFromFile(
       status: 'published',
     }, { index: false });
     if (!article) return null;
-    await OrgKB.indexArticle(scope.orgId, article.id);
-    return OrgKB.getArticle(scope.orgId, article.id) || article;
+    return indexCurrentArticle(article);
   }
   const article = OrgKB.createArticle(scope.orgId, userId, {
     title: repairFilename(filename),
@@ -1129,8 +1264,7 @@ async function ensureOrgArticleFromFile(
     tags: articleTags,
     status: 'published',
   }, { index: false });
-  await OrgKB.indexArticle(scope.orgId, article.id);
-  return OrgKB.getArticle(scope.orgId, article.id) || article;
+  return indexCurrentArticle(article);
 }
 
 function uniqueKnowledgeDestination(scope: FileScope, originalName: string): string {
@@ -1167,9 +1301,12 @@ async function saveKnowledgeFile(
   scope: FileScope,
   db: any,
 ): Promise<any> {
+  input.signal?.throwIfAborted();
+  input.assertAuthorized?.();
   const dest = uniqueKnowledgeDestination(scope, input.originalName || path.basename(input.sourcePath));
   copyOrMoveKnowledgeSource(input, dest);
   const finalName = path.basename(dest);
+  const assertSourceCurrent = captureKnowledgeSource(dest);
   const ext = path.extname(finalName);
   const stats = fs.statSync(dest);
   const mimeType = input.mimeType || getDownloadMime(dest) || '';
@@ -1222,8 +1359,10 @@ async function saveKnowledgeFile(
   // Extract supported document/media content so Lumi can retrieve it later.
   if (TEXT_KNOWLEDGE_EXTS.test(ext) || RTF_KNOWLEDGE_EXTS.test(ext) || EXTRACTABLE_KNOWLEDGE_EXTS.test(ext) || IMAGE_KNOWLEDGE_EXTS.test(ext) || AUDIO_KNOWLEDGE_EXTS.test(ext) || isAudioUpload) {
     extraction = isAudioUpload && !AUDIO_KNOWLEDGE_EXTS.test(ext)
-      ? await extractAudioKnowledge(dest)
-      : await extractKnowledgeFileContent(dest, userId);
+      ? await extractAudioKnowledge(dest, input.signal)
+      : await extractKnowledgeFileContent(dest, userId, input.signal);
+    input.signal?.throwIfAborted();
+    input.assertAuthorized?.();
     extractedContent = extraction.content;
     if (extractedContent) {
       entry.content = extractedContent.slice(0, 50000); // cap at 50KB for chat context
@@ -1245,7 +1384,8 @@ async function saveKnowledgeFile(
       const meta = findFileMeta(db, finalName, scope);
       if (meta) applyExtractionMeta(meta, extraction, extractedContent);
       if (extractedContent?.trim()) {
-        const article = await ensureOrgArticleFromFile(scope, userId, finalName, extractedContent, meta?.orgArticleId, extraction.sourceMetadata);
+        const article = await ensureOrgArticleFromFile(scope, userId, finalName, extractedContent, meta?.orgArticleId, extraction.sourceMetadata, input.signal);
+        input.assertAuthorized?.();
         const manifest = article?.id && scope.orgId
           ? OrgKB.getArticleIngestionManifest(scope.orgId, article.id)
           : null;
@@ -1274,18 +1414,21 @@ async function saveKnowledgeFile(
         entry.syncError = extraction.error || extraction.warning || 'No extractable content found';
       }
     } catch (orgErr: any) {
+      input.signal?.throwIfAborted();
       console.warn(`[OrgKB] Failed to sync "${finalName}": ${orgErr.message}`);
       entry.syncError = orgErr.message;
     }
   } else if (extractedContent?.trim()) {
     try {
       const result = await ingestDocument(userId, 'lumi', finalName, extractedContent, {
+        signal: input.signal,
         filePath: dest,
         domain: scope.domain,
         orgId: scope.orgId || '',
         sourceMetadata: extraction.sourceMetadata,
         extraction,
       });
+      input.assertAuthorized?.();
       const meta = findFileMeta(db, finalName, scope);
       if (meta) {
         if (!Array.isArray(meta.agentIds)) meta.agentIds = [];
@@ -1298,6 +1441,7 @@ async function saveKnowledgeFile(
       entry.partial = extraction.status === 'partial';
       console.log(`[AutoIngest] "${finalName}" -> ${result.chunkCount} chunks`);
     } catch (ingestErr: any) {
+      input.signal?.throwIfAborted();
       console.warn(`[AutoIngest] Failed for "${finalName}": ${ingestErr.message}`);
       const meta = findFileMeta(db, finalName, scope);
       if (meta) {
@@ -1320,6 +1464,10 @@ async function saveKnowledgeFile(
     }
   }
 
+  input.signal?.throwIfAborted();
+  input.assertAuthorized?.();
+  assertSourceCurrent();
+  if (!findFileMeta(readDB(), finalName, scope)) throw Object.assign(new Error('Knowledge file was removed during indexing.'), { status: 409 });
   return entry;
 }
 
@@ -1766,7 +1914,38 @@ function renameFileMemoryReferences(
       return value;
     });
     memory.sourceInteractionId = newPath;
+    if (memory.knowledgeProvenance) {
+      const provenance = memory.knowledgeProvenance;
+      provenance.sourcePath = newPath;
+      provenance.sourceLabel = newName;
+      provenance.citationKey = `source:${newName}#chunk:${provenance.chunkIndex + 1}/${provenance.chunkCount}#sha256:${provenance.chunkContentHash}`;
+    }
+    invalidateMemoryEmbedding(memory);
     memory.updatedAt = new Date().toISOString();
+  }
+  const meta = findFileMeta(db, oldName, scope);
+  const manifest = readCurrentIngestionManifest(meta);
+  if (manifest) {
+    const renamed = new Map(memories.map((memory: any) => [String(memory.id), memory]));
+    const chunks = manifest.chunks.map(chunk => {
+      const memory = renamed.get(String(chunk.memoryId));
+      if (!memory) return chunk;
+      const updated = {
+        ...chunk,
+        citationKey: memory.knowledgeProvenance?.citationKey || chunk.citationKey,
+        embeddingStatus: 'pending' as const,
+      };
+      delete updated.embeddingProvider;
+      delete updated.embeddingModel;
+      delete updated.embeddingDimensions;
+      delete updated.error;
+      return updated;
+    });
+    // A source keeps its ingestion identity across a rename, but the new
+    // filename changes embedding input and invalidates prior retrieval proof.
+    const updated = { ...manifest, chunks, updatedAt: new Date().toISOString() };
+    delete updated.retrieval;
+    applyIngestionManifest(meta, { ...updated, ...evaluateKnowledgeManifest(updated) });
   }
   return memories.length;
 }
@@ -1814,7 +1993,7 @@ function getSourceBacklinks(db: any, scope: FileScope, filename: string): string
   return buildSourceBacklinkMap(scopedMeta, names).get(filename) || [];
 }
 
-router.get('/files/list', (req: Request, res: Response) => {
+router.get('/files/list', requireAuth, (req: Request, res: Response) => {
   try {
     const scope = getFileScope(req);
     const db = readDB();
@@ -1889,7 +2068,7 @@ router.get('/files/obsidian/status', requireAuth, (req: Request, res: Response) 
   }
 });
 
-router.post('/files/obsidian/connect', requireAuth, (req: Request, res: Response) => {
+router.post('/files/obsidian/connect', requireAuth, requireUnifiedAdmin, requireUnifiedLocalRequest, (req: Request, res: Response) => {
   try {
     assertLocalHostRequest(req);
     const userId = getUserId(req);
@@ -1917,7 +2096,7 @@ router.post('/files/obsidian/connect', requireAuth, (req: Request, res: Response
   }
 });
 
-router.post('/files/obsidian/sync', requireAuth, async (req: Request, res: Response) => {
+router.post('/files/obsidian/sync', requireAuth, requireUnifiedAdmin, requireUnifiedLocalRequest, async (req: Request, res: Response) => {
   try {
     assertLocalHostRequest(req);
     const userId = getUserId(req);
@@ -1980,8 +2159,9 @@ router.delete('/files/obsidian/:id', requireAuth, (req: Request, res: Response) 
 
 // ── POST /files/upload — upload files + auto-ingest into Lumi's memory ──
 router.post('/files/upload', requireAuth, upload.array('files', MAX_UPLOAD_FILES), async (req: Request, res: Response) => {
+  const request = createRequestAbortController(req, res);
+  const uploadedFiles = (req.files || []) as Express.Multer.File[];
   try {
-    const uploadedFiles = req.files as Express.Multer.File[];
     if (!uploadedFiles || uploadedFiles.length === 0) {
       return res.status(400).json({ error: 'No files provided' });
     }
@@ -2007,14 +2187,20 @@ router.post('/files/upload', requireAuth, upload.array('files', MAX_UPLOAD_FILES
     if (!db.knowledgeFiles) db.knowledgeFiles = [];
 
     const saved: any[] = [];
-    for (const file of uploadedFiles) {
-      const entry = await saveKnowledgeFile({
-        sourcePath: file.path,
-        originalName: file.originalname,
-        size: file.size,
-        mimeType: file.mimetype || '',
-        move: true,
-      }, userId, scope, db);
+    const failed: Array<{ index: number; itemId?: string; fileName: string; error: string }> = [];
+    const authorization = captureUploadAuthorization(scope);
+    const identities = uploadItemIdentities(req.body, uploadedFiles.length);
+    for (const [index, file] of uploadedFiles.entries()) {
+      request.signal.throwIfAborted();
+      try {
+        const entry = await saveUploadedKnowledgeFile({
+          signal: request.signal,
+          sourcePath: file.path,
+          originalName: file.originalname,
+          size: file.size,
+          mimeType: file.mimetype || '',
+          move: true,
+        }, userId, scope, db, authorization, identities[index]);
       if (interiorProjectId) {
         const projectAsset = createInteriorProjectAsset({
           orgId: interiorProjectScopeId,
@@ -2030,8 +2216,14 @@ router.post('/files/upload', requireAuth, upload.array('files', MAX_UPLOAD_FILES
         });
         entry.interiorProjectAsset = projectAsset;
       }
-      saved.push(entry);
+        saved.push({ ...entry, uploadIndex: index, uploadItemId: identities[index]?.itemId });
+      } catch (error: any) {
+        request.signal.throwIfAborted();
+        authorization.assertCurrent();
+        failed.push({ index, itemId: identities[index]?.itemId, fileName: repairFilename(file.originalname), error: error?.message || 'Upload failed' });
+      }
     }
+    authorization.assertCurrent();
     writeDB(db);
     if (interiorProjectId && scope.domain === 'work' && scope.orgId) {
       logAudit({
@@ -2049,17 +2241,27 @@ router.post('/files/upload', requireAuth, upload.array('files', MAX_UPLOAD_FILES
         userAgent: req.get('user-agent'),
       });
     }
-    res.json({ success: true, files: saved });
+    await flushDBOrThrow();
+    authorization.assertCurrent();
+    request.signal.throwIfAborted();
+    res.status(saved.length > 0 ? 200 : 400).json({
+      success: failed.length === 0, partial: saved.length > 0 && failed.length > 0,
+      files: saved, failed, ...(saved.length === 0 ? { error: failed[0]?.error || 'No files uploaded' } : {}),
+    });
   } catch (err: any) {
-    for (const file of (req.files as Express.Multer.File[] | undefined) || []) {
+    if (!request.signal.aborted) sendRouteError(res, err);
+  } finally {
+    request.dispose();
+    // Multer owns these temporary paths; a replay/failure must not leave its staged copy behind.
+    for (const file of uploadedFiles) {
       try { if (fs.existsSync(file.path)) fs.unlinkSync(file.path); } catch {}
     }
-    sendRouteError(res, err);
   }
 });
 
 // ── POST /files/import-paths — import local files dropped into the desktop widget ──
 router.post('/files/import-paths', requireUnifiedAuth, requireUnifiedAdmin, requireUnifiedLocalRequest, async (req: Request, res: Response) => {
+  const request = createRequestAbortController(req, res);
   try {
     assertLocalHostRequest(req);
     const requestedPaths = Array.isArray(req.body?.paths) ? req.body.paths : [];
@@ -2078,43 +2280,53 @@ router.post('/files/import-paths', requireUnifiedAuth, requireUnifiedAdmin, requ
 
     const saved: any[] = [];
     const skipped: Array<{ path: string; error: string }> = [];
-    for (const rawPath of uniquePaths) {
+    const failed: Array<{ index: number; itemId?: string; fileName: string; error: string }> = [];
+    const authorization = captureUploadAuthorization(scope);
+    const identities = uploadItemIdentities(req.body, uniquePaths.length);
+    for (const [index, rawPath] of uniquePaths.entries()) {
+      request.signal.throwIfAborted();
       try {
         const sourcePath = resolveLocalImportPath(rawPath);
         const stat = fs.statSync(sourcePath);
-        if (!stat.isFile()) {
-          skipped.push({ path: rawPath, error: 'Only files can be imported' });
-          continue;
-        }
-        if (stat.size > MAX_UPLOAD_BYTES) {
-          skipped.push({ path: rawPath, error: 'File is larger than 500 MB' });
-          continue;
-        }
-        saved.push(await saveKnowledgeFile({
+        if (!stat.isFile()) throw new Error('Only files can be imported');
+        if (stat.size > MAX_UPLOAD_BYTES) throw new Error('File is larger than 500 MB');
+        const entry = await saveUploadedKnowledgeFile({
+          signal: request.signal,
           sourcePath,
           originalName: path.basename(sourcePath),
           size: stat.size,
           mimeType: getDownloadMime(sourcePath) || '',
           move: false,
-        }, userId, scope, db));
+        }, userId, scope, db, authorization, identities[index]);
+        saved.push({ ...entry, uploadIndex: index, uploadItemId: identities[index]?.itemId });
       } catch (err: any) {
+        request.signal.throwIfAborted();
+        authorization.assertCurrent();
         skipped.push({ path: rawPath, error: err?.message || String(err) });
+        failed.push({ index, itemId: identities[index]?.itemId, fileName: path.basename(rawPath), error: err?.message || String(err) });
       }
     }
 
+    authorization.assertCurrent();
     if (saved.length === 0) {
-      return res.status(400).json({ error: skipped[0]?.error || 'No files imported', skipped });
+      return res.status(400).json({ error: skipped[0]?.error || 'No files imported', files: [], failed, skipped });
     }
 
     writeDB(db);
-    res.json({ success: true, files: saved, skipped });
+    await flushDBOrThrow();
+    authorization.assertCurrent();
+    request.signal.throwIfAborted();
+    res.json({ success: failed.length === 0, partial: failed.length > 0, files: saved, failed, skipped });
   } catch (err: any) {
-    sendRouteError(res, err);
+    if (!request.signal.aborted) sendRouteError(res, err);
+  } finally {
+    request.dispose();
   }
 });
 
 // ── POST /files/save — save generated content as a file ──
 router.post('/files/save', requireAuth, async (req: Request, res: Response) => {
+  const request = createRequestAbortController(req, res);
   try {
     const { name, content } = req.body;
     if (!name || content === undefined) return res.status(400).json({ error: 'name and content required' });
@@ -2126,6 +2338,7 @@ router.post('/files/save', requireAuth, async (req: Request, res: Response) => {
     const contentText = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
     const filePath = path.join(scope.dir, safeName);
     fs.writeFileSync(filePath, contentText, 'utf-8');
+    const assertSourceCurrent = captureKnowledgeSource(filePath);
 
     const db = readDB();
     if (!db.knowledgeFiles) db.knowledgeFiles = [];
@@ -2155,7 +2368,7 @@ router.post('/files/save', requireAuth, async (req: Request, res: Response) => {
     if (meta) applyExtractionMeta(meta, generatedExtraction, generatedKnowledgeContent);
     let orgArticleId: string | undefined;
     if (scope.domain === 'work') {
-      const article = await ensureOrgArticleFromFile(scope, userId, safeName, generatedKnowledgeContent, meta?.orgArticleId, generatedExtraction.sourceMetadata);
+      const article = await ensureOrgArticleFromFile(scope, userId, safeName, generatedKnowledgeContent, meta?.orgArticleId, generatedExtraction.sourceMetadata, request.signal);
       orgArticleId = article?.id;
       if (meta) {
         if (!Array.isArray(meta.agentIds)) meta.agentIds = [];
@@ -2170,6 +2383,7 @@ router.post('/files/save', requireAuth, async (req: Request, res: Response) => {
     } else if (meta) {
       try {
         const result = await ingestDocument(userId, 'lumi', safeName, generatedKnowledgeContent, {
+          signal: request.signal,
           filePath,
           domain: scope.domain,
           orgId: scope.orgId || '',
@@ -2186,11 +2400,18 @@ router.post('/files/save', requireAuth, async (req: Request, res: Response) => {
         console.warn(`[AutoIngest] Failed for generated "${safeName}": ${ingestErr.message}`);
       }
     }
+    request.signal.throwIfAborted();
+    assertSourceCurrent();
+    if (findFileMeta(readDB(), safeName, scope) !== meta) throw Object.assign(new Error('Knowledge file metadata changed during indexing.'), { status: 409 });
     writeDB(db);
-
+    await flushDBOrThrow();
+    request.signal.throwIfAborted();
+    assertSourceCurrent();
     res.json({ success: true, filename: safeName, orgArticleId, entry: buildEntry(safeName, 'generated', meta?.agentIds || [], scope, meta?.status, meta) });
   } catch (err: any) {
-    sendRouteError(res, err);
+    if (!request.signal.aborted) sendRouteError(res, err);
+  } finally {
+    request.dispose();
   }
 });
 
@@ -2272,9 +2493,12 @@ router.get('/files/download/:id', requireAuth, (req: Request, res: Response) => 
 
     const ext = path.extname(safeName).toLowerCase();
     const mime = getDownloadMime(ext);
-    if (mime) res.setHeader('Content-Type', mime);
+    res.setHeader('Content-Type', mime || 'application/octet-stream');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    // Applies even to downloaded active documents if a browser renders them.
+    res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'");
 
-    const inline = req.query.inline === '1';
+    const inline = req.query.inline === '1' && SAFE_INLINE_EXTENSIONS.has(ext);
     if (inline) {
       res.setHeader('Content-Disposition', 'inline');
     } else {
@@ -2317,7 +2541,7 @@ router.get('/files/open-folder/:id', requireAuth, async (req: Request, res: Resp
 });
 
 // ── DELETE /files/delete/:id ──
-router.delete('/files/delete/:id', requireAuth, (req: Request, res: Response) => {
+router.delete('/files/delete/:id', requireAuth, async (req: Request, res: Response) => {
   try {
     const scope = getFileScope(req);
     assertKnowledgeWriteAccess(scope, scope.domain === 'work');
@@ -2335,6 +2559,7 @@ router.delete('/files/delete/:id', requireAuth, (req: Request, res: Response) =>
     const removedOrgArticle = scope.domain === 'work' && scope.orgId && meta?.orgArticleId
       ? OrgKB.deleteArticle(scope.orgId, scope.userId, meta.orgArticleId)
       : false;
+    await flushDBOrThrow();
     res.json({ success: true, removedMemoryCount, removedOrgArticle });
   } catch (err: any) {
     sendRouteError(res, err);
@@ -2342,7 +2567,7 @@ router.delete('/files/delete/:id', requireAuth, (req: Request, res: Response) =>
 });
 
 // ── POST /files/rename ──
-router.post('/files/rename', requireAuth, (req: Request, res: Response) => {
+router.post('/files/rename', requireAuth, async (req: Request, res: Response) => {
   try {
     const { id, newName } = req.body;
     if (!id || !newName) return res.status(400).json({ error: 'id and newName required' });
@@ -2375,6 +2600,7 @@ router.post('/files/rename', requireAuth, (req: Request, res: Response) => {
     if (scope.domain === 'work' && scope.orgId && orgArticleId) {
       OrgKB.updateArticle(scope.orgId, scope.userId, orgArticleId, { title: repairFilename(safeNewName) });
     }
+    await flushDBOrThrow();
     res.json({
       success: true,
       id: safeNewName,
@@ -2388,7 +2614,7 @@ router.post('/files/rename', requireAuth, (req: Request, res: Response) => {
 });
 
 // ── GET /files/info/:id ──
-router.get('/files/info/:id', (req: Request, res: Response) => {
+router.get('/files/info/:id', requireAuth, (req: Request, res: Response) => {
   try {
     const scope = getFileScope(req);
     const safeName = path.basename(req.params.id);
@@ -2530,6 +2756,7 @@ router.post('/files/ingestion/:id/verify', requireAuth, async (req: Request, res
 
 // ── POST /files/ingest — chunk into agent memory (RAG) ──
 router.post('/files/ingest', requireAuth, async (req: Request, res: Response) => {
+  const request = createRequestAbortController(req, res);
   try {
     const userId = getUserId(req);
     const scope = getFileScope(req);
@@ -2543,7 +2770,7 @@ router.post('/files/ingest', requireAuth, async (req: Request, res: Response) =>
       return res.status(404).json({ error: 'File not found' });
     }
 
-    const extraction = await extractKnowledgeFileContent(filePath, userId);
+    const extraction = await extractKnowledgeFileContent(filePath, userId, request.signal);
     const content = extraction.content;
 
     // Mark as indexing
@@ -2582,6 +2809,8 @@ router.post('/files/ingest', requireAuth, async (req: Request, res: Response) =>
       if (content?.trim()) applyExtractionMeta(meta, extraction, content);
       delete meta.indexingAt;
       writeDB(db);
+      await flushDBOrThrow();
+      request.signal.throwIfAborted();
       return res.json({
         success: true,
         reused: true,
@@ -2612,7 +2841,7 @@ router.post('/files/ingest', requireAuth, async (req: Request, res: Response) =>
     writeDB(db);
 
     if (scope.domain === 'work') {
-      const article = await ensureOrgArticleFromFile(scope, userId, safeName, content, meta?.orgArticleId, extraction.sourceMetadata);
+      const article = await ensureOrgArticleFromFile(scope, userId, safeName, content, meta?.orgArticleId, extraction.sourceMetadata, request.signal);
       if (!meta.agentIds.includes('org-kb')) meta.agentIds.push('org-kb');
       meta.orgArticleId = article?.id;
       meta.status = extraction.status === 'partial' ? 'partial' : 'indexed';
@@ -2623,6 +2852,8 @@ router.post('/files/ingest', requireAuth, async (req: Request, res: Response) =>
       if (manifest) applyIngestionManifest(meta, manifest);
       delete meta.indexingAt;
       writeDB(db);
+      await flushDBOrThrow();
+      request.signal.throwIfAborted();
       res.json({
         success: true,
         orgArticleId: article?.id,
@@ -2636,6 +2867,7 @@ router.post('/files/ingest', requireAuth, async (req: Request, res: Response) =>
     }
 
     const result = await ingestDocument(userId, agentId, safeName, content, {
+      signal: request.signal,
       filePath,
       domain: scope.domain,
       orgId: scope.orgId || '',
@@ -2644,12 +2876,18 @@ router.post('/files/ingest', requireAuth, async (req: Request, res: Response) =>
     });
 
     // Mark as indexed
+    // Replace only the old chunks captured by this request, after new indexing
+    // succeeds. A failed embedding must leave the previous index available.
+    const replacedMemoryIds = new Set(existingMemories.map((memory: any) => memory.id));
+    if (replacedMemoryIds.size) db.memories = (db.memories || []).filter((memory: any) => !replacedMemoryIds.has(memory.id));
     if (!meta.agentIds.includes(agentId)) meta.agentIds.push(agentId);
     meta.status = extraction.status === 'partial' ? 'partial' : 'indexed';
     applyExtractionMeta(meta, extraction, content);
     applyIngestionManifest(meta, result.manifest);
     delete meta.indexingAt;
     writeDB(db);
+    await flushDBOrThrow();
+    request.signal.throwIfAborted();
 
     res.json({
       success: true,
@@ -2661,7 +2899,9 @@ router.post('/files/ingest', requireAuth, async (req: Request, res: Response) =>
       coverage: result.manifest.coverage,
     });
   } catch (err: any) {
-    sendRouteError(res, err, 500);
+    if (!request.signal.aborted) sendRouteError(res, err, 500);
+  } finally {
+    request.dispose();
   }
 });
 

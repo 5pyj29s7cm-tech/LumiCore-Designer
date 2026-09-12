@@ -37,10 +37,10 @@ import type { CommandCenterView } from './commandCenterTypes';
 
 export type CommandCenterTask = {
   id: string;
-  kind?: 'autonomy' | 'takeover';
-  title?: string;
-  status?: string;
-  phase?: string;
+  kind?: 'autonomy' | 'takeover' | 'workflow';
+  title: string;
+  status: string;
+  phase: string;
   updatedAt?: string;
   toolCallsCount?: number;
   resultPreview?: string;
@@ -109,7 +109,7 @@ export function normalizeCommandCenterTask(value: unknown, locale?: 'zh' | 'en')
     : undefined;
   return {
     id,
-    kind: task.kind === 'takeover' ? 'takeover' : 'autonomy',
+    kind: task.kind === 'takeover' || task.kind === 'workflow' ? task.kind : 'autonomy',
     title: locale
       ? customerVisibleTaskDetail(task.title, locale, '')
       : String(task.title || '').trim(),
@@ -189,10 +189,11 @@ export function CommandCenterPanel({
   };
   backgroundOnly?: boolean;
 }) {
-  const { workDomain, orgConnection } = useApp();
+  const { user, workDomain, orgConnection } = useApp();
   const isWork = workDomain === 'work' && Boolean(orgConnection?.connected && orgConnection?.orgId);
   const isZh = t?.langCode !== 'en';
-  const scopeKey = `${isWork ? 'work' : 'personal'}:${isWork ? orgConnection?.orgId || '' : ''}`;
+  const runtimeScopeKey = `${isWork ? 'work' : 'personal'}:${isWork ? orgConnection?.orgId || '' : ''}`;
+  const scopeKey = JSON.stringify([user?.uid || '', runtimeScopeKey]);
   const [tasks, setTasks] = useState<CommandCenterTask[]>([]);
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
   const [controlInFlightIds, setControlInFlightIds] = useState<string[]>([]);
@@ -201,7 +202,7 @@ export function CommandCenterPanel({
   const scopeGenerationRef = useRef(0);
   const activeScopeKeyRef = useRef(scopeKey);
   const refreshInFlightRef = useRef<Promise<void> | null>(null);
-  const localRuntimeStatus = useRuntimeStatus({ enabled: runtimeStatusOverride === undefined, scopeKey });
+  const localRuntimeStatus = useRuntimeStatus({ enabled: runtimeStatusOverride === undefined && Boolean(user), scopeKey: runtimeScopeKey, userId: user?.uid });
   const {
     status,
     loading: runtimeLoading,
@@ -209,8 +210,9 @@ export function CommandCenterPanel({
     refresh: refreshRuntime,
   } = runtimeStatusOverride || localRuntimeStatus;
   const { scene, loading: sceneLoading, error: sceneError, refresh: refreshScene } = useLumiScene({
-    enabled: view === 'core',
-    scopeKey,
+    enabled: view === 'core' && Boolean(user),
+    scopeKey: runtimeScopeKey,
+    userId: user?.uid,
   });
 
   const copy = useMemo(() => getCommandCenterCopy(isZh ? 'zh' : 'en', isWork), [isWork, isZh]);
@@ -220,6 +222,7 @@ export function CommandCenterPanel({
     scopeGenerationRef.current += 1;
     setTasks([]);
     setExpandedTaskId(null);
+    setControlInFlightIds([]);
     setTaskError('');
   }, [scopeKey]);
 
@@ -278,20 +281,24 @@ export function CommandCenterPanel({
 
   const controlTask = useCallback(async (task: CommandCenterTask, action: 'pause' | 'resume' | 'cancel') => {
     if (controlInFlightIds.includes(task.id)) return;
+    const allowed = action === 'pause' ? task.controls?.canPause : action === 'resume' ? task.controls?.canResume : task.controls?.canCancel;
+    if (!allowed) return;
+    const request = { scopeKey, generation: scopeGenerationRef.current };
     setControlInFlightIds(previous => [...previous, task.id]);
     setTaskError('');
     try {
       const response = await apiFetch(`/api/autonomy/work/${encodeURIComponent(task.id)}/${action}`, { method: 'POST' });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok || payload?.ok === false) throw new Error(payload?.error || `${action} failed`);
+      if (!isCurrentScopeRequest(request, activeScopeKeyRef.current, scopeGenerationRef.current)) return;
       await refresh();
       await refreshRuntime();
     } catch (error: any) {
-      setTaskError(copy.degradedTaskState);
+      if (isCurrentScopeRequest(request, activeScopeKeyRef.current, scopeGenerationRef.current)) setTaskError(copy.degradedTaskState);
     } finally {
-      setControlInFlightIds(previous => previous.filter(id => id !== task.id));
+      if (isCurrentScopeRequest(request, activeScopeKeyRef.current, scopeGenerationRef.current)) setControlInFlightIds(previous => previous.filter(id => id !== task.id));
     }
-  }, [controlInFlightIds, copy.degradedTaskState, refresh, refreshRuntime]);
+  }, [controlInFlightIds, copy.degradedTaskState, refresh, refreshRuntime, scopeKey]);
 
   const orbitTasks = useMemo(() => buildLumiCoreOrbitTasks(tasks), [tasks]);
   const activeTasks = useMemo(() => tasks.filter(commandCenterTaskIsActive), [tasks]);

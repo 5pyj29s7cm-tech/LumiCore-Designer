@@ -31,6 +31,7 @@ import {
   extractRequestedCurrentAppText,
   isRunningSoftwareInspectionRequest,
   requiresCurrentAppUiMutation,
+  requiresMediaPlaybackAction,
   requestedDesktopWindowAction,
 } from './action_contract';
 import { getPersonalClientSurfaceByAction } from '../../shared/client_surfaces';
@@ -601,6 +602,7 @@ export function buildDeterministicLocalDesktopNavigationCommand(
     || normalizedIntent.operation !== 'navigate'
     || normalizedIntent.sideEffectClass !== 'none'
     || requiresCurrentAppUiMutation(taskText)
+    || requiresMediaPlaybackAction(taskText)
   ) return null;
   const target = String(normalizedIntent.target || '').trim();
   if (!target) return null;
@@ -1242,6 +1244,9 @@ export async function matchQuickCommand(
   options?: QuickCommandOptions,
 ): Promise<QuickCommandResult | null> {
   const clean = text.trim();
+  // Opening the player is preparation; the full playback request must reach
+  // the normal tool loop and its progressing-content verification.
+  if (requiresMediaPlaybackAction(clean)) return null;
   const normalizedIntent = normalizeActionIntent(clean);
 
   // Safety-critical intent classes are resolved before the generic "open X"
@@ -1273,6 +1278,7 @@ export async function matchQuickCommand(
  */
 export function isQuickCommand(text: string): boolean {
   const clean = text.trim();
+  if (requiresMediaPlaybackAction(clean)) return false;
   for (const pattern of patterns) {
     for (const regex of pattern.patterns) {
       if (regex.test(clean)) return true;

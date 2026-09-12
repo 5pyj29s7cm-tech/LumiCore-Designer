@@ -189,6 +189,9 @@ describe('task feedback frontend wiring', () => {
     expect(planner).toContain('data-command-center-task-details');
     expect(planner).toContain('normalizeTaskCompletionFeedback(task.completionFeedback)');
     expect(chat).toContain('normalizeTaskCompletionFeedback(data.completionFeedback)');
-    expect(desktop).toContain('normalizeTaskCompletionFeedback(raw?.completionFeedback || data?.completionFeedback)');
+    expect(chat).toContain('variant="chat"');
+    // Background task feedback belongs to the feed, not a second foreground reducer.
+    // The cross-task event behavior is exercised by desktop_foreground_ownership.test.ts.
+    expect(desktop).not.toContain('normalizeTaskCompletionFeedback(raw?.completionFeedback || data?.completionFeedback)');
   });
 });

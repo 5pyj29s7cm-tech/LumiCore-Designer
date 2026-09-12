@@ -734,15 +734,9 @@ describe('designer project delivery loop', () => {
       }),
       terminalVerification: { status: 'verified', strategy: 'terminal_receipt', reason: 'foreign receipt' },
     };
-    const rejected = recordIndustryWorkflowExecution({
-      ...scope,
-      taskId: started.task.id,
-      resultText: stageResult('project'),
-      toolRecords: [foreignReceipt],
-    });
-    expect(rejected.verification.passed).toBe(false);
-    expect(rejected.task.status).not.toBe('delivered');
-    expect(rejected.verification.summary).toMatch(/Missing verified required capability receipts/i);
+    expect(() => recordIndustryWorkflowExecution({
+      ...scope, taskId: started.task.id, resultText: stageResult('project'), toolRecords: [foreignReceipt],
+    })).toThrow(/delivered workflow is immutable/i);
   });
 
   it('rejects required domain receipts copied from workflow A into workflow B', () => {

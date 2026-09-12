@@ -647,7 +647,7 @@ export type ConversationActionTaskFinalizationOutcome =
  * from an earlier step in the same request from being mistaken for completion.
  */
 export interface ConversationActionTerminalDisposition {
-  outcome: 'blocked';
+  outcome: 'blocked' | 'cancelled';
   taskId: string;
   requestId: string;
   reason: string;
@@ -996,8 +996,8 @@ export function archiveBoundConversationActionReceipts(
             && (candidate.status === 'accepted' || candidate.status === 'leased')
           ))
         : null;
-      const authoritativeBlocked = Boolean(
-        disposition?.outcome === 'blocked'
+      const authoritativeDisposition = Boolean(
+        (disposition?.outcome === 'blocked' || disposition?.outcome === 'cancelled')
         && disposition.taskId === taskId
         && dispositionRequestId
         && dispositionReason
@@ -1014,11 +1014,12 @@ export function archiveBoundConversationActionReceipts(
         state.goal || task.goal,
         receipts,
         state.taskCapsule,
+        exactRequestOwnsActiveTask ? { requestId: receiptRequestId, taskId } : undefined,
       );
       const waitingForConfirmation = records.some(isConfirmationBlockedToolRecord);
       const hasFailure = records.some(record => !toolRecordSucceeded(record));
-      const status: ConversationTaskStatus = authoritativeBlocked
-        ? 'blocked'
+      const status: ConversationTaskStatus = authoritativeDisposition
+        ? disposition!.outcome
         : isTerminalConversationTaskStatus(task.status)
         ? task.status
         : completion.complete
@@ -1036,19 +1037,19 @@ export function archiveBoundConversationActionReceipts(
         status,
         unfinished: !isTerminalConversationTaskStatus(status),
         latestBlocker: status === 'blocked'
-          ? authoritativeBlocked
+          ? authoritativeDisposition
             ? dispositionReason
             : completion.blocker || task.blocker
           : status === 'failed' || status === 'cancelled'
-            ? task.blocker
+            ? authoritativeDisposition ? dispositionReason : task.blocker
             : '',
-        activeRequestId: !authoritativeBlocked && requestLeaseActive
+        activeRequestId: !authoritativeDisposition && requestLeaseActive
           && !records.some(record => record.requestId === state.activeRequestId)
           ? state.activeRequestId
           : undefined,
-        completionSource: !authoritativeBlocked && status === 'completed' && completion.complete
+        completionSource: !authoritativeDisposition && status === 'completed' && completion.complete
           ? 'tool_receipt'
-          : authoritativeBlocked
+          : authoritativeDisposition
             ? undefined
             : state.completionSource,
         assistantState: input.currentPairingAuthority && input.assistantState !== undefined
@@ -1067,7 +1068,7 @@ export function archiveBoundConversationActionReceipts(
           },
           state: nextState,
           outcome: status as 'blocked' | 'completed' | 'failed' | 'cancelled',
-          requestId: authoritativeBlocked
+          requestId: authoritativeDisposition
             ? dispositionRequestId
             : records.find(record => record.requestId)?.requestId,
           blocker: nextState.latestBlocker,
@@ -1076,7 +1077,7 @@ export function archiveBoundConversationActionReceipts(
           now,
           updateLivePointer: Boolean(conversation),
         });
-        if (authoritativeBlocked) terminalDispositionApplied = true;
+        if (authoritativeDisposition) terminalDispositionApplied = true;
       } else {
         if (nextState) context.actionState = sanitizeState(nextState);
         task.context = JSON.stringify(context);

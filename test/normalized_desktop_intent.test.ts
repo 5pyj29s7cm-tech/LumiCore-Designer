@@ -376,18 +376,17 @@ describe('normalized desktop intent priority', () => {
   });
 
   it('parses an actionable restatement as a correction of the same client action', () => {
-    const intent = normalizeActionIntent('我说的是切换客户端聊天模式');
+    const intent = normalizeActionIntent('我说的是打开聊天界面');
     expect(intent).toMatchObject({
       kind: 'client_navigation',
       operation: 'navigate',
       target: 'chat',
-      clientAction: 'set_client_mode',
-      clientActionArguments: { mode: 'chat' },
+      clientAction: 'open_chat',
       relation: 'correction',
     });
     expect(buildDeterministicClientNavigationCommand(intent)?.toolCall).toEqual({
       name: 'client_action',
-      arguments: { action: 'set_client_mode', mode: 'chat' },
+      arguments: { action: 'open_chat' },
     });
   });
 
@@ -513,7 +512,7 @@ describe('normalized desktop intent priority', () => {
     expect(normalizeActionIntent('\u751f\u6210\u4e00\u5f20\u771f\u5b9e\u672c\u5730\u6548\u679c\u56fe\uff0c\u4e0d\u8981\u6253\u5f00\u6216\u4fee\u6539\u5916\u90e8\u8f6f\u4ef6\uff0c\u4e0d\u8981\u5916\u53d1')).toMatchObject({
       kind: 'media_generation',
       operation: 'create',
-      target: 'image',
+      target: 'generate_image',
       sideEffectClass: 'external_commit',
     });
     expect(normalizeActionIntent('\u4e0d\u8981\u751f\u6210\u6548\u679c\u56fe\uff0c\u53ea\u67e5\u8be2\u5f53\u524d\u9879\u76ee\u72b6\u6001')).not.toMatchObject({

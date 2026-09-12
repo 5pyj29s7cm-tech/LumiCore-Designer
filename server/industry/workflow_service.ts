@@ -1361,6 +1361,9 @@ export function recordIndustryWorkflowExecution(input: RecordIndustryWorkflowInp
       archivedFilePaths: safeFilePaths(updated.artifacts.map(artifact => artifact.path || ''), contract),
     };
   }
+  if (existing.status === 'delivered' && previousVerification?.passed === true) {
+    throw new Error('The delivered workflow is immutable; new or foreign receipts cannot replace its verified result.');
+  }
   if (contract.requiresFileArtifact && filePaths.length === 0) {
     const blocker = missingFileArtifactBlocker(contract, toolRecords);
     const blocked = updateWorkTakeoverTask(input.userId, existing.id, {

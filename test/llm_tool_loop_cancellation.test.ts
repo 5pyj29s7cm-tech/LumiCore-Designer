@@ -283,7 +283,7 @@ describe('LLM tool loop cancellation boundary', () => {
     expect(result.text).toBe('The source looks incomplete.');
   });
 
-  it('forces the exact missing industry tool after the model falls back to stale ledger reads', async () => {
+  it('does not force a product-specific tool or execute stale ledger reads', async () => {
     const registry = new ToolRegistry();
     const assessment = vi.fn(async () => JSON.stringify({ ok: true, status: 'verified' }));
     const output = vi.fn(async () => JSON.stringify({ ok: true, status: 'verified', path: 'current.dxf' }));
@@ -345,7 +345,7 @@ describe('LLM tool loop cancellation boundary', () => {
       'industry_source_assessment',
       'industry_output_create',
     ]);
-    expect(result.text).toMatch(/bounded tool execution.+budget was exhausted/is);
+    expect(result.text).not.toMatch(/Created and verified current.dxf/i);
     expect(result.text).not.toMatch(/historical file as the current result/i);
   });
 

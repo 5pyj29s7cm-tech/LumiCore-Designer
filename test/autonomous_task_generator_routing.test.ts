@@ -25,6 +25,30 @@ describe('autonomous task generator model routing', () => {
     vi.clearAllMocks();
   });
 
+  it('does not seed fallback tasks after its parent cancels an in-flight generation', async () => {
+    const userId = `autonomous-generation-cancel-${Date.now()}`;
+    const { saveGateConfig } = await import('../server/autonomy/safety_gate');
+    const { ensureLearningWorkflow } = await import('../server/autonomy/workflows');
+    const { generateAutonomousTasks } = await import('../server/autonomy/task_generator');
+    const { getTaskQueue } = await import('../server/autonomy/task_queue');
+    const { upsertUserPreferredLLM } = await import('../server/llm/user_preferences');
+    saveGateConfig({ autonomyLevel: 'full' }, userId);
+    ensureLearningWorkflow(userId);
+    upsertUserPreferredLLM(userId, { provider: 'deepseek', model: 'deepseek-v4-flash', selectionMode: 'single' });
+    const controller = new AbortController();
+    const create = vi.fn(async (_request: unknown, options?: { signal?: AbortSignal }) => {
+      expect(options?.signal).toBeDefined();
+      controller.abort(new Error('Parent cycle stopped'));
+      expect(options?.signal?.aborted).toBe(true);
+      return { choices: [{ message: { role: 'assistant', content: '[]' } }] };
+    });
+    expect(await generateAutonomousTasks(userId, {
+      getDeepSeek: () => ({ chat: { completions: { create } } }), getGemini: () => null,
+    }, controller.signal)).toBe(0);
+    expect(create).toHaveBeenCalledOnce();
+    expect(getTaskQueue(userId)).toHaveLength(0);
+  });
+
   it('preserves the full getter chain and records ordered fallback to LM Studio', async () => {
     const userId = `autonomous-routing-${Date.now()}`;
     const { saveGateConfig } = await import('../server/autonomy/safety_gate');
@@ -124,7 +148,7 @@ describe('autonomous task generator model routing', () => {
       choices: [{ message: { role: 'assistant', content: '[]' } }],
     }));
     await generateAutonomousTasks(userId, {
-      getDeepSeek: () => ({ chat: { completions: { create } } }),
+      getDeepSeek: () => null,
       getGemini: () => null,
       getOpenAI: () => null,
       getAnthropic: () => null,
@@ -135,7 +159,7 @@ describe('autonomous task generator model routing', () => {
       getXiaomi: () => null,
       getKimi: () => null,
       getGlm: () => null,
-      getRelay: () => null,
+      getRelay: () => ({ chat: { completions: { create } } }),
     });
 
     expect(create).toHaveBeenCalled();
