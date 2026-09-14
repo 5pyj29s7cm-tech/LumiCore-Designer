@@ -1,4 +1,4 @@
-import { repairTestMemoryProvenance } from '../memory/provenance';
+import { repairTestMemoryProvenance, repairRuntimeLearningEvidence } from '../memory/provenance';
 import {
   readDB,
   flushDB,
@@ -152,6 +152,7 @@ export async function bootstrap(ctx: BootstrapContext) {
     initializeDesktopBootstrapProof();
     await ensureDatabaseInitialized();
     repairTestMemoryProvenance();
+    repairRuntimeLearningEvidence();
     const initializedDb = readDB();
     const migrationCounts = {
       quickCheck: requireDatabaseStartupQuickCheck(),
@@ -311,7 +312,7 @@ export async function bootstrap(ctx: BootstrapContext) {
       for (const timer of startupTimers) clearTimeout(timer);
       startupTimers.clear();
       stopSystemExplorationWorker();
-      scheduler.stop();
+      scheduler.stop({ drainSettledHandlers: true });
       unifiedRuntimeSupervisor?.stop();
     },
     drain: async () => {
