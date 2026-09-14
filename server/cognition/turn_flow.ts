@@ -64,6 +64,10 @@ export interface LumiTurnFlowInput {
 }
 
 export interface LumiTurnFlow {
+  /** User-authored root goal from the exact server-bound continuation task. */
+  rootTaskText?: string;
+  /** A prerequisite step must not complete the retained root goal. */
+  preparationRootText?: string;
   /** Exact server-resolved target shared across all execution consumers. */
   acceptedTaskTarget?: import('../conversation/task_target_anchor').AcceptedTaskTarget;
   channel: LumiTurnChannel;
@@ -329,7 +333,7 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
   const directIndustryWorkflowExecution = isCurrentIndustryWorkflowExecutionRequest(input.text);
   const conceptualCapabilityQuestion = isCapabilityMetaQuestion(input.text)
     && !directIndustryWorkflowExecution;
-  const continuationContext = compact(input.continuationContext);
+  const continuationContext = String(input.continuationContext || '').trim();
   const hasContinuationContext = Boolean(continuationContext);
   const directActionFollowupIntent = classifyRecentActionFollowupIntent(input.text);
   const recoveredActionFollowupIntent = /(?:^|\n)- followupIntent:\s*status(?:\s|$)/i.test(continuationContext)
@@ -345,7 +349,7 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
   const immediateAssistantRestatement = actionFollowupIntent === 'repeat';
   // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
   const explicitContinuationConfirmation =
-    /^(?:确认|确定|嗯|好|好的|可以|行|开始|yes|ok|okay|confirm|go)[。！？.!?]*$/iu.test(input.text.trim()); // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
+    /^(?:确认|确定|允许|同意|嗯|好|好的|可以|行|开始|yes|ok|okay|confirm|go)[。！？.!?]*$/iu.test(input.text.trim()); // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
   const currentAcceptsContinuationContext = needsRecentActionContinuationContext(input.text)
     || explicitContinuationConfirmation
     || recoveredActionFollowupIntent !== 'none';
@@ -451,7 +455,7 @@ export function buildLumiTurnFlow(input: LumiTurnFlowInput): LumiTurnFlow {
     // also describes how Lumi should recover if that work fails. Otherwise a
     // phrase such as “if vision is unavailable” can strip `desktop_open` from
     // an explicit “open Notepad” request and leave only diagnostic tools.
-    && !actionContractRequiresTools
+    && (!actionContractRequiresTools || actionContract.label === 'Current Lumi runtime diagnostic')
     && isDiagnosticOrRepairRequest(input.text);
   const clientActionOnlyTurn = !selfRepairTurn && clientActionIntent;
   const visionIntent = hasVisionIntent(routingText);
