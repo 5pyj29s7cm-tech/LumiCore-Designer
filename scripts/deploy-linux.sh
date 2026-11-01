@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Lumi Designer Linux Deployment
 # Usage: ./scripts/deploy-linux.sh [install_dir]
-# Default: /opt/lumi-core
+# Default: /opt/lumi-designer
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-INSTALL_DIR="${1:-/opt/lumi-core}"
+INSTALL_DIR="${1:-/opt/lumi-designer}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -89,11 +89,9 @@ sudo cp "$BINARY" "$INSTALL_DIR/lumi-core"
 sudo chmod +x "$INSTALL_DIR/lumi-core"
 echo -e "${GRAY}  lumi-core${NC}"
 
-# Copy dist-server (Node.js backend)
-DIST_SERVER="$PROJECT_DIR/desktop-resources/dist-server"
-sudo cp -R "$DIST_SERVER"/* "$INSTALL_DIR/dist-server/" 2>/dev/null || true
-# Ensure node binary is executable
-sudo chmod -R +x "$INSTALL_DIR/dist-server/"
+# Copy and verify the backend; any missing file or copy failure stops deployment.
+source "$SCRIPT_DIR/lib/deploy-backend.sh"
+install_backend_resources "$PROJECT_DIR/desktop-resources/dist-server" "$INSTALL_DIR/dist-server"
 echo -e "${GRAY}  dist-server/${NC}"
 
 # Copy GPT-SoVITS (optional)
@@ -108,7 +106,7 @@ echo -e "${GREEN}  Installed.${NC}"
 # ── Desktop shortcut ──────────────────────────────────────────────────
 echo -e "${YELLOW}[6/6] Creating desktop shortcut...${NC}"
 
-DESKTOP_ENTRY="$HOME/.local/share/applications/lumi-core.desktop"
+DESKTOP_ENTRY="$HOME/.local/share/applications/lumi-designer.desktop"
 mkdir -p "$(dirname "$DESKTOP_ENTRY")"
 cat > "$DESKTOP_ENTRY" << DESKTOPEOF
 [Desktop Entry]
@@ -123,8 +121,8 @@ StartupWMClass=lumi-core
 DESKTOPEOF
 
 # Also copy to desktop
-cp "$DESKTOP_ENTRY" "$HOME/Desktop/lumi-core.desktop" 2>/dev/null || true
-chmod +x "$HOME/Desktop/lumi-core.desktop" 2>/dev/null || true
+cp "$DESKTOP_ENTRY" "$HOME/Desktop/lumi-designer.desktop" 2>/dev/null || true
+chmod +x "$HOME/Desktop/lumi-designer.desktop" 2>/dev/null || true
 
 echo -e "${GREEN}  Desktop entry: ${DESKTOP_ENTRY}${NC}"
 

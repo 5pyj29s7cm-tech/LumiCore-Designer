@@ -1,34 +1,58 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import {
-  DEPRECATED_GENERIC_DESIGN_TEMPLATE_NAMES_CN,
-  INTERIOR_DESIGN_TEMPLATES_CN,
-} from '../server/regions/packs/cn/interior_design_templates';
+import { getIndustryWorkflowContract, getIndustryWorkflowContracts } from '../server/industry/workflow_contracts';
+import { getCurrentIndustryCapabilityProfile, matchCurrentIndustryWorkflow } from '../server/regions/packs/cn/industry_capability_profile';
 
 function source(file: string): string {
   return fs.readFileSync(path.join(process.cwd(), file), 'utf8');
 }
 
 describe('spatial and interior design variant', () => {
-  it('installs only spatial and interior specialist templates', () => {
-    expect(INTERIOR_DESIGN_TEMPLATES_CN.map(template => template.name)).toEqual([
-      '空间规划师',
-      '室内设计师',
-      '建筑条件协调顾问',
-      '室内可视化师',
-    ]);
+  it('exposes the five current project contracts through the actual edition profile', () => {
+    const contracts = getIndustryWorkflowContracts('design');
+    const profile = getCurrentIndustryCapabilityProfile();
+    expect(profile?.productLine).toBe('design');
+    expect(profile?.entries.map(entry => entry.contract)).toEqual(contracts);
+    expect(contracts.map(contract => contract.entryId)).toEqual(['project', 'cad', 'visualization', 'presentation', 'handoff']);
+    expect(getIndustryWorkflowContract('design', 'brand-designer')).toBeNull();
+  });
 
-    const searchable = JSON.stringify(INTERIOR_DESIGN_TEMPLATES_CN);
-    expect(searchable).not.toMatch(/品牌设计|Logo|UI\/UX|外立面设计|建筑体量设计/);
-    expect(searchable).toMatch(/空间规划/);
-    expect(searchable).toMatch(/室内设计/);
-    expect(searchable).toMatch(/既有条件|建筑条件/);
-    expect([...DEPRECATED_GENERIC_DESIGN_TEMPLATE_NAMES_CN]).toEqual(expect.arrayContaining([
-      '品牌设计师',
-      'UI/UX 审查师',
-      '设计规范师',
-    ]));
+  it.each([
+    ['project', '执行设计项目阶段'], ['cad', '执行CAD方案阶段'],
+    ['visualization', '生成效果图'], ['presentation', '制作提案 PPT'], ['handoff', '执行交付中心阶段'],
+  ])('routes an explicit %s request to its live contract', (stage, request) => {
+    const match = matchCurrentIndustryWorkflow(request);
+    expect(match?.entry.entryId).toBe(stage);
+    expect(match?.entry.contract).toBe(getIndustryWorkflowContract('design', stage));
+  });
+
+  it('does not activate visualization from a negated request', () => {
+    expect(matchCurrentIndustryWorkflow('不要生成效果图。')).toBeNull();
+  });
+
+  it('requires source/geometry and real output receipts instead of accepting template text', () => {
+    const project = getIndustryWorkflowContract('design', 'project')!;
+    const cad = getIndustryWorkflowContract('design', 'cad')!;
+    const visual = getIndustryWorkflowContract('design', 'visualization')!;
+    expect(project.requiredToolReceipts).toEqual(expect.arrayContaining(['mcp_design-studio-pack_interior_project_brief', 'mcp_design-studio-pack_space_planning_checklist']));
+    expect(cad.requiredToolReceipts).toEqual(expect.arrayContaining(['mcp_design-studio-pack_drawing_ingest_qa', 'cad_generate_dxf']));
+    expect(cad.requiresFileArtifact).toBe(true);
+    expect(cad.acceptedFileExtensions).toEqual(expect.arrayContaining(['.dxf', '.svg']));
+    expect(visual.requiredToolReceipts).toEqual(expect.arrayContaining(['mcp_design-studio-pack_interior_visual_direction', 'generate_image']));
+    expect(visual.requiresFileArtifact).toBe(true);
+    expect(visual.acceptedFileExtensions).not.toContain('.txt');
+  });
+
+  it('retains professional review and stops the handoff contract before external delivery', () => {
+    const handoff = getIndustryWorkflowContract('design', 'handoff')!;
+    expect(handoff.requiredToolReceipts).toContain('design_delivery_package_create');
+    expect(handoff.nextActions.join(' ')).toMatch(/stop before external delivery/i);
+    expect(handoff.confirmationBoundaries.join(' ')).toMatch(/professional sign-off.*approval/i);
+    expect(handoff.executionTools).not.toEqual(expect.arrayContaining(['send_email']));
+    for (const contract of getIndustryWorkflowContracts('design')) {
+      expect(contract.confirmationBoundaries.join(' ')).toMatch(/review|approval/i);
+    }
   });
 
   it('ships focused skill tools instead of generic brand and UI tools', () => {
