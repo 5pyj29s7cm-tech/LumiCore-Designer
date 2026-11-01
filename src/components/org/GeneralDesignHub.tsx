@@ -1,3 +1,4 @@
+import { buildGeneralDesignPrompt } from '../../i18n/generalDesignPrompt';
 import React, { useMemo, useState } from 'react';
 import {
   Building2,
@@ -251,13 +252,7 @@ function DesignToolView({ config, workspace }: { config: ToolConfig; workspace: 
 
   const run = () => {
     const outputGuide = config.output.map(item => `- ${item}`).join('\n');
-    send(`${config.role}
-
-请按以下模块输出：
-${outputGuide}
-
-用户需求：
-${input}`);
+    send(buildGeneralDesignPrompt(config.role, outputGuide, input));
   };
 
   return (

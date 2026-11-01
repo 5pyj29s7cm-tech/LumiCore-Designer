@@ -59,7 +59,9 @@ export function buildConversationActionContinuationState(
   const followupIntent = classifyConversationActionFollowupIntent(userText, previous, undefined, analysis);
   const sameRequestBlockedObservation = Boolean(designerRequest(userText)?.requiresStage
     && previous?.status === 'blocked' && previous.latestInstruction === userText
-    && input.requestId && previous.activeRequestId === input.requestId
+    // A terminal normalization clears the execution lease. Compare the incoming
+    // owner update identity without restoring that lease on the output.
+    && input.requestId && input.previous?.activeRequestId === input.requestId
     && calls.every(call => /(?:^|_)(?:status|state|get|list|inspect|read)(?:_|$)/iu.test(toolCallName(call))));
   const samePreparedTurn = Boolean(
     previous

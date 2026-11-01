@@ -20,13 +20,21 @@ function safeFileName(value: string): string {
 
 function safeLayer(value: any, fallback: string): string {
   const raw = String(value || '').trim();
+// i18n-allow: recognized input vocabulary; this literal does not render user-facing text.
   const mapped = /(?:外轮廓|轮廓|边界)/u.test(raw) ? 'OUTLINE'
+// i18n-allow: recognized input vocabulary; this literal does not render user-facing text.
     : /(?:分区|区域)/u.test(raw) ? 'ZONE'
+// i18n-allow: recognized input vocabulary; this literal does not render user-facing text.
     : /(?:墙|隔断)/u.test(raw) ? 'WALL'
+// i18n-allow: recognized input vocabulary; this literal does not render user-facing text.
     : /(?:门)/u.test(raw) ? 'DOOR'
+// i18n-allow: recognized input vocabulary; this literal does not render user-facing text.
     : /(?:窗)/u.test(raw) ? 'WINDOW'
+// i18n-allow: recognized input vocabulary; this literal does not render user-facing text.
     : /(?:尺寸)/u.test(raw) ? 'DIM'
+// i18n-allow: recognized input vocabulary; this literal does not render user-facing text.
     : /(?:标注|文字|文本)/u.test(raw) ? 'TEXT'
+// i18n-allow: recognized input vocabulary; this literal does not render user-facing text.
     : /(?:标题)/u.test(raw) ? 'TITLE'
     : raw;
   const ascii = String(mapped || fallback)

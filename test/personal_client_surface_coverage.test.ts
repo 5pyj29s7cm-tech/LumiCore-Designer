@@ -124,7 +124,13 @@ describe('complete personal-client surface contract', () => {
     );
     const appIcons = sourceBlock(desktop, 'const appIcons = [', 'const desktopAppEntries');
     const utilityIcons = sourceBlock(desktop, 'const utilityAppEntries = [', 'const allAppEntries');
+    // Designer maps five literal workspace tuples into template-literal IDs.
+    // Inspect that actual mapping as well as the common literal window IDs.
+    const designerViews = Array.from(desktopIcons.matchAll(/\['(project|cad|visualization|presentation|handoff)',/g), match => match[1]);
+    expect(designerViews).toEqual(['project', 'cad', 'visualization', 'presentation', 'handoff']);
+    expect(desktopIcons).toContain('windowId: `design-${view}`');
     const renderedLauncherIds = Array.from(new Set([
+      ...designerViews.map(view => `design-${view}`),
       ...quotedPropertyValues(desktopIcons, 'windowId'),
       ...quotedPropertyValues(appIcons, 'id'),
       ...quotedPropertyValues(utilityIcons, 'id'),

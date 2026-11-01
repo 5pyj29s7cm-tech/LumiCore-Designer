@@ -6,8 +6,11 @@ export function splitInteriorList(value: unknown): string[] {
     .filter(Boolean);
 }
 
+// i18n-allow: recognized input vocabulary; this literal does not render user-facing text.
 const NEGATED_EVIDENCE_RE = /(?:^|[\s:：,，;；])(?:(?:no|none|not supplied|not provided|missing|without|unavailable|unknown)\b|无|未提供|没有|暂无|缺少|不含|未知)/i;
+// i18n-allow: recognized input vocabulary; this literal does not render user-facing text.
 const NON_SOURCE_DESCRIPTION_RE = /(?:仅有|只有|仅存在).*(?:需求|文字|描述|信息|面积)/i;
+// i18n-allow: recognized input vocabulary; this literal does not render user-facing text.
 const LINEAR_DIMENSION_RE = /(?:\d+(?:\.\d+)?(?:\s*[x×*]\s*\d+(?:\.\d+)?){0,2}\s*(?:mm|cm|m\b|毫米|厘米|米(?!方|²|2)))/i;
 
 function isPositiveEvidenceClaim(value: string): boolean {
@@ -23,6 +26,7 @@ function isPositiveSourceReference(value: string): boolean {
 function isVerifiedLinearDimension(value: string): boolean {
   const text = String(value || '').trim();
   if (!isPositiveEvidenceClaim(text)) return false;
+// i18n-allow: recognized input vocabulary; this literal does not render user-facing text.
   if (/(?:平方米|平方公尺|m\s*[²2]|sq\.?\s*m)/i.test(text) && !/(?:mm|cm|毫米|厘米)/i.test(text)) return false;
   return LINEAR_DIMENSION_RE.test(text);
 }

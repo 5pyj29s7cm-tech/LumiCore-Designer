@@ -5,8 +5,13 @@ import { buildActionEvidenceContract, claimsCurrentAppSaveCompletion, hasCoreAct
 import { affirmativeActionClauses } from '../cognition/action_instruction_clauses';
 import { responseClaimFileTargets, responseExecutionClaims } from './response_execution_claims';
 import { hasPublicSourceObservationEvidence } from '../cognition/contracts/receipt_evidence';
+import { evaluateMediaGenerationEvidence } from '../cognition/contracts/media_contract';
 import { CN_COMPLETION_GUARD_MESSAGES } from "../regions/messages/completion_guard_messages";
 import { normalizeActionIntent, isStoredMemoryRecallQuestion } from '../cognition/normalized_action_intent';
+import { hasMediaPlaybackEvidence } from '../cognition/action_contract';
+import { isModelConfigurationReadRequest } from '../cognition/model_configuration_intent';
+import { CN_REPORTED_EXECUTION_MESSAGES } from '../regions/messages/reported_execution_messages';
+import { hasCurrentLegalResearchPlanEvidence } from '../cognition/legal_research_plan_evidence';
 
 import { classifyToolRecordTaskDurability } from '../cognition/continuation/tool_receipts';
 import { formatGroundedKnowledgeObservation, isKnowledgeInventoryRequest } from '../cognition/knowledge_result';
@@ -18,6 +23,25 @@ export interface CompletionGuardResult {
   reasonCode?: 'successful_irrelevant_evidence';
 }
 
+/** Only a full displayed source block is data; a short word cannot erase a predicate in prose. */
+export function omitObservedSourceBlocks(text: string, bodies: string[]): string {
+  for (const body of new Set(bodies.filter(Boolean))) {
+    let offset = 0;
+    while (offset <= text.length - body.length) {
+      const index = text.indexOf(body, offset);
+      if (index < 0) break;
+      const end = index + body.length;
+      if ((index === 0 || text[index - 1] === '\n')
+        && (end === text.length || text[end] === '\n' || text.slice(end, end + 2) === '\r\n')) {
+        text = text.slice(0, index) + text.slice(end);
+        break;
+      }
+      offset = index + 1;
+    }
+  }
+  return text;
+}
+
 interface CompletionGuardInput {
   task: string;
   response: string;
@@ -27,6 +51,8 @@ interface CompletionGuardInput {
   taskId?: string;
   acceptedTaskTarget?: ToolContext['acceptedTaskTarget'];
   acceptedActionContract?: ToolContext['acceptedActionContract'];
+  /** Validate reported facts without re-adjudicating an already blocked parent request. */
+  claimsOnly?: boolean;
 }
 
 const DESKTOP_ACTION_TASK_RE =
@@ -215,13 +241,12 @@ export function guardCompletionClaims(input: CompletionGuardInput): CompletionGu
     && classifyToolRecordTaskDurability(call) === 'durable');
   const currentSuccessful = successful.filter(call => artifactRecordMatchesTurn(call, input)
     && call.terminalVerification?.status !== 'unverified');
-  const claimText = currentSuccessful.filter(call => isSuccessfulExactDocumentRead(call)
+  const sourceBodies = currentSuccessful.filter(call => isSuccessfulExactDocumentRead(call)
     && documentReadMatchesRequestedTarget(call, task, input.acceptedTaskTarget)
     && !currentSuccessful.some(producer => isArtifactProducerRecord(producer)
-      && sameArtifactPath(artifactPathFromRecord(producer), artifactPathFromRecord(call)))).reduce((text, call) => {
-    const body = actualDocumentReadContent(call);
-    return body ? text.replace(body, '\n') : text;
-  }, response);
+      && sameArtifactPath(artifactPathFromRecord(producer), artifactPathFromRecord(call))))
+    .map(actualDocumentReadContent);
+  const claimText = omitObservedSourceBlocks(response, sourceBodies);
   const replyClaims = responseExecutionClaims(claimText);
   const { claims } = replyClaims;
   const needsEvidence = actionContract.applies || normalizeActionIntent(task).sideEffectClass !== 'none'
@@ -237,23 +262,45 @@ export function guardCompletionClaims(input: CompletionGuardInput): CompletionGu
 
   // This guard checks what the answer claims. A pending-input explanation is
   // preserved; the finalizer still owns whether the requested task is complete.
-  if (claims.length === 0 && replyClaims.deferred) return { text: response, blocked: false };
+  if (claims.length === 0 && replyClaims.deferred
+    && !durableCalls.some(call => !isSuccessfulToolCall(call))
+    && !(actionContract.applies && !hasDomainCompletionEvidence
+      && failed.some(call => artifactRecordMatchesTurn(call, input)))) return { text: response, blocked: false };
   const containsKind = (contract: LumiActionContract, kind: LumiActionContract['kind']): boolean => contract.kind === kind
     || Boolean(contract.components?.some(component => containsKind(component.contract, kind)));
+  const matchesClaimedPath = (target: string, actual: string) => /[\\/]/u.test(target) ? sameArtifactPath(target, actual)
+    : Boolean(actual) && actual.split(/[\\/]/u).pop()?.toLocaleLowerCase() === target.toLocaleLowerCase();
   const matchesFileClaim = (text: string, records: ToolExecutionRecord[]) => {
     const targets = responseClaimFileTargets(text);
-    return targets.length ? targets.every(target => records.some(record => {
-      const actual = artifactPathFromRecord(record);
-      return /[\\/]/u.test(target) ? sameArtifactPath(target, actual)
-        : Boolean(actual) && actual.split(/[\\/]/u).pop()?.toLocaleLowerCase() === target.toLocaleLowerCase();
-    })) : records.length > 0;
+    return targets.length ? targets.every(target => records.some(record => matchesClaimedPath(target, artifactPathFromRecord(record)))) : records.length > 0;
   };
   const unsupportedClaim = claims.find(claim => {
+    if (claim.immediate && currentSuccessful.every(isSuccessfulExactDocumentRead)) return true;
+    // A plan is a local work product, never evidence of querying platforms or
+    // performing an external action. Do not let its durable flag prove those.
+    if (currentSuccessful.length > 0 && currentSuccessful.every(call => call.name === 'legal_external_research_plan')) {
+      return !hasCurrentLegalResearchPlanEvidence(currentSuccessful,
+        { taskText: task, requestId: input.requestId, taskId: input.taskId }, claim.text);
+    }
     // A successful search/fetch only proves observation. No current generic
     // receipt binds a factual/authority-verification claim to a verified result.
     if (claim.kind === 'source_verification') return true;
     if (claim.kind === 'source') return !hasPublicSourceObservationEvidence(currentSuccessful, claim.text);
+    if (claim.kind === 'playback') return !hasMediaPlaybackEvidence(currentSuccessful, claim.text,
+      { requestId: input.requestId, taskId: input.taskId });
+    if (claim.kind === 'configuration') return !isModelConfigurationReadRequest(task) || !hasDomainCompletionEvidence;
     if (claim.kind === 'artifact') {
+      if (claim.mediaKind === 'video') {
+        const matchingMediaContract = (contract: LumiActionContract): boolean => {
+          if (contract.kind === 'media_generation' && contract.mediaGeneration?.toolName === 'generate_video') {
+            const evidence = evaluateMediaGenerationEvidence(contract, currentSuccessful, input);
+            return evidence.complete && responseClaimFileTargets(claim.text, claim.mediaKind).every(target =>
+              evidence.receipt?.artifacts.some(artifact => matchesClaimedPath(target, artifact.path || '')));
+          }
+          return Boolean(contract.components?.some(component => matchingMediaContract(component.contract)));
+        };
+        return !matchingMediaContract(actionContract);
+      }
       if (hasDomainCompletionEvidence && actionContract.kind === 'work_task'
         && responseClaimFileTargets(claim.text).length === 0
         // i18n-allow: A task-creation receipt does not substantiate a saved file.
@@ -270,8 +317,15 @@ export function guardCompletionClaims(input: CompletionGuardInput): CompletionGu
   });
   if (unsupportedClaim) {
     const reason = `Missing current-turn evidence for reported ${unsupportedClaim.kind} ${unsupportedClaim.immediate ? 'execution promise' : 'completion'}.`;
-    return { text: buildGuardedResponse(task, reason, successful, failed), blocked: true, reason };
+    // i18n-allow: Reminder creation is a distinct effect, not an ordinary saved artifact.
+    const kind = unsupportedClaim.kind === 'artifact' && /提醒|闹钟|remind|alarm/iu.test(unsupportedClaim.text)
+      ? 'reminder' : unsupportedClaim.kind;
+    const detail = CN_REPORTED_EXECUTION_MESSAGES.unverified[kind as keyof typeof CN_REPORTED_EXECUTION_MESSAGES.unverified];
+    return { text: detail && /[\u3400-\u9fff]/u.test(task + response) ? kind === 'open' && (isClientSurfaceTask(task) || isDesktopActionTask(task))
+      ? buildGuardedResponse(task, reason, successful, failed).split('。')[0] + '；' + detail : detail
+      : buildGuardedResponse(task, reason, successful, failed), blocked: true, reason };
   }
+  if (input.claimsOnly) return { text: response, blocked: false };
 
   // The accepted contract owns required effects. Historical saves and excluded
   // edits in an artifact handoff do not create a separate current-app mutation.
