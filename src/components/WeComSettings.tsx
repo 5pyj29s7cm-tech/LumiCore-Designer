@@ -16,42 +16,26 @@ import {
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { toast } from 'sonner';
-import { appConfirm } from '../lib/appConfirm';
+import { useAppConfirm } from '../lib/appConfirm';
 import { uiMessage } from '../i18n/uiMessages';
 import { formatMessagingBindingCommand } from '../i18n/locales/messaging';
+import type { MessagingBinding } from '../../server/messaging/bindings';
+import type { MessagingConfig } from '../../server/messaging/config';
+import type { MessagingConnectionStatus } from '../../server/messaging/connections';
+import { useMessagingReads } from '../hooks/useMessagingReads';
+import { organizationRemediationCopy } from '../i18n/locales/organizationRemediation';
 
-type WeComMode = 'aibot_long_connection' | 'app_webhook';
+type WeComMode = MessagingConfig['wecom']['mode'];
+type WeComBinding = Pick<MessagingBinding, 'id' | 'platformUserId' | 'chatId' | 'chatType' | 'orgId' | 'createdAt'>;
 
-interface WeComBinding {
-  id: string;
-  platformUserId: string;
-  chatId?: string;
-  chatType?: 'private' | 'group';
-  orgId: string;
-  createdAt: string;
-}
-
-interface ConnectionStatus {
-  state?: 'disabled' | 'connecting' | 'connected' | 'reconnecting' | 'error';
-  lastConnectedAt?: string;
-  lastMessageAt?: string;
-  lastError?: string;
-  reconnectAttempts?: number;
-}
-
-interface WeComConfigResponse {
-  mode?: WeComMode;
-  botId?: string;
+interface WeComConfigResponse extends Partial<Pick<MessagingConfig['wecom'], 'mode' | 'botId' | 'corpId' | 'agentId' | 'enabled'>> {
   botIdMasked?: string;
   hasBotSecret?: boolean;
-  corpId?: string;
   corpIdMasked?: string;
-  agentId?: string;
   hasSecret?: boolean;
   hasToken?: boolean;
   hasAesKey?: boolean;
-  enabled?: boolean;
-  connection?: ConnectionStatus | null;
+  connection?: Partial<MessagingConnectionStatus> | null;
 }
 
 const EMPTY_FORM = {
@@ -65,13 +49,14 @@ const EMPTY_FORM = {
 };
 
 export function WeComSettings({ t }: { t?: any }) {
+  const appConfirm = useAppConfirm();
   const isZh = t?.langCode !== 'en';
   const locale = isZh ? 'zh' : 'en';
-  const ui = (zh: string, en: string) => isZh ? zh : en;
+  const reads = useMessagingReads();
   const [config, setConfig] = useState<WeComConfigResponse | null>(null);
   const [mode, setMode] = useState<WeComMode>('aibot_long_connection');
   const [form, setForm] = useState(EMPTY_FORM);
-  const [connection, setConnection] = useState<ConnectionStatus | null>(null);
+  const [connection, setConnection] = useState<Partial<MessagingConnectionStatus> | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [bindingCode, setBindingCode] = useState('');
@@ -80,9 +65,7 @@ export function WeComSettings({ t }: { t?: any }) {
   const [bindings, setBindings] = useState<WeComBinding[]>([]);
 
   const loadConfig = async (resetForm = false) => {
-    const res = await fetch('/api/wecom/config', { credentials: 'include' });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || uiMessage('we-com-settings.failed-to-load-configuration.7ef35e8101'));
+    const data = await reads.read('/api/wecom/config');
     const nextMode: WeComMode = data.mode === 'app_webhook' ? 'app_webhook' : 'aibot_long_connection';
     setConfig(data);
     setMode(nextMode);
@@ -99,20 +82,16 @@ export function WeComSettings({ t }: { t?: any }) {
 
   const loadStatus = async () => {
     try {
-      const res = await fetch('/api/wecom/status', { credentials: 'include' });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) {
+      const data = await reads.read('/api/wecom/status');
         setConfig(previous => ({ ...(previous || {}), enabled: Boolean(data.configured) }));
         setConnection(data.connection || null);
-      }
     } catch {}
   };
 
   const loadBindings = async () => {
     try {
-      const res = await fetch('/api/wecom/bindings', { credentials: 'include' });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) setBindings(Array.isArray(data.bindings) ? data.bindings : []);
+      const data = await reads.read('/api/wecom/bindings');
+      setBindings(data.bindings);
     } catch {}
   };
 
@@ -125,6 +104,7 @@ export function WeComSettings({ t }: { t?: any }) {
   }, []);
 
   const save = async () => {
+    if (reads.configFailed) return;
     if (mode === 'aibot_long_connection') {
       if (!form.botId.trim()) {
         toast.error(uiMessage('we-com-settings.bot-id-is-required.efd9d5b119'));
@@ -243,6 +223,7 @@ export function WeComSettings({ t }: { t?: any }) {
 
   return (
     <div className="space-y-6">
+      {reads.error && <div role="alert">{organizationRemediationCopy(locale).configError} {reads.error}<button type="button" onClick={() => { void loadConfig().catch(() => {}); void loadBindings(); void loadStatus(); }}>{organizationRemediationCopy(locale).retry}</button></div>}
       <div className="flex items-center gap-3 rounded-lg border border-white/10 bg-white/5 p-4">
         <span className={`h-3 w-3 rounded-full ${online ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : state === 'error' ? 'bg-red-400' : configured ? 'bg-amber-400' : 'bg-white/20'}`} />
         <div className="min-w-0">

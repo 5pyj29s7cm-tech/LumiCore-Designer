@@ -1,7 +1,7 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import { FeedbackBanner } from './FeedbackBanner';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion } from 'motion/react';
 import {
-  AlertCircle,
   Building2,
   CheckCircle,
   Copy,
@@ -14,130 +14,114 @@ import {
 } from 'lucide-react';
 import { useT } from '../../lib/useT';
 import { useApp } from '../../contexts/AppContext';
-import { appConfirm } from '../../lib/appConfirm';
-import { formatUiMessage, uiMessage } from '../../i18n/uiMessages';
+import { useAppConfirm } from '../../lib/appConfirm';
+import { apiJson } from '../../services/apiClient';
+import { useAsyncOperation } from '../../hooks/useAsyncOperation';
+import { uiMessage } from '../../i18n/uiMessages';
+import { orgAdminCompletenessCopy } from '../../i18n/locales/orgAdminCompleteness';
 
-type Feedback = { type: 'success' | 'error'; text: string };
+function readOrg(value: any, id: string) {
+  if (value?.id !== id || typeof value.name !== 'string' || typeof value.slug !== 'string') throw new Error('Organization receipt was not confirmed');
+  return value;
+}
 
 export function OrgSettings() {
-  const t = useT();
-  const { orgConnection, switchDomain } = useApp();
-  const [org, setOrg] = useState<any>(null);
-  const [name, setName] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [invitationCode, setInvitationCode] = useState('');
-  const [invitationRole, setInvitationRole] = useState('member');
-  const [generating, setGenerating] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const { user, workDomain, orgConnection } = useApp();
+  return user ? <OrganizationForm key={JSON.stringify([user.uid, user.role, workDomain, orgConnection?.orgId, orgConnection?.orgRole])} initialOrgId={orgConnection?.orgId || ''} /> : null;
+}
 
-  const loadOrg = useCallback(async () => {
-    setLoading(true);
-    setFeedback(null);
-    try {
-      let orgId = orgConnection?.orgId || '';
-      if (!orgId) {
-        const orgsRes = await fetch('/api/org/org', { credentials: 'include' });
-        const orgs = await orgsRes.json().catch(() => []);
-        if (!orgsRes.ok) throw new Error((orgs as any).error || formatUiMessage('org-settings.failed-to-load-organizations-value0.0c01e9694d', { value0: orgsRes.status }));
-        if (!Array.isArray(orgs) || orgs.length === 0) throw new Error(uiMessage('org-settings.no-organization-found.90a2ad4211'));
-        orgId = orgs[0].id || orgs[0].orgId;
-      }
-
-      const orgDetailRes = await fetch(`/api/org/org/${orgId}`, { credentials: 'include' });
-      const orgData = await orgDetailRes.json().catch(() => ({}));
-      if (!orgDetailRes.ok) throw new Error(orgData.error || formatUiMessage('org-settings.failed-to-load-organization-value0.29c105c15a', { value0: orgDetailRes.status }));
-      setOrg(orgData);
-      setName(orgData.name || '');
-    } catch (err: any) {
-      setOrg(null);
-      setFeedback({ type: 'error', text: err.message || String(err) });
-    } finally {
-      setLoading(false);
+function OrganizationForm({ initialOrgId }: { initialOrgId: string }) {
+  const t = useT(), { user, switchDomain } = useApp(), appConfirm = useAppConfirm();
+  const copy = orgAdminCompletenessCopy(t.langCode);
+  const [org, setOrg] = useState<any>();
+  const [name, setName] = useState(''), [invitationCode, setInvitationCode] = useState('');
+  const [invitationRole, setInvitationRole] = useState('member'), [copied, setCopied] = useState(false);
+  const [message, setMessage] = useState('');
+  const [eligibleMembers, setEligibleMembers] = useState<string[] | null>(null), [newOwner, setNewOwner] = useState('');
+  const [accessPending, setAccessPending] = useState(false), [refreshAttempt, setRefreshAttempt] = useState(0);
+  const confirmingTransfer = useRef(false);
+  const resolvedOrgId = useRef(initialOrgId);
+  const { busy, error, run } = useAsyncOperation();
+  const loading = busy === 'load' || (org === undefined && !error), saving = busy === 'save', generating = busy === 'invite';
+  const feedback = error ? { type: 'error' as const, text: error } : message ? { type: 'success' as const, text: message } : null;
+  const loadOrg = useCallback(() => run('load', async signal => {
+    let orgId = resolvedOrgId.current;
+    if (!orgId) {
+      const organizations = await apiJson('/api/org/org', { signal });
+      if (!Array.isArray(organizations) || typeof organizations[0]?.id !== 'string' || !organizations[0].id) throw new Error(uiMessage('org-settings.no-organization-found.90a2ad4211'));
+      orgId = organizations[0].id;
     }
-  }, [orgConnection?.orgId]);
-
+    const data = readOrg(await apiJson('/api/org/org/' + encodeURIComponent(orgId), { signal }), orgId);
+    return () => { resolvedOrgId.current = orgId; setOrg(data); setName(data.name); setMessage(''); setEligibleMembers(null); setNewOwner(''); };
+  }), [run]);
+  useEffect(() => { void loadOrg(); }, [loadOrg]);
+  const loadMembers = () => run('members', async signal => {
+    const data = await apiJson('/api/org/org/' + encodeURIComponent(org.id) + '/members', { signal });
+    if (!Array.isArray(data) || !data.every(item => item?.orgId === org.id && typeof item.userId === 'string'
+      && ['owner', 'admin', 'member', 'viewer'].includes(item.role) && typeof item.status === 'string')) throw new Error('Invalid organization member response');
+    return () => { setEligibleMembers(data.filter(item => item.status === 'active' && item.userId !== user?.uid).map(item => item.userId)); setNewOwner(''); };
+  });
+  const transferOwnership = async () => {
+    if (!org || org.ownerUid !== user?.uid || !newOwner || !eligibleMembers?.includes(newOwner) || busy || confirmingTransfer.current) return;
+    const target = newOwner;
+    confirmingTransfer.current = true;
+    try {
+      if (!await appConfirm({ title: copy.ownership, message: copy.transferConfirm(target), confirmText: copy.confirm, cancelText: copy.cancel, tone: 'danger' })) return;
+      setMessage('');
+      await run('ownership', async signal => {
+        const data = readOrg(await apiJson('/api/org/org/' + encodeURIComponent(org.id) + '/ownership', {
+          method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ newOwnerUserId: target }),
+        }), org.id);
+        if (data.ownerUid !== target) throw new Error(copy.transferUnconfirmed);
+        return () => { setOrg(data); setEligibleMembers(null); setNewOwner(''); setMessage(copy.transferred); setAccessPending(true); };
+      });
+    } finally { confirmingTransfer.current = false; }
+  };
+  // Refresh the server-issued role only after an ownership receipt; never manufacture a local owner/admin session.
   useEffect(() => {
-    void loadOrg();
-  }, [loadOrg]);
-
-  const handleSave = async () => {
+    if (!accessPending) return;
+    void run('refresh-access', async signal => {
+      const result = await switchDomain('work', { orgId: resolvedOrgId.current, signal });
+      if (!result.success) throw new Error(copy.refreshFailed);
+      return () => setAccessPending(false);
+    });
+  }, [accessPending, refreshAttempt, run, switchDomain, copy.refreshFailed]);
+  const handleSave = () => {
     if (!org || !name.trim()) return;
-    setSaving(true);
-    setFeedback(null);
-    try {
-      const res = await fetch(`/api/org/org/${org.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name.trim() }),
-        credentials: 'include',
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || formatUiMessage('org-settings.save-failed-value0.5559bb34d3', { value0: res.status }));
-      setOrg(data);
-      setName(data.name || name.trim());
-      setFeedback({ type: 'success', text: t.orgSettingsSaved || uiMessage('org-settings.organization-settings-saved.ba1832e337') });
-    } catch (err: any) {
-      setFeedback({ type: 'error', text: err.message || String(err) });
-    } finally {
-      setSaving(false);
-    }
+    setMessage('');
+    return run('save', async signal => {
+      const data = readOrg(await apiJson('/api/org/org/' + encodeURIComponent(org.id), { method: 'PUT', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim() }) }), org.id);
+      return () => { setOrg(data); setName(data.name); setMessage(t.orgSettingsSaved || uiMessage('org-settings.organization-settings-saved.ba1832e337')); };
+    });
   };
-
-  const handleCreateInvitation = async () => {
+  const handleCreateInvitation = () => {
     if (!org) return;
-    setGenerating(true);
-    setFeedback(null);
-    try {
-      const res = await fetch(`/api/org/org/${org.id}/invitations`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role: invitationRole, maxUses: 0 }),
-        credentials: 'include',
-      });
-      const inv = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(inv.error || formatUiMessage('org-settings.invitation-creation-failed-value0.dd3265d5f7', { value0: res.status }));
-      setInvitationCode(inv.code || '');
-      setFeedback({ type: 'success', text: t.invitationCreated || uiMessage('org-settings.invitation-code-created.b835c22578') });
-    } catch (err: any) {
-      setFeedback({ type: 'error', text: err.message || String(err) });
-    } finally {
-      setGenerating(false);
-    }
+    setMessage('');
+    return run('invite', async signal => {
+      const data = await apiJson('/api/org/org/' + encodeURIComponent(org.id) + '/invitations', { method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: invitationRole, maxUses: 0 }) });
+      if (data?.orgId !== org.id || data.role !== invitationRole || typeof data.code !== 'string' || !data.code) throw new Error('Invitation receipt was not confirmed');
+      return () => { setInvitationCode(data.code); setCopied(false); setMessage(t.invitationCreated || uiMessage('org-settings.invitation-code-created.b835c22578')); };
+    });
   };
-
-  const copyCode = async () => {
-    if (!invitationCode) return;
-    await navigator.clipboard.writeText(invitationCode);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1800);
-  };
-
+  const copyCode = () => invitationCode && run('copy', async () => {
+    await navigator.clipboard.writeText(invitationCode); return () => setCopied(true);
+  });
   const handleDelete = async () => {
-    if (!org) return;
-    const ok = await appConfirm({
+    if (!org || busy || !await appConfirm({
       title: uiMessage('org-settings.delete-organization.4de5283414'),
       message: uiMessage('org-settings.this-cannot-be-undone-organization.1d1562fe80'),
-      confirmText: uiMessage('org-settings.delete.5b875326d1'),
-      cancelText: uiMessage('org-settings.cancel.998b9c48fb'),
-      tone: 'danger',
+      confirmText: uiMessage('org-settings.delete.5b875326d1'), cancelText: uiMessage('org-settings.cancel.998b9c48fb'), tone: 'danger',
+    })) return;
+    setMessage('');
+    return run('delete', async signal => {
+      const data = await apiJson('/api/org/org/' + encodeURIComponent(org.id), { method: 'DELETE', signal });
+      signal.throwIfAborted();
+      if (data?.success !== true) throw new Error('Organization deletion was not confirmed');
+      setOrg(null); setMessage(t.organizationDeleted || uiMessage('org-settings.organization-deleted.7ecab76b97'));
+      const result = await switchDomain('personal', { signal });
+      if (!result.success) throw new Error(result.message || 'Personal workspace could not be opened');
+      return () => window.dispatchEvent(new CustomEvent('lumi:navigate', { detail: { tab: 'home' } }));
     });
-    if (!ok) return;
-
-    setFeedback(null);
-    try {
-      const res = await fetch(`/api/org/org/${org.id}`, { method: 'DELETE', credentials: 'include' });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || formatUiMessage('org-settings.delete-failed-value0.98201beb15', { value0: res.status }));
-      setFeedback({ type: 'success', text: t.organizationDeleted || uiMessage('org-settings.organization-deleted.7ecab76b97') });
-      setOrg(null);
-      void switchDomain('personal').finally(() => {
-        window.dispatchEvent(new CustomEvent('lumi:navigate', { detail: { tab: 'home' } }));
-      });
-    } catch (err: any) {
-      setFeedback({ type: 'error', text: err.message || String(err) });
-    }
   };
 
   if (loading) {
@@ -152,6 +136,7 @@ export function OrgSettings() {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-4 p-6 text-center text-white/55">
         {feedback && <FeedbackBanner feedback={feedback} />}
+
         <Building2 size={34} className="text-white/25" />
         <div>{uiMessage('org-settings.no-organization-found-create-one.f354c5cd6b')}</div>
         <button onClick={loadOrg} className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white/70 hover:bg-white/10">
@@ -163,7 +148,7 @@ export function OrgSettings() {
 
   return (
     <div className="h-full overflow-y-auto p-6 text-white">
-      <div className="mx-auto flex max-w-4xl flex-col gap-4">
+      <fieldset disabled={Boolean(busy)} className="mx-auto flex max-w-4xl flex-col gap-4">
         <section className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
           <div className="flex items-start gap-3">
             <span className="flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-white/65">
@@ -179,6 +164,22 @@ export function OrgSettings() {
         </section>
 
         {feedback && <FeedbackBanner feedback={feedback} />}
+
+        {accessPending && <button type="button" onClick={() => setRefreshAttempt(value => value + 1)} className="rounded-lg border border-white/10 px-3 py-2 text-sm">{copy.refreshAccess}</button>}
+        <button type="button" onClick={loadOrg} className="self-start rounded-lg border border-white/10 px-3 py-2 text-sm">{uiMessage('org-settings.reload.27d9a83a34')}</button>
+
+        {org.ownerUid === user?.uid && <section className="rounded-lg border border-amber-400/20 bg-amber-500/5 p-5 space-y-3">
+          <h3 className="text-sm font-medium">{copy.ownership}</h3>
+          <p className="text-sm text-white/60">{copy.ownershipExplanation}</p>
+          <button type="button" onClick={loadMembers} className="rounded-lg border border-white/10 px-3 py-2 text-sm">{copy.loadMembers}</button>
+          {eligibleMembers !== null && <div className="flex gap-3">
+            <select aria-label={copy.newOwner} value={newOwner} onChange={event => setNewOwner(event.target.value)} className="rounded-lg border border-white/10 bg-black/20 p-2 text-sm">
+              <option value="">{copy.chooseMember}</option>
+              {eligibleMembers.map(id => <option key={id} value={id}>{id}</option>)}
+            </select>
+            <button type="button" disabled={!newOwner} onClick={transferOwnership} className="rounded-lg border border-amber-400/20 px-3 py-2 text-sm disabled:opacity-40">{copy.ownership}</button>
+          </div>}
+        </section>}
 
         <section className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
           <div className="mb-4 flex items-center gap-2">
@@ -251,7 +252,7 @@ export function OrgSettings() {
                 <p className="mt-1 font-mono text-2xl font-semibold tracking-[0.18em] text-emerald-200">{invitationCode}</p>
               </div>
               <button
-                onClick={copyCode}
+                onClick={() => void copyCode()}
                 className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white/70 transition hover:bg-white/10"
               >
                 {copied ? <CheckCircle size={15} className="text-emerald-300" /> : <Copy size={15} />}
@@ -261,7 +262,7 @@ export function OrgSettings() {
           )}
         </section>
 
-        <section className="rounded-lg border border-red-400/15 bg-red-500/5 p-5">
+        {org.ownerUid === user?.uid && <section className="rounded-lg border border-red-400/15 bg-red-500/5 p-5">
           <div className="mb-3 flex items-center gap-2 text-red-300">
             <Trash2 size={17} />
             <h3 className="text-sm font-medium">{uiMessage('org-settings.danger-zone.c15803c9ea')}</h3>
@@ -275,21 +276,8 @@ export function OrgSettings() {
           >
             {uiMessage('org-settings.delete-organization.4de5283414')}
           </button>
-        </section>
-      </div>
-    </div>
-  );
-}
-
-function FeedbackBanner({ feedback }: { feedback: Feedback }) {
-  return (
-    <div className={`flex items-start gap-2 rounded-lg border px-3 py-2 text-sm ${
-      feedback.type === 'success'
-        ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200'
-        : 'border-red-500/20 bg-red-500/10 text-red-200'
-    }`}>
-      {feedback.type === 'success' ? <CheckCircle size={16} className="mt-0.5 shrink-0" /> : <AlertCircle size={16} className="mt-0.5 shrink-0" />}
-      <span>{feedback.text}</span>
+        </section>}
+      </fieldset>
     </div>
   );
 }

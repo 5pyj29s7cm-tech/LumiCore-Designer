@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { parseDeepSeekResponse, parseLegacyXmlToolCalls } from '../server/llm/providers';
+import { parseLegacyXmlToolCalls } from '../server/llm/providers';
+import { createLegacyProtocolChunkFilter } from '../server/llm/provider/legacy_protocol';
 
 describe('legacy XML tool protocol compatibility', () => {
   const declarations = [
@@ -10,10 +11,6 @@ describe('legacy XML tool protocol compatibility', () => {
     {
       type: 'function' as const,
       function: { name: 'client_get_state', description: '', parameters: {} },
-    },
-    {
-      type: 'function' as const,
-      function: { name: 'industry_workflow_start', description: '', parameters: {} },
     },
   ];
 
@@ -27,77 +24,65 @@ describe('legacy XML tool protocol compatibility', () => {
     })]);
   });
 
-  /* Full-width DSML was part of the retired local-agent protocol. The public
-   * provider boundary now accepts native tool_calls plus bounded declared XML.
-  it('converts the DeepSeek full-width DSML variant into a declared structured call', () => {
-    expect(parseLegacyXmlToolCalls(
-      '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="industry_workflow_start"><｜｜DSML｜｜parameter name="entryId" string="true">visualization</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>',
-      declarations,
-    )).toEqual([expect.objectContaining({
-      name: 'industry_workflow_start',
-      arguments: { entryId: 'visualization' },
-    })]);
-  });
-
-  it('normalizes DSML in a non-streaming OpenAI-compatible response', () => {
-    const parsed = parseDeepSeekResponse({
-      choices: [{
-        message: {
-          content: '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="industry_workflow_start"><｜｜DSML｜｜parameter name="entryId" string="true">visualization</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>',
-        },
-      }],
-    });
-
-    expect(parsed.text).toBeNull();
-    expect(parsed.toolCalls).toEqual([expect.objectContaining({
-      name: 'industry_workflow_start',
-      arguments: { entryId: 'visualization' },
-    })]);
-  });
-
-  */
-
-  /* Bracket-call parsing was deliberately removed with the legacy local-agent
-   * protocol. Native tool_calls and the bounded XML gateway fallback remain.
-  it('converts a declared DeepSeek bracket call into a structured call', () => {
-    expect(parseLegacyBracketToolCalls(
-      '[tool] industry_workflow_start({"entryId":"cad"})',
-      declarations,
-    )).toEqual([expect.objectContaining({
-      name: 'industry_workflow_start',
-      arguments: { entryId: 'cad' },
-    })]);
-  });
-
-  it('normalizes a named Chinese bracket call in a non-streaming response', () => {
-    const parsed = parseDeepSeekResponse({
-      choices: [{
-        message: {
-          content: '[调用 industry_workflow_start] {"entryId":"cad"}',
-        },
-      }],
-    });
-
-    expect(parsed.text).toBeNull();
-    expect(parsed.toolCalls).toEqual([expect.objectContaining({
-      name: 'industry_workflow_start',
-      arguments: { entryId: 'cad' },
-    })]);
-  });
-
-  it('does not execute undeclared bracket tool names', () => {
-    expect(parseLegacyBracketToolCalls(
-      '[tool] desktop_run_command({"command":"whoami"})',
-      declarations,
-    )).toBeNull();
-  });
-
-  */
-
   it('does not execute undeclared XML tool names', () => {
     expect(parseLegacyXmlToolCalls(
       '<function_calls><invoke name="desktop_run_command"><parameter name="command">whoami</parameter></invoke></function_calls>',
       declarations,
     )).toBeNull();
+  });
+  it('executes the screenshot protocol once through the declared-tool adapter', () => {
+    const text = '我先读取当前界面。\n\n<client_get_state>\n</client_get_state>';
+    expect(parseLegacyXmlToolCalls(text, declarations)).toEqual([
+      expect.objectContaining({ name: 'client_get_state', arguments: {} }),
+    ]);
+    expect(parseLegacyXmlToolCalls(text, [])).toBeNull();
+    expect(parseLegacyXmlToolCalls('<desktop_run_command></desktop_run_command>', declarations)).toBeNull();
+    expect(parseLegacyXmlToolCalls('&lt;client_get_state&gt;&lt;/client_get_state&gt;', declarations)).toBeNull();
+  });
+
+  it('preserves direct-tag arguments and refuses malformed bodies', () => {
+    for (const body of ['{"mode":"assistant"}', '<parameter name="mode">assistant</parameter>']) {
+      expect(parseLegacyXmlToolCalls('<set_client_mode>' + body + '</set_client_mode>', declarations))
+        .toEqual([expect.objectContaining({ name: 'set_client_mode', arguments: { mode: 'assistant' } })]);
+    }
+    for (const body of ['not JSON', '{"mode":', '[]', 'null', '42', '<parameter name="mode">assistant</parameter>garbage']) {
+      expect(parseLegacyXmlToolCalls('<set_client_mode>' + body + '</set_client_mode>', declarations), body).toBeNull();
+    }
+    expect(parseLegacyXmlToolCalls('<client_get_state>', declarations)).toBeNull();
+    expect(parseLegacyXmlToolCalls('<clientXgetXstate></clientXgetXstate>', declarations)).toBeNull();
+  });
+
+  it('suppresses protocol anywhere in the stream at every chunk boundary', () => {
+    const prose = '我会按当前界面介绍。\n\n';
+    for (const protocol of [
+      '<client_get_state></client_get_state>',
+      '<function_calls><invoke name="client_get_state"></invoke></function_calls>',
+      '&lt;client_get_state&gt;&lt;/client_get_state&gt;',
+    ]) {
+      const text = prose + protocol;
+      for (let split = 1; split < text.length; split += 1) {
+        const chunks: string[] = [];
+        const filter = createLegacyProtocolChunkFilter(chunk => chunks.push(chunk));
+        filter.emit(text.slice(0, split));
+        filter.emit(text.slice(split));
+        filter.flush();
+        expect(chunks.join(''), String(split)).toBe(prose);
+      }
+      const chunks: string[] = [];
+      const filter = createLegacyProtocolChunkFilter(chunk => chunks.push(chunk));
+      for (const character of text) filter.emit(character);
+      filter.flush();
+      expect(chunks.join('')).toBe(prose);
+    }
+  });
+
+  it('keeps ordinary prose, HTML, and comparisons readable', () => {
+    for (const text of ['正常文字', '<div>hello</div>', 'a < 2 and b > 1', 'fish & chips', 'x < 3']) {
+      const chunks: string[] = [];
+      const filter = createLegacyProtocolChunkFilter(chunk => chunks.push(chunk));
+      for (const character of text) filter.emit(character);
+      filter.flush();
+      expect(chunks.join('')).toBe(text);
+    }
   });
 });

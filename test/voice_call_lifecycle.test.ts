@@ -10,6 +10,7 @@ const fixture = vi.hoisted(() => ({
   stt: [] as any[],
   sttProvider: 'ark' as string | null,
   sttStartFails: false,
+  sttReady: true,
   ttsProvider: null as string | null,
   ttsVoices: vi.fn(),
 }));
@@ -19,7 +20,7 @@ vi.mock('../server/stt/adapter', () => ({
   getActiveStreamingSTTProvider: () => fixture.sttProvider,
   createResilientStreamingSession: (_options: any, lifecycle: any) => {
     if (fixture.sttStartFails) throw new Error('synthetic STT start failure');
-    const stt = { lifecycle, end: vi.fn(), sendAudio: vi.fn(), onResult: vi.fn(), onError: vi.fn(), updateEndpointing: vi.fn() };
+    const stt = { lifecycle, end: vi.fn(), sendAudio: vi.fn(), onResult: vi.fn(), onError: vi.fn(), updateEndpointing: vi.fn(), onReady: vi.fn((callback: () => void) => { if (fixture.sttReady) callback(); }) };
     fixture.stt.push(stt);
     return stt;
   },
@@ -78,12 +79,58 @@ beforeEach(() => {
   fixture.stt.length = 0;
   fixture.sttProvider = 'ark';
   fixture.sttStartFails = false;
+  fixture.sttReady = true;
   fixture.ttsProvider = null;
   fixture.ttsVoices.mockReset().mockResolvedValue([]);
 });
 afterAll(async () => { for (const socket of sockets) await socket.receive('audio:stop'); });
 
 describe('voice call ownership and terminal STT failure cleanup', () => {
+  it('keeps manual input connecting and ignores transcripts until the provider acknowledges readiness', async () => {
+    fixture.sttReady = false;
+    const { socket } = createFixture();
+    await socket.receive('audio:start', start('delayed-ready'));
+    const stt = fixture.stt[0];
+    const result = stt.onResult.mock.calls[0][0];
+    expect(socket.outputs.some(([event, payload]) => event === 'audio:status' && payload.status === 'listening')).toBe(false);
+    await result({ text: '未就绪的内容不得显示', isFinal: false });
+    expect(socket.outputs.some(([event]) => event === 'audio:transcript')).toBe(false);
+    expect(socket.data.audioSession.silenceTimer).toBeNull();
+    stt.onReady.mock.calls[0][0]();
+    expect(socket.outputs.at(-1)).toEqual(['audio:status', { status: 'listening', sessionId: 'delayed-ready' }]);
+    await result({ text: '就绪后的实时转写', isFinal: false });
+    expect(socket.outputs).toContainEqual(['audio:transcript', { text: '就绪后的实时转写', isFinal: false }]);
+  });
+
+  it('does not admit transcripts from a recovering stream until its new provider is ready', async () => {
+    const { socket } = createFixture();
+    await socket.receive('audio:start', start('recover-ready'));
+    const stt = fixture.stt[0]; const result = stt.onResult.mock.calls[0][0];
+    stt.lifecycle.onRecovering({ attempt: 1, delayMs: 250, error: new Error('temporary disconnect') });
+    await result({ text: '恢复握手尚未完成', isFinal: false });
+    stt.lifecycle.onRecovered({ attempt: 1 });
+    expect(socket.outputs.at(-1)).toEqual(['audio:status', expect.objectContaining({ status: 'connecting' })]);
+    expect(socket.outputs.some(([event]) => event === 'audio:transcript')).toBe(false);
+    stt.onReady.mock.calls[0][0]();
+    await result({ text: '恢复后接续的转写', isFinal: false });
+    expect(socket.outputs).toContainEqual(['audio:transcript', { text: '恢复后接续的转写', isFinal: false }]);
+  });
+
+  it.each(['stop', 'error', 'replacement'])('ignores late readiness and transcript callbacks after %s', async reason => {
+    fixture.sttReady = false;
+    const { socket } = createFixture();
+    await socket.receive('audio:start', start('retire-ready'));
+    const stt = fixture.stt[0];
+    if (reason === 'error') await stt.onError.mock.calls[0][0](new Error('Unauthorized 401'));
+    else if (reason === 'replacement') await socket.receive('audio:start', start('new-ready'));
+    else await socket.receive('audio:stop', { sessionId: 'retire-ready' });
+    const before = socket.outputs.length;
+    stt.onReady.mock.calls[0][0]();
+    await stt.onResult.mock.calls[0][0]({ text: '已结束会话的迟到内容', isFinal: false });
+    expect(socket.outputs).toHaveLength(before);
+    expect(stt.end).toHaveBeenCalledOnce();
+  });
+
   it('finishes the old stop without closing the newer call', async () => {
     const { socket } = createFixture();
     await socket.receive('audio:start', start('call-a'));
@@ -262,6 +309,8 @@ describe('voice call ownership and terminal STT failure cleanup', () => {
     newStt.lifecycle.onRecovering({ attempt: 1, delayMs: 10, error: new Error('current recovery') });
     expect(socket.outputs.at(-1)).toEqual(['audio:status', expect.objectContaining({ status: 'connecting', sessionId: 'error-b' })]);
     newStt.lifecycle.onRecovered({ attempt: 1 });
+    expect(socket.outputs.at(-1)).toEqual(['audio:status', expect.objectContaining({ status: 'connecting', sessionId: 'error-b' })]);
+    newStt.onReady.mock.calls[0][0]();
     expect(socket.outputs.at(-1)).toEqual(['audio:status', expect.objectContaining({ status: 'listening', sessionId: 'error-b' })]);
     expect(isRealtimeUserActive(socket.data.authenticatedUserId, 0)).toBe(true);
   });
@@ -332,5 +381,120 @@ describe('voice call ownership and terminal STT failure cleanup', () => {
       expect(isRealtimeUserActive(userId, 0)).toBe(false);
       vi.unstubAllGlobals();
     }
+  });
+});
+
+
+describe('selected voice conversation identity', () => {
+  it('admits speech into the selected archived conversation after another chat becomes active', async () => {
+    const { getOrCreateActiveConversation, startNewConversation, getMessages } = await import('../server/conversation/manager');
+    const { prepareVoiceIdentityAndAdmission } = await import('../server/socket/voice/turn/prepare_voice_identity_and_admission');
+    const { socket, io } = createFixture();
+    const userId = socket.data.authenticatedUserId;
+    const selected = getOrCreateActiveConversation(userId, 'lumi', 'personal', '');
+    const active = startNewConversation(userId, 'lumi', 'personal', '');
+    await socket.receive('audio:start', { ...start('selected-archive'), conversationId: selected.id });
+    const resources = {} as import('../server/cognition/conversation_execution').ConversationResourceLifetime;
+    try {
+      const admitted = await prepareVoiceIdentityAndAdmission(socket as any, socket.data.audioSession, 'Tell me about the weather.', {} as any, () => ({}), io as any, undefined, true, {}, resources);
+      expect(admitted.terminal).toBe(false);
+      expect(admitted.entry?.conversationTurn.conversation.id).toBe(selected.id);
+      expect(socket.data.audioSession.conversationId).toBe(selected.id);
+      expect(getMessages(selected.id).some(row => row.message === 'Tell me about the weather.')).toBe(true);
+      expect(getMessages(active.id).some(row => row.message === 'Tell me about the weather.')).toBe(false);
+      expect(getOrCreateActiveConversation(userId, 'lumi', 'personal', '').id).toBe(active.id);
+    } finally { resources.admission?.release(); await socket.receive('audio:stop'); }
+  });
+
+  it.each(['missing', 'foreign', 'other-agent', 'other-scope'] as const)('refuses a %s selected anchor before starting STT', async kind => {
+    const { getOrCreateActiveConversation } = await import('../server/conversation/manager');
+    const { socket } = createFixture();
+    const userId = socket.data.authenticatedUserId;
+    const selected = kind === 'missing' ? { id: 'nonexistent-conversation' }
+      : getOrCreateActiveConversation(kind === 'foreign' ? 'foreign-voice-user' : userId,
+        kind === 'other-agent' ? 'separate-agent' : 'lumi', kind === 'other-scope' ? 'work' : 'personal', kind === 'other-scope' ? 'synthetic-org' : '');
+    await socket.receive('audio:start', { ...start('invalid-anchor-' + kind), conversationId: selected.id });
+    expect(socket.data.audioSession.isActive).toBe(false);
+    expect(socket.data.audioSession.sttSession).toBeNull();
+    expect(fixture.stt).toHaveLength(0);
+    expect(socket.outputs).toContainEqual(['audio:error', expect.objectContaining({ code: 'CONVERSATION_UNAVAILABLE' })]);
+    expect(isRealtimeUserActive(userId, 0)).toBe(false);
+  });
+
+  it('withdraws deleted queued voice work and never reads the replacement active transcript', async () => {
+    const { getOrCreateActiveConversation, startNewConversation, getMessages } = await import('../server/conversation/manager');
+    const { reserveConversationExecution } = await import('../server/cognition/conversation_execution');
+    const { prepareVoiceIdentityAndAdmission } = await import('../server/socket/voice/turn/prepare_voice_identity_and_admission');
+    const { readDB, writeDB } = await import('../db_layer');
+    const { socket, io } = createFixture();
+    const userId = socket.data.authenticatedUserId;
+    const selected = getOrCreateActiveConversation(userId, 'lumi', 'personal', '');
+    await socket.receive('audio:start', { ...start('delete-selected'), conversationId: selected.id });
+    const foreground = reserveConversationExecution({ userId, domain: 'personal', orgId: '', conversationId: selected.id, source: 'chat' }, 'foreground-before-selected-voice');
+    await foreground.waitForTurn();
+    const resources = {} as import('../server/cognition/conversation_execution').ConversationResourceLifetime;
+    const pending = (async () => {
+      const admitted = await prepareVoiceIdentityAndAdmission(socket as any, socket.data.audioSession, 'A queued conversation question.', {} as any, () => ({}), io as any, undefined, true, {}, resources);
+      if (admitted.terminal) return;
+      const entry = admitted.entry!;
+      const { runLumiEntryTurn } = await import('../server/cognition/turn_execution');
+      return runLumiEntryTurn({
+        entry: { source: 'voice', channel: 'voice', historyLimit: 0, failureText: 'Voice preparation failed.', failureReason: 'voice_processing_failed' },
+        identity: { userId: entry.session.userId, agentId: entry.conversationTurn.conversation.agentId,
+          conversationId: selected.id, requestId: entry.requestId, domain: entry.voiceScope.domain, orgId: entry.voiceScope.orgId },
+        userText: entry.userText, persistence: 'preaccepted', authorization: entry.turnAuthorization, controller: entry.pipelineAbort,
+        resource: { admission: resources.admission },
+        planning: async () => ({ terminal: await admitted.resume!() }),
+        assemble: () => { throw new Error('Identity preparation must finish before model assembly'); },
+        deliver: () => { throw new Error('Identity preparation must finish before delivery'); },
+      });
+    })();
+    const rejected = expect(pending).rejects.toThrow(/deleted|available|cancelled/);
+    try {
+      await vi.waitFor(() => expect(resources.admission?.waitingForRequestId).toBe('foreground-before-selected-voice'));
+      const active = startNewConversation(userId, 'lumi', 'personal', '');
+      const db = readDB(); db.conversations = db.conversations.filter((row: any) => row.id !== selected.id); writeDB(db);
+      await vi.waitFor(() => expect(resources.admission?.controller.signal.aborted).toBe(true));
+      foreground.release(); await rejected;
+      expect(getMessages(active.id).some(row => row.message === 'A queued conversation question.')).toBe(false);
+      expect(getOrCreateActiveConversation(userId, 'lumi', 'personal', '').id).toBe(active.id);
+    } finally { foreground.release(); resources.admission?.release(); await pending.catch(() => undefined); await socket.receive('audio:stop'); }
+  });
+
+  it('keeps the mounted hook selected transcript through a reconnect', async () => {
+    const { getOrCreateActiveConversation, startNewConversation } = await import('../server/conversation/manager');
+    const { socket } = createFixture();
+    const userId = socket.data.authenticatedUserId;
+    const selected = getOrCreateActiveConversation(userId, 'lumi', 'personal', '');
+    const active = startNewConversation(userId, 'lumi', 'personal', '');
+    class FixtureAudioContext {
+      state = 'running'; currentTime = 0; destination = {};
+      createGain() { return { gain: { value: 1 }, connect() {}, disconnect() {} }; }
+      createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+      createScriptProcessor() { return { onaudioprocess: null, connect() {}, disconnect() {} }; }
+      async resume() { this.state = 'running'; }
+      async close() { this.state = 'closed'; }
+    }
+    vi.stubGlobal('AudioContext', FixtureAudioContext);
+    const outbound: Array<[string, any]> = [];
+    const pending: Promise<void>[] = [];
+    class Client extends EventEmitter {
+      connected = true; volatile = this;
+      emit(event: string, data?: any) { outbound.push([event, data]); pending.push(socket.receive(event, data)); return true; }
+      deliver(event: string, data?: any) { return super.emit(event, data); }
+    }
+    const client = new Client(); socket.receiver = (event, data) => client.deliver(event, data);
+    const hook = renderHook(() => useVoiceCall({ socket: client }));
+    try {
+      await act(async () => { await hook.result.current.startCall(undefined, 'lumi', 'lumi', { domain: 'personal', conversationId: selected.id }); await Promise.all(pending); });
+      expect(hook.result.current.callState).toBe('listening');
+      await act(async () => { client.connected = false; client.deliver('disconnect'); });
+      await act(async () => { client.connected = true; client.deliver('connect'); await Promise.all(pending); });
+      const starts = outbound.filter(([event]) => event === 'audio:start');
+      expect(starts).toHaveLength(2);
+      expect(starts.every(([, payload]) => payload.conversationId === selected.id)).toBe(true);
+      expect(socket.data.audioSession.conversationId).toBe(selected.id);
+      expect(getOrCreateActiveConversation(userId, 'lumi', 'personal', '').id).toBe(active.id);
+    } finally { hook.unmount(); socket.receiver = undefined; await socket.receive('audio:stop'); vi.unstubAllGlobals(); }
   });
 });

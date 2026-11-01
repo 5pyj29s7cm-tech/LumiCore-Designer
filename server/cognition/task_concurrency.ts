@@ -1,13 +1,18 @@
+import { actionInstructionClauses } from './action_instruction_clauses';
+import { isConfirmationCancellation, isExplicitConfirmationReply } from '../tools/pending_confirmation';
 import {
   classifyConversationActionFollowupIntent,
   conversationActionRequiresFreshConfirmationReview,
   isBlockedTaskRetryAcceptance,
   isTaskPreparationContinuation,
+  isReferentialArtifactEdit,
   isExplicitUnfinishedTaskContinuation,
+  normalizeConversationActionState,
   type ConversationActionContinuationState,
 } from './action_continuation';
 import { classifyTaskCapsuleTurn } from '../conversation/task_capsule';
-import { normalizeActionIntent } from './normalized_action_intent';
+import { normalizeActionIntent, type NormalizedActionIntent } from './normalized_action_intent';
+import { hasExplicitNoToolInstruction, isInformationOnlyQuestion } from './tool_intent';
 import {
   resolvePendingRuntimeCleanupOffer,
   type PendingAssistantOfferContext,
@@ -90,6 +95,10 @@ export interface ActiveTaskMessageResolution {
 export interface ActiveTaskRelationOptions {
   /** Request currently holding (or immediately preceding) the foreground lease. */
   activeRequestId?: string;
+  /** Server-resolved current instruction; not transport/client metadata. */
+  normalizedIntent?: NormalizedActionIntent;
+  /** Rebind a queued predecessor without reclassifying the same utterance. */
+  acceptedFeedback?: ActiveTaskFeedbackKind;
   /** Optional immutable target supplied by a client control event. */
   controlTargetRequestId?: string;
   /** Optional durable identity supplied by a client that rendered task state. */
@@ -116,11 +125,6 @@ export function bindPreparedTaskMessageRelation(
     binding: 'active_task', taskId: state.taskId, revision: state.revision, targetRequestId: state.activeRequestId };
 }
 
-// These are task-control utterances, not domain intents. Keeping them here
-// prevents every socket surface from inventing a different cancellation rule.
-// i18n-allow: multilingual task-control recognition; not user-visible copy.
-const CANCEL_ONLY_RE =
-  /^(?:(?:等一下|等等|先别急)[，,\s]*)?(?:你)?(?:先)?(?:取消|停止|停下|别做了|不要做了|终止)(?:这个|那个|当前)?(?:任务|操作|工作)?(?:[，,。.\s]+(?:不要|别|无需|不必)(?:再|继续)?(?:写入|创建|发送|发布|执行|继续)[^\r\n]{0,180})?[。！？.!?]*$|^(?:(?:wait|hold\s+on)[,!\s]*)?(?:please\s+)?(?:cancel|stop|abort|terminate)(?:\s+(?:this|that|the current)\s+(?:task|operation|work))?(?:[.!?\s]+(?:do\s+not|don['’]?t|never)\s+(?:write|create|send|publish|execute|run|continue)\b[^\r\n]{0,180})?[.!?]*$/iu; // i18n-allow: multilingual task-control recognition; not user-visible copy.
 // i18n-allow: multilingual task-replacement recognition; not user-visible copy.
 const REPLACE_RE =
   /(?:取消|停止|停下|别做|不要做|终止|放弃).{0,24}(?:改成|换成|改做|转去|重新做|而是)|\b(?:cancel|stop|abort|drop)\b.{0,40}\b(?:instead|replace|switch|change\s+to|do(?!\s+not\b|n['’]?t\b))\b/iu; // i18n-allow: multilingual task-replacement recognition; not user-visible copy.
@@ -135,14 +139,7 @@ const RETRY_ONLY_RE =
 // a fix. Generic referents bind to that action; concrete new objects do not.
 // i18n-allow: multilingual task-feedback recognition; not user-visible copy.
 const CONTINUE_ONLY_RE =
-  /^(?:(?:请|现在|那就|赶紧|快点)\s*)?(?:修|修复|处理|清理|继续|接着|推进|执行|完成|做)(?:一下)?(?:它|这个|这些|上述|当前)?(?:问题|任务|工作|操作)?[了吧啊呀。！？.!?]*$|^(?:(?:please|now|then)\s+)?(?:fix|clean(?:\s+it)?|continue|resume|proceed|execute|finish|do)(?:\s+(?:it|this|these|that|the\s+(?:current\s+)?(?:issue|task|work)))?[.!?]*$/iu; // i18n-allow: multilingual task-feedback recognition; not user-visible copy.
-
-// Keep acceptance narrow. Longer action-bearing messages such as “好的，帮我
-// 写一份报告” are new work, while these terse replies bind to the adjacent
-// pending action or root-task verification.
-// i18n-allow: multilingual task-feedback recognition; not user-visible copy.
-const ACCEPT_ONLY_RE =
-  /^(?:(?:我)?(?:确认|同意|允许|接受|批准|授权)(?:(?:这个|该|上述|当前|刚才的)?(?:操作|方案|修改|执行|权限扩张))?了?|(?:嗯|好|好的|可以|行|没问题|就这样|按这个做|开始吧)|(?:yes|ok|okay|confirmed?|approved?|accepted?|go\s+ahead|looks\s+good))[。！？.!?]*$/iu; // i18n-allow: multilingual task-feedback recognition; not user-visible copy.
+  /^(?:(?:请|现在|那就|赶紧|快点)\s*)?(?:修|修复|处理|清理|继续(?:执行)?|接着|推进|执行|完成|做)(?:一下)?(?:它|这个|这些|上述|当前)?(?:问题|任务|工作|操作)?[了吧啊呀。！？.!?]*$|^(?:(?:please|now|then)\s+)?(?:fix|clean(?:\s+it)?|continue|resume|proceed|execute|finish|do)(?:\s+(?:it|this|these|that|the\s+(?:current\s+)?(?:issue|task|work)))?[.!?]*$/iu; // i18n-allow: multilingual task-feedback recognition; not user-visible copy.
 
 // A bare acknowledgement is conversational unless the durable state proves
 // that the immediately adjacent action is actually waiting for confirmation.
@@ -157,8 +154,6 @@ const ORDINARY_ACK_ONLY_RE =
 // i18n-allow: multilingual task-feedback recognition; not user-visible copy.
 const CORRECTION_RE =
   /^(?:(?:不对|错了|搞错了|弄错了|纠正一下|更正一下|不是这样)[，,:：\s]*|(?:no|wrong|that(?:'s| is)\s+wrong|correction)\b[,:\s]*).{1,500}$|^(?:把|将)(?:它|这个|那个|刚才的|上一步|当前步骤).{0,80}(?:改成|换成|更正为|调整为).{1,360}$|^(?:不是).{1,160}(?:而是|应该是).{1,320}$|^(?:(?:我说的|我的意思|刚才说的).{0,80}(?:是|要).{1,220}(?:不是|而不是).{1,220})$|^(?:change|correct|update)\s+(?:it|this|that|the\s+(?:last|current)\s+step)\b.{1,360}$|^(?:I\s+meant|what\s+I\s+meant\s+was)\b.{1,220}\b(?:not|instead\s+of)\b.{1,220}$/iu; // i18n-allow: multilingual task-feedback recognition; not user-visible copy.
-const TERSE_TARGET_CORRECTION_RE =
-  /^(?:不是|并不是|别用|不要用)(?:这|那|刚才|之前|当前)?(?:个|份|张|条)?\s*(?:文件|文档|PPT|演示文稿|表格|图片|资料|窗口|页面|应用|软件|路径|目录|版本|目标)?[^。！？!?]{0,160}[。！？!?]*$|^(?:no|wrong|not)\s+(?:this|that|the\s+(?:current|previous|last))?\s*(?:file|document|presentation|sheet|image|window|app|path|target)?[.!?]*$/iu; // i18n-allow: multilingual task-target correction recognition; not user-visible copy.
 function compact(value: unknown, limit = 180): string {
   return String(value || '').replace(/\s+/gu, ' ').trim().slice(0, limit);
 }
@@ -172,9 +167,10 @@ function feedbackKind(
   normalized: string,
   state?: ConversationActionContinuationState | null,
   assistantOfferContext?: PendingAssistantOfferContext,
+  currentIntent?: NormalizedActionIntent,
 ): ActiveTaskFeedbackKind {
   if (REPLACE_RE.test(normalized)) return 'replace';
-  if (CANCEL_ONLY_RE.test(normalized)) return 'cancel';
+  if (isConfirmationCancellation(normalized)) return 'cancel';
   const acceptedCleanupOffer = resolvePendingRuntimeCleanupOffer(
     normalized,
     assistantOfferContext,
@@ -190,8 +186,16 @@ function feedbackKind(
     // Never attach acceptance to a different task that appeared while queued.
     if (offeredConversationTaskId === currentConversationTaskId) return 'accept';
   }
-  const normalizedIntent = normalizeActionIntent(normalized);
-  if (isTaskPreparationContinuation(normalized, state)) return 'continue';
+  const normalizedIntent = currentIntent || normalizeActionIntent(normalized);
+  const followup = classifyConversationActionFollowupIntent(normalized, state, normalizedIntent);
+  // One semantic answer owns queueing, planning and ledger preparation. A
+  // phrase about continuing later must not override a current status question.
+  if (followup === 'status' && normalizedIntent.target !== 'runtime_work') return 'status';
+  if (followup === 'repeat') return 'repeat';
+  if (hasExplicitNoToolInstruction(normalized)
+    || normalizedIntent.kind === 'none' && isInformationOnlyQuestion(normalized)) return 'new_task';
+  if (isReferentialArtifactEdit(normalized, state)) return 'correction';
+  if (isTaskPreparationContinuation(normalized, state, normalizedIntent)) return 'continue';
   if (isExplicitUnfinishedTaskContinuation(normalized, state)) return 'continue';
   if (isBlockedTaskRetryAcceptance(normalized, state)) return 'retry';
   // A runtime-work status query asks about Lumi's global execution ledger,
@@ -203,7 +207,6 @@ function feedbackKind(
     && normalizedIntent.operation === 'status'
     && normalizedIntent.target === 'runtime_work'
   ) return 'new_task';
-  if (classifyConversationActionFollowupIntent(normalized, state) === 'status') return 'status';
   if (
     normalizedIntent.relation === 'correction'
     && normalizedIntent.kind !== 'none'
@@ -212,27 +215,6 @@ function feedbackKind(
   ) {
     return state?.unfinished ? 'correction' : 'new_task';
   }
-  // A fully specified normalized action cannot be feedback about an older
-  // task. Bind this before status/continue heuristics so a new file, client
-  // surface, read, or external action is not swallowed by an old task merely
-  // because its verb also appears in the terse-continuation vocabulary.
-  if (
-    normalizedIntent.relation === 'new'
-    && normalizedIntent.kind !== 'none'
-    && normalizedIntent.operation !== 'status'
-  ) return 'new_task';
-  if (RETRY_ONLY_RE.test(normalized)) return 'retry';
-  if (ACCEPT_ONLY_RE.test(normalized)) {
-    if (conversationActionRequiresFreshConfirmationReview(state)) return 'status';
-    const hasPendingAcceptance = Boolean(
-      acceptedCleanupOffer
-      || (state?.unfinished && state.status === 'waiting_confirmation'),
-    );
-    if (ORDINARY_ACK_ONLY_RE.test(normalized) && !hasPendingAcceptance) return 'new_task';
-    return 'accept';
-  }
-  if (CONTINUE_ONLY_RE.test(normalized)) return 'continue';
-
   // Long path-bearing corrections frequently exceed the deliberately terse
   // language patterns below. Reuse the task capsule's target-aware parser so
   // an explicit old-target -> new-target correction keeps the same task even
@@ -241,16 +223,49 @@ function feedbackKind(
     return 'correction';
   }
 
+  // A fully specified normalized action cannot be feedback about an older
+  // task. Bind this before status/continue heuristics so a new file, client
+  // surface, read, or external action is not swallowed by an old task merely
+  // because its verb also appears in the terse-continuation vocabulary.
+  if (
+    normalizedIntent.relation === 'new'
+    && normalizedIntent.kind !== 'none'
+    && normalizedIntent.operation !== 'status'
+    && followup !== 'execute'
+  ) return 'new_task';
+  if (RETRY_ONLY_RE.test(normalized)) return 'retry';
+  if (CONTINUE_ONLY_RE.test(normalized)) return 'continue';
+  if (isExplicitConfirmationReply(normalized)) {
+    if (conversationActionRequiresFreshConfirmationReview(state)) return 'status';
+    const hasPendingAcceptance = Boolean(
+      acceptedCleanupOffer
+      || (state?.unfinished && state.status === 'waiting_confirmation'),
+    );
+    if (ORDINARY_ACK_ONLY_RE.test(normalized) && !hasPendingAcceptance) {
+      return followup === 'execute' ? 'continue' : 'new_task';
+    }
+    return 'accept';
+  }
+
   if (
     CORRECTION_RE.test(normalized)
-    || (state?.unfinished && TERSE_TARGET_CORRECTION_RE.test(normalized))
   ) return 'correction';
 
-  const followup = classifyConversationActionFollowupIntent(normalized, state);
-  if (followup === 'status') return 'status';
   if (followup === 'execute') return 'continue';
-  if (followup === 'repeat') return 'repeat';
   return 'new_task';
+}
+
+/** Projection of the server-owned relation, never a second text classifier. */
+export function taskRelationFollowupIntent(
+  resolution: ActiveTaskMessageResolution,
+): import('./action_continuation').RecentActionFollowupIntent {
+  if (resolution.binding === 'stale') return 'none';
+  switch (resolution.feedback) {
+    case 'status': return 'status';
+    case 'repeat': return 'repeat';
+    case 'continue': case 'correction': case 'retry': case 'accept': return 'execute';
+    default: return 'none';
+  }
 }
 
 function queueRelation(feedback: ActiveTaskFeedbackKind): ActiveTaskMessageRelation {
@@ -306,10 +321,10 @@ export function resolveActiveTaskMessageRelation(
   state?: ConversationActionContinuationState | null,
   options: ActiveTaskRelationOptions = {},
 ): ActiveTaskMessageResolution {
-  const normalized = compact(text, 700);
-  const feedback = normalized
-    ? feedbackKind(normalized, state, options.pendingAssistantOfferContext)
-    : 'new_task';
+  const normalized = compact(actionInstructionClauses(text).map(clause => clause.probe).join(''), 700);
+  const feedback = options.acceptedFeedback || (isExplicitUnfinishedTaskContinuation(text, normalizeConversationActionState(state)) ? 'continue' : normalized
+    ? feedbackKind(normalized, normalizeConversationActionState(state), options.pendingAssistantOfferContext, options.normalizedIntent)
+    : 'new_task');
   const acceptedRuntimeCleanupOffer = feedback === 'accept'
     ? resolvePendingRuntimeCleanupOffer(normalized, options.pendingAssistantOfferContext)
     : null;
@@ -505,9 +520,15 @@ export function formatActiveTaskRelationContext(
   return lines.join('\n');
 }
 
-export function classifyActiveTaskMessage(
-  text: string,
+/** Only identity/version is checked after queueing. The accepted meaning is immutable. */
+export function revalidateAcceptedTaskRelation(
+  relation: ActiveTaskMessageResolution,
   state?: ConversationActionContinuationState | null,
-): ActiveTaskMessageRelation {
-  return resolveActiveTaskMessageRelation(text, state).relation;
+): ActiveTaskMessageResolution {
+  if (!relation.taskId || relation.binding === 'stale' || relation.binding === 'new_task') return relation;
+  if (relation.taskId !== state?.taskId || relation.revision !== state.revision
+    || relation.targetRequestId && state.activeRequestId && relation.targetRequestId !== state.activeRequestId) {
+    return {...relation, binding:'stale', operation:'reject_stale', reason:'accepted_task_snapshot_changed'};
+  }
+  return {...relation, binding:state.unfinished ? 'active_task' : 'previous_task'};
 }

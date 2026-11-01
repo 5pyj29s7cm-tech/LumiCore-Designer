@@ -1,5 +1,8 @@
+import { parseStoredObject as parseObject } from '../tools/receipt_payload';
 import crypto from 'node:crypto';
-import type { CapabilityManifestEntry, ToolExecutionRecord } from '../tools/types';
+import { isCanonicalToolExecutionRecord } from '../tools/canonical_execution_record';
+import { toolExecutionIdentity } from '../tools/execution_identity';
+import type { CapabilityManifestEntry, ToolExecutionIdentity, ToolExecutionRecord } from '../tools/types';
 import {
   recordDesktopAuthorizationBlock,
   recordDesktopExecutionReceipt,
@@ -35,21 +38,10 @@ type WindowFingerprint = DesktopWindowFingerprint & {
   displayId?: string;
 };
 
-const CONTROL_TOOL_RE = /^(?:client_(?:get_state|action)|desktop_(?:open|show_lumi_window|window_control|active_window|list_apps|ui_|capture_screen|mouse_|keyboard_|run_command)|mouse_(?:move|click|drag)|keyboard_(?:type|press)|computer_use|run_command|powershell|shell_exec|terminal_exec|wechat_(?:read_recent_chat|send_message)|cad_(?:prepare_autocad_operations|draw_floorplan_in_autocad)|mcp_cad-drafting_autocad_|wps_create_document_with_text|desktop_ai_ask)/i;
+const CONTROL_TOOL_RE = /^(?:desktop_(?:open|show_lumi_window|window_control|active_window|list_apps|ui_|capture_screen|mouse_|keyboard_|run_command)|mouse_(?:move|click|drag)|keyboard_(?:type|press)|computer_use|run_command|powershell|shell_exec|terminal_exec|wechat_(?:read_recent_chat|send_message)|cad_(?:prepare_autocad_operations|draw_floorplan_in_autocad)|mcp_cad-drafting_autocad_|wps_create_document_with_text|desktop_ai_ask)/i;
 
 function digest(value: unknown): string {
   return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
-}
-
-function parseObject(value: unknown): Record<string, any> {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, any>;
-  if (typeof value !== 'string' || !value.trim()) return {};
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
 }
 
 export function parseDesktopWindowFingerprint(value: unknown): WindowFingerprint | null {
@@ -100,7 +92,7 @@ function fingerprintInvalidatesVisualPlan(before: WindowFingerprint | null, afte
 type RuntimeCapabilityDescriptor = Pick<
   CapabilityManifestEntry,
   'lane' | 'operation' | 'sideEffects'
->;
+> & Partial<Pick<CapabilityManifestEntry, 'family'>>;
 
 function isSafeObservationCapability(capability?: RuntimeCapabilityDescriptor): boolean {
   return Boolean(
@@ -125,21 +117,22 @@ function isDesktopRuntimeCapability(
   toolName: string,
   capability?: RuntimeCapabilityDescriptor,
 ): boolean {
+  if (capability?.lane === 'client') return false;
   if (CONTROL_TOOL_RE.test(toolName)) return true;
   if (!capability) return false;
-  return capability.sideEffects.some(effect => effect.type === 'desktop_control')
-    || (
-      ['client', 'desktop', 'cad', 'messaging', 'office'].includes(capability.lane)
-      && !isSafeObservationCapability(capability)
-    );
+  // Office/CAD/messaging also contain background file and API capabilities.
+  // Only actual desktop input needs a foreground-window lease.
+  return capability.sideEffects.some(effect => effect.type === 'desktop_control');
 }
 
-function isFocusOrOpenCapability(toolName: string): boolean {
+function isFocusOrOpenCapability(toolName: string, capability?: RuntimeCapabilityDescriptor): boolean {
   const segments = toolName.toLocaleLowerCase().split('_').filter(Boolean);
   return segments.includes('open')
     || segments.includes('focus')
     || segments.join('_') === 'desktop_show_lumi_window'
-    || segments.join('_') === 'desktop_window_control';
+    || segments.join('_') === 'desktop_window_control'
+    || (capability?.family === 'web_login' && capability.lane === 'web'
+      && capability.operation === 'mutate' && !isExternalCommitCapability(capability));
 }
 
 /**
@@ -153,14 +146,14 @@ function stepForTool(
   toolName: string,
   capability?: RuntimeCapabilityDescriptor,
 ): DesktopActionStep | undefined {
+  if (!isDesktopRuntimeCapability(toolName, capability)) return undefined;
   const planned = plan.steps.find(step => step.allowedTools.includes(toolName));
   if (planned) return planned;
-  if (!isDesktopRuntimeCapability(toolName, capability)) return undefined;
   if (isSafeObservationCapability(capability)) {
     return plan.steps.find(step => step.operation === 'observe')
       || plan.steps.find(step => step.operation === 'verify');
   }
-  if (isFocusOrOpenCapability(toolName)) {
+  if (isFocusOrOpenCapability(toolName, capability)) {
     return plan.steps.find(step => step.operation === 'focus_or_open');
   }
   if (isExternalCommitCapability(capability)) {
@@ -177,6 +170,7 @@ function isObservationStep(step: DesktopActionStep | undefined): boolean {
 
 export class DesktopExecutionTracker {
   private readonly stepReceipts = new Map<string, DesktopStepReceipt>();
+  private receiptOwner: ToolExecutionIdentity | null = null;
   private lastObservationAt = 0;
   private lastFingerprint: WindowFingerprint | null = null;
   private applicationMatched = false;
@@ -194,6 +188,17 @@ export class DesktopExecutionTracker {
   private block(reason: string): DesktopRuntimeAuthorization {
     recordDesktopAuthorizationBlock(reason);
     return { allowed: false, reason };
+  }
+
+  bindSnapshotArguments(args: Record<string, any>): Record<string, any> {
+    // Reading a previously identified window does not require it to remain
+    // foreground. Keep both native selectors; never use this as an input lease.
+    const fingerprint = this.lastFingerprint;
+    if (!this.applicationMatched || !fingerprint?.processId || !fingerprint.nativeWindowHandle
+      || (args.root && args.root !== 'active') || args.allMatches
+      || ['name', 'nameContains', 'automationId', 'controlType', 'className', 'processId', 'nativeWindowHandle']
+        .some(key => args[key] !== undefined && args[key] !== '')) return args;
+    return { ...args, root: 'desktop', processId: fingerprint.processId, nativeWindowHandle: fingerprint.nativeWindowHandle };
   }
 
   authorize(
@@ -238,8 +243,15 @@ export class DesktopExecutionTracker {
   }
 
   record(record: ToolExecutionRecord): void {
+    if (!isCanonicalToolExecutionRecord(record)) return;
     const step = stepForTool(this.plan, record.name, record.capability);
     if (!step) return;
+    if (record.taskId && record.requestId) {
+      if (this.plan.taskId && this.plan.taskId !== record.taskId
+        || this.receiptOwner && (record.taskId !== this.receiptOwner.taskId || record.requestId !== this.receiptOwner.requestId)) return;
+      this.receiptOwner ||= toolExecutionIdentity(record);
+      this.plan.taskId = record.taskId;
+    } else if (this.receiptOwner) return;
     const verified = !record.error && record.terminalVerification?.status === 'verified';
     const evidence = [`tool:${record.name}`, `result_sha256:${digest(record.result || record.error || '')}`];
 
@@ -255,13 +267,13 @@ export class DesktopExecutionTracker {
     if (postOpenFingerprint) this.pendingAction = { step, recordVerified: true };
     if (isObservationStep(step) || postOpenFingerprint) {
       const fingerprint = postOpenFingerprint || parseDesktopWindowFingerprint(record.result);
+      // Screenshots and accessibility trees are content evidence, not a fresh
+      // foreground identity measurement. Missing identity is not a mismatch,
+      // and it must neither consume nor renew the last input lease.
+      if (!fingerprint) return;
       const fingerprintInvalidated = fingerprintInvalidatesVisualPlan(this.lastFingerprint, fingerprint);
-      const identityAssessment = this.plan.application.family === 'lumi'
-        ? null
-        : assessDesktopApplicationIdentity(fingerprint, this.plan.application);
-      const matched = this.plan.application.family === 'lumi'
-        ? record.name === 'client_get_state' && verified
-        : this.plan.application.family === 'unknown'
+      const identityAssessment = assessDesktopApplicationIdentity(fingerprint, this.plan.application);
+      const matched = this.plan.application.family === 'unknown'
           ? desktopFingerprintMatchesRequestedTarget(
               fingerprint,
               this.plan.expectedWindow.requestedTarget,
@@ -415,8 +427,11 @@ export class DesktopExecutionTracker {
     });
   }
 
-  toToolExecutionRecord(): ToolExecutionRecord | null {
-    if (this.stepReceipts.size === 0) return null;
+  toToolExecutionRecord(records: ToolExecutionRecord[] = []): ToolExecutionRecord | null {
+    const canonical = records.filter(record => isCanonicalToolExecutionRecord(record) && record.taskId && record.requestId);
+    const owner = this.receiptOwner;
+    if (!owner || canonical.length === 0 || canonical.some(record => record.taskId !== owner.taskId || record.requestId !== owner.requestId)) return null;
+    if (this.stepReceipts.size === 0 || canonical.some(record => record.envelope?.status === 'waiting_confirmation')) return null;
     const receipt = this.receipt();
     if (!this.receiptMetricRecorded) {
       recordDesktopExecutionReceipt(receipt);
@@ -425,7 +440,7 @@ export class DesktopExecutionTracker {
     const verified = receipt.completionVerified;
     return {
       id: `desktop-plan-${this.plan.planId}`,
-      taskId: this.plan.taskId,
+      ...this.receiptOwner,
       name: 'desktop_execution_plan_receipt',
       arguments: { planId: this.plan.planId, applicationId: this.plan.application.id },
       result: JSON.stringify(receipt),
@@ -452,13 +467,8 @@ export function withDesktopExecutionReceipt(
   records: ToolExecutionRecord[],
   tracker: DesktopExecutionTracker | undefined,
 ): ToolExecutionRecord[] {
-  const receipt = tracker?.toToolExecutionRecord();
-  if (!receipt) return records;
-  const existingIndex = records.findIndex(record => record.id === receipt.id);
-  if (existingIndex >= 0) {
-    const updated = [...records];
-    updated[existingIndex] = receipt;
-    return updated;
-  }
-  return [...records, receipt];
+  if (!tracker) return records;
+  const current = records.filter(record => record.id !== `desktop-plan-${tracker.plan.planId}`);
+  const receipt = tracker.toToolExecutionRecord(current);
+  return receipt ? [...current, receipt] : current;
 }

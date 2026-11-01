@@ -1,3 +1,4 @@
+import { readImplementationSource } from './implementation_source';
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -5,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 const root = process.cwd();
 
 function read(relativePath: string): string {
-  return fs.readFileSync(path.join(root, relativePath), 'utf8');
+  return readImplementationSource(path.join(root, relativePath), 'utf8');
 }
 
 describe('unified organization workspace boundary', () => {
@@ -30,14 +31,14 @@ describe('unified organization workspace boundary', () => {
     const desktop = read('src/entries/desktop.tsx');
     const portal = read('src/components/OrgPortal.tsx');
     const hub = read('src/components/org/OrgHub.tsx');
-    const workModeSwitch = read('src/components/org/WorkModeSwitch.tsx');
 
     expect(desktop).toContain("case 'org'");
     expect(desktop).toContain('<OrgPortal />');
     expect(portal).toContain("await switchDomain('work')");
     expect(portal).toMatch(/<OrgHub\s+key=/);
-    expect(hub).toContain("const target = workDomain === 'personal' ? 'work' : 'personal'");
-    expect(hub).toContain("await switchDomain(target)");
+    expect(hub).toContain('handleDomainToggle');
+    expect(hub).not.toContain('orgExitWorkSpace');
+    expect(hub).not.toContain('orgModulesOpen');
   });
 
   it('keeps native desktop window controls visible above the organization workbench', () => {

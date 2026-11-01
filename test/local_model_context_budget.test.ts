@@ -20,6 +20,24 @@ const tools = [{
 }];
 
 describe('local model context budget', () => {
+  it('reserves one consistent message budget before selecting optional schemas on continuation', () => {
+    const task = 'Create the requested report, then open that exact output in WPS and check its contents.';
+    const call: any = { role: 'assistant', content: null,
+      toolCalls: [{ id: 'saved-1', name: 'create_docx', arguments: { outputPath: 'D:/work/meeting.docx' } }] };
+    const receipt: any = { role: 'tool', name: 'create_docx', toolCallId: 'saved-1',
+      content: JSON.stringify({ ok: true, path: 'D:/work/meeting.docx', details: 'verified details '.repeat(220) }) };
+    const prepared = prepareLocalModelRequest({ contextTokens: 32768, compactToolDeclarations: true,
+      messages: [{ role: 'system', content: 'execution rules '.repeat(2000) },
+        { role: 'user', content: task }, call, receipt],
+      toolDeclarations: [...tools, ...Array.from({ length: 20 }, (_, i) => ({ ...tools[0], function: {
+        ...tools[0].function, name: `optional_${i}`, description: 'Optional capability description. '.repeat(45),
+      } }))], requiredToolNames: ['desktop_open'],
+    });
+    expect(prepared.messages).toContainEqual(receipt);
+    expect(prepared.messages).toContainEqual(call);
+    expect(prepared.messages.find(m => m.role === 'user')?.content).toBe(task);
+    expect(prepared.estimatedInputTokens).toBeLessThanOrEqual(6144);
+  });
   it('reserves room for nested workflow arguments while respecting the context and explicit limits', () => {
     const toolDeclarations = [{ type: 'function' as const, function: { name: 'save_workflow', description: 'Save draft',
       parameters: { type: 'object', properties: { steps: { type: 'array', items: { type: 'object', properties: {
@@ -244,9 +262,9 @@ describe('local model context budget', () => {
     })).toThrow(/complete assistant tool_call\/tool receipt boundary/i);
   });
 
-  it('retains the annotated source and a trailing synthetic user through local-model compaction', () => {
+  it('rejects rather than clipping an oversized annotated source and trailing synthetic user', () => {
     const sourceMessageId = 'local-durable-source-1';
-    const prepared = prepareLocalModelRequest({
+    const request = () => prepareLocalModelRequest({
       messages: [
         { role: 'system', content: `Safety boundary. ${'large policy '.repeat(1_500)}` },
         ...Array.from({ length: 12 }, (_, index) => ({
@@ -269,9 +287,30 @@ describe('local model context budget', () => {
       contextTokens: 4_096,
     });
 
-    const source = prepared.messages.find(message => message.sourceMessageId === sourceMessageId);
-    expect(String(source?.content)).toContain('LOCAL_ANNOTATED_SOURCE_SENTINEL');
-    expect(String(prepared.messages.at(-1)?.content)).toContain('LOCAL_SYNTHETIC_RECOVERY_SENTINEL');
+    let failure: Error | undefined;
+    try { request(); } catch (error) { failure = error as Error; }
+    expect(failure).toBeInstanceOf(LocalModelContextBudgetError);
+    expect(failure!.message).toMatch(/complete original user input/);
+    expect(failure!.message).not.toMatch(/LOCAL_ANNOTATED_SOURCE_SENTINEL|LOCAL_SYNTHETIC_RECOVERY_SENTINEL/);
+  });
+
+  it('retains the entire annotated source and trailing synthetic turn when both fit after history compaction', () => {
+    const sourceMessageId = 'local-fitting-source';
+    const sourceText = `LOCAL_ANNOTATED_SOURCE_SENTINEL ${'accepted instruction '.repeat(20)}`;
+    const syntheticText = `LOCAL_SYNTHETIC_RECOVERY_SENTINEL ${'synthetic guidance '.repeat(20)}`;
+    const prepared = prepareLocalModelRequest({
+      messages: [
+        { role: 'system', content: `Safety boundary. ${'large policy '.repeat(1500)}` },
+        ...Array.from({ length: 12 }, (_, index) => ({ role: index % 2 === 0 ? 'user' : 'assistant', content: `old turn ${index} ${'large history '.repeat(300)}` })),
+        { role: 'user', content: sourceText, sourceMessageId },
+        { role: 'assistant', content: 'Recover the interrupted execution.' },
+        { role: 'user', content: syntheticText },
+      ] as any[],
+      toolDeclarations: tools, maxTokens: 768, contextTokens: 4096,
+    });
+    expect(prepared.compacted).toBe(true);
+    expect(prepared.messages.find(message => message.sourceMessageId === sourceMessageId)?.content).toBe(sourceText);
+    expect(prepared.messages.at(-1)?.content).toBe(syntheticText);
     expect(prepared.estimatedInputTokens).toBeLessThanOrEqual(prepared.inputBudgetTokens);
   });
 
@@ -285,4 +324,42 @@ describe('local model context budget', () => {
       contextTokens: 4_096,
     })).toThrow(ModelRequestSourceProvenanceError);
   });
+  it('rejects an oversized unannotated current instruction with the local capacity error before inference', () => {
+    let providerCalls = 0;
+    const infer = () => {
+      const prepared = prepareLocalModelRequest({
+        messages: [{ role: 'user', content: 'Do not remove the unknown dates or exclusions. '.repeat(500) }],
+        toolDeclarations: [], contextTokens: 4_096,
+      });
+      providerCalls += 1;
+      return prepared;
+    };
+    expect(infer).toThrow(LocalModelContextBudgetError);
+    expect(providerCalls).toBe(0);
+  });
+
+  it.each([
+    ['invalid id', [{ role: 'user', content: 'task', sourceMessageId: ' invalid-id ' }]],
+    ['multiple sources', [
+      { role: 'user', content: 'first', sourceMessageId: 'first' },
+      { role: 'user', content: 'second', sourceMessageId: 'second' },
+    ]],
+    ['non-user source', [{ role: 'system', content: 'policy', sourceMessageId: 'not-a-user' }]],
+    ['incomplete tool protocol', [
+      { role: 'user', content: 'task', sourceMessageId: 'accepted' },
+      { role: 'assistant', content: null, toolCalls: [{ id: 'missing-result', name: 'read_file', arguments: {} }] },
+    ]],
+  ])('keeps %s as a provenance error rather than a local capacity error', (_label, messages) => {
+    let failure: any;
+    let providerCalls = 0;
+    try {
+      prepareLocalModelRequest({ messages: messages as any[], toolDeclarations: [], contextTokens: 4_096 });
+      providerCalls += 1;
+    } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(ModelRequestSourceProvenanceError);
+    expect(failure).not.toBeInstanceOf(LocalModelContextBudgetError);
+    expect(failure.capacityExceeded).toBe(false);
+    expect(providerCalls).toBe(0);
+  });
+
 });

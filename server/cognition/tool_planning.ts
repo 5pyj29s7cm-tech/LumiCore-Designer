@@ -1,4 +1,4 @@
-import type { ParsedToolCall, ToolExecutionRecord } from '../tools/types';
+import type { ParsedToolCall } from '../tools/types';
 import type { ToolRegistry } from '../tools/registry';
 
 type PlannedToolCall = ParsedToolCall & { id: string };
@@ -68,22 +68,13 @@ export function normalizePlannedToolScope(
   return normalized;
 }
 
-/** Attach an auditable, generic evidence envelope to a terminal receipt. */
-export function buildToolEvidenceRecord(
-  registry: ToolRegistry,
-  toolName: string,
-  args: Record<string, any>,
-): ToolExecutionRecord['evidence'] | undefined {
-  return registry.buildEvidenceRecord(toolName, args);
-}
-
 export const GENERIC_TOOL_PLANNING_PROMPT = [
   '## Tool planning and execution',
-  '- You are the planner: understand the user goal, decompose it, select declared tools, execute them now, inspect receipts, and continue until the requested result is complete or a real blocker is proven.',
+  '- You are the planner: preserve every requested part of the goal. Use declared tools where needed, complete independent parts even if another part is blocked, and stop only work that depends on the proven blocker.',
   '- Preserve scope words exactly. A request for all/every/each/other/remaining items must not silently become one default item; use an all-scope call when supported or call the selected tool for every declared enum member.',
   '- Do not announce that you will run a tool and then stop. When work is requested and an appropriate declared tool exists, call it in this turn.',
   '- Tool descriptions and schemas are the capability source of truth. Do not invent modes, tools, settings, execution, or results.',
-  '- After tool output, report only what the receipts support, include real blockers and relevant limitations, and distinguish observed state from live verification.',
+  '- Ground tool-action claims in their receipts and analysis in the available conversation or source content. Claim whole-request completion only when every requested part is satisfied.',
 ].join('\n');
 
 export const GENERIC_TOOL_REPLAN_PROMPT = [

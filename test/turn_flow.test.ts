@@ -18,7 +18,8 @@ describe('Lumi turn flow', () => {
     });
 
     expect(flow.routeText).toBe(text);
-    expect(flow.allowToolUseForTurn).toBe(false);
+    // Schema eligibility does not admit a tool call or create a task.
+    expect(flow.allowToolUseForTurn).toBe(true);
     expect(flow.selfRepairTurn).toBe(false);
     expect(flow.autoPromoteToAssistant).toBe(false);
     expect(flow.completionEvidenceNeeded).toBe(false);
@@ -49,7 +50,6 @@ describe('Lumi turn flow', () => {
       targetIsLumi: true,
     });
     expect(flow.allowToolUseForTurn).toBe(false);
-    expect(flow.modelToolAccess).toBe('hard_off');
     expect(flow.selfRepairTurn).toBe(false);
     expect(flow.completionEvidenceNeeded).toBe(false);
     expect(flow.executionGovernance.verificationIntent).toBe('none');
@@ -149,7 +149,7 @@ describe('Lumi turn flow', () => {
 
   it('does not join navigation verbs and client-surface nouns across separate clauses', async () => {
     const { initDatabase } = await import('../db_layer');
-    const { buildLumiTurnFlow, buildInteractionModeOverlay } = await import('../server/cognition/turn_flow');
+    const { buildLumiTurnFlow } = await import('../server/cognition/turn_flow');
     await initDatabase();
     const flow = buildLumiTurnFlow({
       userId: 'turn_flow_factual_restatement',
@@ -160,8 +160,7 @@ describe('Lumi turn flow', () => {
     });
 
     expect(flow.clientActionOnlyTurn).toBe(false);
-    expect(flow.allowToolUseForTurn).toBe(false);
-    expect(buildInteractionModeOverlay(flow)).toContain('Factual Restatement Fidelity');
+    expect(flow.allowToolUseForTurn).toBe(true);
   });
 
   it.each(['chat', 'voice'] as const)('keeps capability access questions conversational in %s', async (channel) => {
@@ -181,10 +180,9 @@ describe('Lumi turn flow', () => {
 
     expect(dispatch.boundary).toBe('conversation');
     expect(dispatch.flow.conceptualCapabilityQuestion).toBe(true);
-    expect(dispatch.flow.allowToolUseForTurn).toBe(false);
+    expect(dispatch.flow.allowToolUseForTurn).toBe(true);
     expect(dispatch.flow.clientActionOnlyTurn).toBe(false);
     expect(dispatch.flow.selfRepairTurn).toBe(false);
-    expect(dispatch.flow.specialWorkflow).toBeNull();
     expect(dispatch.flow.routeText).not.toContain('active task');
     if (channel === 'chat') {
       expect(dispatch.promptOverlay).toContain('only text entry');
@@ -254,7 +252,7 @@ describe('Lumi turn flow', () => {
     });
 
     expect(flow.selfRepairTurn).toBe(false);
-    expect(flow.allowToolUseForTurn).toBe(false);
+    expect(flow.allowToolUseForTurn).toBe(true);
     expect(flow.completionEvidenceNeeded).toBe(false);
     expect(flow.routeText).toBe('为什么不回我');
   });
@@ -409,7 +407,7 @@ describe('Lumi turn flow', () => {
       });
 
       expect(continuationContext).toBe('');
-      expect(flow.allowToolUseForTurn).toBe(false);
+      expect(flow.allowToolUseForTurn).toBe(true);
       expect(flow.routeText).toBe(text);
     }
   });
@@ -440,7 +438,7 @@ describe('Lumi turn flow', () => {
     expect(flow.surface).toBe('chat');
     expect(flow.workTakeover.strength).toBe('hint');
     expect(flow.workTakeover.shouldResumeTask).toBe(false);
-    expect(flow.allowToolUseForTurn).toBe(false);
+    expect(flow.allowToolUseForTurn).toBe(true);
     expect(flow.promptOverlay).toContain('Do not force a task/tool path');
   });
 
@@ -471,9 +469,9 @@ describe('Lumi turn flow', () => {
       targetIsLumi: true,
     });
 
-    expect(dispatch.boundary).toBe('conversation');
+    expect(dispatch.boundary).toBe('tool_action');
     expect(dispatch.flow.workTakeover.shouldResumeTask).toBe(false);
-    expect(dispatch.flow.allowToolUseForTurn).toBe(false);
+    expect(dispatch.flow.allowToolUseForTurn).toBe(true);
     expect(dispatch.flow.routeText).toBe(text);
   });
 
@@ -521,7 +519,6 @@ describe('Lumi turn flow', () => {
     expect(dispatch.flow.workTakeover.shouldResumeTask).toBe(false);
     expect(dispatch.flow.selfRepairTurn).toBe(false);
     expect(dispatch.flow.allowToolUseForTurn).toBe(false);
-    expect(dispatch.flow.modelToolAccess).toBe('hard_off');
     expect(dispatch.flow.routeText).toContain('followupIntent: repeat');
     expect(dispatch.flow.routeText).toContain('我是 Lumi，是你的常驻智能伙伴。');
     expect(dispatch.flow.routeText).not.toContain('工作接管');
@@ -650,7 +647,8 @@ describe('Lumi turn flow', () => {
       operationMode: 'chat',
     });
     expect(chatty.workTakeover.strength).toBe('hint');
-    expect(chatty.allowToolUseForTurn).toBe(false);
+    expect(chatty.allowToolUseForTurn).toBe(true);
+    expect(chatty.workTakeover.shouldResumeTask).toBe(false);
 
     const working = buildLumiTurnFlow({
       userId: 'turn_flow_voice_user',
@@ -687,7 +685,7 @@ describe('Lumi turn flow', () => {
       operationMode: 'autonomous',
     });
     expect(channelCorrection.clientActionOnlyTurn).toBe(false);
-    expect(channelCorrection.allowToolUseForTurn).toBe(false);
+    expect(channelCorrection.allowToolUseForTurn).toBe(true);
   });
 
   it('routes knowledge inventory as read-only knowledge work, not client navigation', async () => {
@@ -787,7 +785,7 @@ describe('Lumi turn flow', () => {
       operationMode: 'assistant',
     });
 
-    expect(resultDemand.allowToolUseForTurn).toBe(false);
+    expect(resultDemand.allowToolUseForTurn).toBe(true);
     expect(resultDemand.routeText).toContain('desktop_list_apps | items=2');
     expect(resultDemand.routeText).not.toContain('work_takeover');
 
@@ -806,7 +804,7 @@ describe('Lumi turn flow', () => {
 
     expect(statusQuestion.selfRepairTurn).toBe(false);
     expect(statusQuestion.clientActionOnlyTurn).toBe(false);
-    expect(statusQuestion.allowToolUseForTurn).toBe(false);
+    expect(statusQuestion.allowToolUseForTurn).toBe(true);
     expect(statusQuestion.routeText).toContain('打开微信问阿陆在干嘛');
 
     const whyUnfinished = buildLumiTurnFlow({
@@ -825,7 +823,7 @@ describe('Lumi turn flow', () => {
       operationMode: 'assistant',
     });
 
-    expect(whyUnfinished.allowToolUseForTurn).toBe(false);
+    expect(whyUnfinished.allowToolUseForTurn).toBe(true);
     expect(whyUnfinished.routeText).toContain('设计草稿.jpg');
     expect(whyUnfinished.routeText).toContain('followupIntent: status');
 
@@ -866,4 +864,55 @@ describe('Lumi turn flow', () => {
     expect(cadContinuation.clientActionOnlyTurn).toBe(false);
     expect(cadContinuation.routeText).toContain('AutoCAD');
   });
+});
+
+it.each(['按上面的“非拼写错误版”来', '按上面的非拼写错误版来'])('keeps a creative version choice out of runtime self-repair: %s', async text => {
+  const { isDiagnosticOrRepairRequest } = await import('../server/cognition/tool_intent');
+  const { buildLumiTurnFlow } = await import('../server/cognition/turn_flow');
+  expect(isDiagnosticOrRepairRequest(text)).toBe(false);
+  const flow = buildLumiTurnFlow({userId:'creative-version-selection',text,channel:'chat',targetIsLumi:true});
+  expect(flow.selfRepairTurn).toBe(false);
+  expect(isDiagnosticOrRepairRequest('客户端启动错误，请检查')).toBe(true);
+});
+
+describe('current-turn guidance boundary', () => {
+  it('answers explicit operation instructions without creating tool work from the mentioned file', async () => {
+    const { initDatabase } = await import('../db_layer');
+    const { buildLumiTurnFlow } = await import('../server/cognition/turn_flow');
+    const { hasExplicitNoToolInstruction } = await import('../server/cognition/no_tool_instruction');
+    const { buildActionContract } = await import('../server/cognition/action_contract');
+    await initDatabase();
+    const text = "如果共同验收丙.docx在其他目录，我不知道完整路径怎么找，也不知道怎么把文件发给你。请教我具体怎么操作，这一步先给操作说明。";
+    expect(hasExplicitNoToolInstruction(text)).toBe(true);
+    expect(buildActionContract(text)).toMatchObject({ applies: false, kind: 'none' });
+    const flow = buildLumiTurnFlow({ userId: 'missing-source-guidance', text, channel: 'chat', source: 'command-center-chat', operationMode: 'assistant', targetIsLumi: true });
+    expect(flow.routeText).toBe(text);
+    expect(flow.allowToolUseForTurn).toBe(false);
+    expect(flow.completionEvidenceNeeded).toBe(false);
+  });
+  it.each(['教我怎么做，随后帮我打开记事本。', '先搜索文件再解释。', '先给操作说明，然后帮我执行。'])('does not suppress a separate explicit action: %s', async text => {
+    const { hasExplicitNoToolInstruction } = await import('../server/cognition/no_tool_instruction');
+    expect(hasExplicitNoToolInstruction(text)).toBe(false);
+  });
+});
+
+describe('explicit guidance keeps the latest turn as its route', () => {
+  it('does not append an old execution root when the user says continue but asks for instructions first', async () => {
+    const { initDatabase } = await import('../db_layer');
+    const { buildLumiTurnFlow } = await import('../server/cognition/turn_flow');
+    await initDatabase();
+    const text = '继续这个任务，这一步先给操作说明。';
+    const flow = buildLumiTurnFlow({ userId: 'guidance-before-resume', text, channel: 'chat', source: 'command-center-chat', operationMode: 'assistant', targetIsLumi: true, continuationContext: '先前任务：合并两份本地文件并返回成品，缺少第二份。', actionFollowupIntent: 'execute' });
+    expect(flow.routeText).toBe(text);
+    expect(flow.allowToolUseForTurn).toBe(false);
+    expect(flow.completionEvidenceNeeded).toBe(false);
+  });
+});
+
+it('keeps a natural how-to follow-up out of prior-task execution and verification', async () => {
+  const { buildLumiTurnFlow } = await import('../server/cognition/turn_flow');
+  const text = '这个文件在其他文件夹，我怎么找到它并发给你';
+  const flow = buildLumiTurnFlow({ userId: 'natural-howto-boundary', text, channel: 'chat', source: 'command-center-chat', operationMode: 'assistant', targetIsLumi: true, continuationContext: '原任务：合并桌面两份文件并发回，第二份文件缺少。', actionFollowupIntent: 'status' });
+  expect(flow.routeText).toBe(text);
+  expect(flow.completionEvidenceNeeded).toBe(false);
 });

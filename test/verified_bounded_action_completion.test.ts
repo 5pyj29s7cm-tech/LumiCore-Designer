@@ -48,6 +48,27 @@ async function run(task: string, value: ReturnType<typeof fixture>, onToolCall?:
 }
 
 describe('verified bounded actions in the real shared tool loop', () => {
+  it.each(['run', 'send', '运行', '发送'].flatMap(directory => [false, true].map(readback => [directory, readback] as const)))('treats action words inside the %s path as a location, retaining compound obligations (readback=%s)', async (directory, readback) => {
+    const value = fixture();
+    value.target = path.join(root, directory, 'literal-action-' + serial + '.txt');
+    fs.mkdirSync(path.dirname(value.target), { recursive: true });
+    const content = 'LC location literal';
+    mocks.makeLLMCall.mockResolvedValue({ text: '文件已保存。', toolCalls: [] }).mockResolvedValueOnce({ text: '', toolCalls: [
+      { id: 'literal-path-write', name: 'write_file', arguments: { path: value.target, content } },
+    ] });
+    const task = '在 ' + value.target + ' 新建文本文件，只写入“' + content + '”。' + (readback ? '写完回读并告诉我全文。' : '');
+    const result = await run(task, value);
+    expect(fs.readFileSync(value.target, 'utf8')).toBe(content);
+    const input = { taskText: task, responseText: '', toolRecords: result.toolCalls, source: 'voice_confirmation',
+      taskId: value.context.taskId, requestId: value.context.requestId };
+    expect(tryFinalizeVerifiedBoundedAction(input)).toMatchObject({ blocked: false });
+    expect(tryFinalizeVerifiedBoundedAction({ ...input, taskText: task + '写完还要运行 Notepad。' })).toBeNull();
+    expect(tryFinalizeVerifiedBoundedAction({ ...input, taskText: task + '写完还要发邮件给对方。' })).toBeNull();
+    expect(tryFinalizeVerifiedBoundedAction({ ...input, taskText: task + '写完还要发给别人。' })).toBeNull();
+    expect(result.toolCalls).toHaveLength(readback ? 2 : 1);
+    expect(mocks.makeLLMCall).toHaveBeenCalledTimes(1);
+  });
+
   it('delivers a verified retry image before another model call or queued duplicate can replace its success', async () => {
     const value = fixture();
     registerImageTools(value.registry);
@@ -75,7 +96,8 @@ describe('verified bounded actions in the real shared tool loop', () => {
       requestId: value.context.requestId, taskId: value.context.taskId };
     expect(finalizeLumiResponse(input)).toMatchObject({ blocked: false, text: '图片已生成。' });
     expect(tryFinalizeVerifiedBoundedAction({ ...input, taskText: '生成一张蓝色杯子的图片并发送邮件。' })).toBeNull();
-    expect(tryFinalizeVerifiedBoundedAction({ ...input, taskText: '生成两张蓝色杯子的图片。' })).toBeNull();
+    expect(tryFinalizeVerifiedBoundedAction({ ...input, taskText: '生成两张蓝色杯子的图片。' }))
+      .toMatchObject({ blocked: true, reason: 'media_settings_mismatch' });
     expect(tryFinalizeVerifiedBoundedAction({ ...input, requestId: 'other-turn' })).toBeNull();
   });
 
@@ -135,7 +157,7 @@ describe('verified bounded actions in the real shared tool loop', () => {
     const result = await run(`在 ${value.target} 新建文本文件，只写入“${content}”，写完回读并告诉我全文。`, value);
     expect(result.toolCalls?.map(record => record.name)).toEqual(['write_file', 'read_file']);
     expect(result.text).toContain(content);
-    expect(mocks.makeLLMCall).toHaveBeenCalledTimes(2);
+    expect(mocks.makeLLMCall).toHaveBeenCalledTimes(1); // The requested saved-output read is bound by the runtime.
   });
 
   it('does not confuse reading the source with delivering the requested calculation', async () => {

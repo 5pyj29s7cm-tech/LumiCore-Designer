@@ -5,7 +5,7 @@ import path from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { flushDBOrThrow, readDB, writeDB } from '../db_layer';
 import { getOrCreateActiveConversation } from '../server/conversation/manager';
-import { ensureBackgroundConversationActionTask } from '../server/conversation/action_ledger';
+import { ensureBackgroundConversationActionTask } from '../server/conversation/ledger/background';
 import {
   createInteriorProject,
   getActiveInteriorProject,
@@ -703,9 +703,9 @@ describe('designer project delivery loop', () => {
     const status = JSON.parse(await registry.execute('interior_design_project_status', {
       projectId: project.id,
     }, { userId, domain: 'personal', orgId: '' } as any));
-    expect(status.project.brief.occupants).toBe('Three-person household');
-    expect(status.project.brief.budget).toBe('CNY 350,000');
-    expect(status.project.brief.constraints).toContain('height 2800 mm');
+    expect(status.project.brief.occupants).toBe('');
+    expect(status.project.brief.budget).toBe('');
+    expect(status.project.brief.constraints).toBe(''); // A read-only status query must not overwrite a user's later edits.
   });
 
   it('never reuses a verified completion receipt from another workflow task', () => {

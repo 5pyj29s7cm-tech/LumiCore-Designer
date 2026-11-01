@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
-  ArrowUpRight,
   Building2,
   ChevronDown,
   CircleAlert,
@@ -23,7 +22,7 @@ import { getCommandCenterCopy } from '@/i18n/locales/commandCenter';
 import { isCurrentScopeRequest } from './scopeRequestGuard';
 import { LumiScenePanel } from './LumiScenePanel';
 import { RuntimeEvidencePanel } from './RuntimeEvidencePanel';
-import { LumiCoreSphere, type LumiCoreOrbitTask, type LumiCoreTaskState } from './LumiCoreSphere';
+import { LumiCoreSphere, type LumiCoreOrbitTask } from './LumiCoreSphere';
 import { TaskCompletionFeedbackDetails } from './TaskCompletionFeedbackDetails';
 import {
   customerVisibleTaskBlocker,
@@ -41,34 +40,23 @@ export type CommandCenterTask = {
   title: string;
   status: string;
   phase: string;
-  updatedAt?: string;
-  toolCallsCount?: number;
-  resultPreview?: string;
-  error?: string;
-  completedAt?: string;
   blocker?: string;
   nextAction?: string;
   cancellationRequested?: boolean;
-  pauseRequested?: boolean;
   controls?: { canPause: boolean; canResume: boolean; canCancel: boolean };
   progress?: {
-    checkpoint: string;
     completedUnits: number;
     totalUnits: number;
     receiptCount: number;
-    toolCallCount: number;
   };
   evidence?: {
-    terminal: boolean;
     verification: string;
     evidenceCount: number;
-    toolCount: number;
-    reasonCode: string;
   };
   completionFeedback?: TaskCompletionFeedback;
 };
 
-const ACTIVE_PHASES = new Set(['pending', 'queued', 'running', 'working', 'pausing', 'cancelling', 'waiting_confirmation']);
+const ACTIVE_STATUSES = new Set(['pending', 'queued', 'running', 'in_progress', 'executing', 'planning', 'working', 'pausing', 'cancelling']);
 
 function numeric(value: unknown): number {
   const number = Number(value || 0);
@@ -91,20 +79,15 @@ export function normalizeCommandCenterTask(value: unknown, locale?: 'zh' | 'en')
     : undefined;
   const progress = task.progress && typeof task.progress === 'object'
     ? {
-        checkpoint: String(task.progress.checkpoint || ''),
         completedUnits: numeric(task.progress.completedUnits),
         totalUnits: numeric(task.progress.totalUnits),
         receiptCount: numeric(task.progress.receiptCount),
-        toolCallCount: numeric(task.progress.toolCallCount),
       }
     : undefined;
   const evidence = task.evidence && typeof task.evidence === 'object'
     ? {
-        terminal: task.evidence.terminal === true,
         verification: String(task.evidence.verification || 'pending'),
         evidenceCount: numeric(task.evidence.evidenceCount),
-        toolCount: numeric(task.evidence.toolCount),
-        reasonCode: String(task.evidence.reasonCode || ''),
       }
     : undefined;
   return {
@@ -115,17 +98,6 @@ export function normalizeCommandCenterTask(value: unknown, locale?: 'zh' | 'en')
       : String(task.title || '').trim(),
     status,
     phase,
-    updatedAt: typeof task.updatedAt === 'string' ? task.updatedAt : undefined,
-    toolCallsCount: task.toolCallsCount == null
-      ? (task.progress?.toolCallCount == null ? undefined : numeric(task.progress.toolCallCount))
-      : numeric(task.toolCallsCount),
-    resultPreview: typeof task.resultPreview === 'string'
-      ? locale ? customerVisibleTaskDetail(task.resultPreview, locale, '') : task.resultPreview
-      : undefined,
-    error: typeof task.error === 'string'
-      ? locale ? customerVisibleTaskBlocker(task.error, locale) : task.error
-      : undefined,
-    completedAt: typeof task.completedAt === 'string' ? task.completedAt : undefined,
     blocker: typeof task.blocker === 'string'
       ? locale ? customerVisibleTaskBlocker(task.blocker, locale) : task.blocker
       : undefined,
@@ -133,7 +105,6 @@ export function normalizeCommandCenterTask(value: unknown, locale?: 'zh' | 'en')
       ? locale ? customerVisibleTaskNextAction(task.nextAction, locale) : task.nextAction
       : undefined,
     cancellationRequested: task.cancellationRequested === true || task.cancelRequested === true,
-    pauseRequested: task.pauseRequested === true,
     controls,
     progress,
     evidence,
@@ -144,23 +115,14 @@ export function normalizeCommandCenterTask(value: unknown, locale?: 'zh' | 'en')
 }
 
 export function commandCenterTaskIsActive(task: CommandCenterTask): boolean {
-  return ACTIVE_PHASES.has(String(task.phase || '')) || ACTIVE_PHASES.has(String(task.status || ''));
-}
-
-function taskOrbitState(task: CommandCenterTask): LumiCoreTaskState {
-  if (task.phase === 'paused') return 'paused';
-  if (task.phase === 'failed' || task.phase === 'blocked') return 'attention';
-  if (task.phase === 'completed') return 'completed';
-  if (commandCenterTaskIsActive(task)) return 'working';
-  return 'queued';
+  return ACTIVE_STATUSES.has(task.status);
 }
 
 export function buildLumiCoreOrbitTasks(tasks: CommandCenterTask[]): LumiCoreOrbitTask[] {
-  return tasks.map(task => ({
+  return tasks.filter(commandCenterTaskIsActive).map(task => ({
     id: task.id,
-    title: task.title || task.id,
-    state: taskOrbitState(task),
-    active: commandCenterTaskIsActive(task),
+    title: task.title,
+    state: task.status === 'pending' || task.status === 'queued' ? 'queued' : 'working',
   }));
 }
 
@@ -168,7 +130,6 @@ export function CommandCenterPanel({
   t,
   view,
   onViewChange,
-  onOpenNexus,
   runtimeStatusOverride,
   /**
    * Render only the animated core field.  The command-center chat uses this
@@ -180,7 +141,6 @@ export function CommandCenterPanel({
   t?: any;
   view: CommandCenterView;
   onViewChange: (view: CommandCenterView) => void;
-  onOpenNexus?: () => void;
   runtimeStatusOverride?: {
     status: StructuredRuntimeStatus | null;
     loading: boolean;
@@ -201,7 +161,8 @@ export function CommandCenterPanel({
   const [loading, setLoading] = useState(true);
   const scopeGenerationRef = useRef(0);
   const activeScopeKeyRef = useRef(scopeKey);
-  const refreshInFlightRef = useRef<Promise<void> | null>(null);
+  activeScopeKeyRef.current = scopeKey;
+  const refreshRevisionRef = useRef(0);
   const localRuntimeStatus = useRuntimeStatus({ enabled: runtimeStatusOverride === undefined && Boolean(user), scopeKey: runtimeScopeKey, userId: user?.uid });
   const {
     status,
@@ -227,34 +188,36 @@ export function CommandCenterPanel({
   }, [scopeKey]);
 
   const refresh = useCallback(async () => {
-    if (refreshInFlightRef.current) return refreshInFlightRef.current;
+    if (activeScopeKeyRef.current !== scopeKey) return;
     const request = { scopeKey, generation: scopeGenerationRef.current };
+    const revision = ++refreshRevisionRef.current;
+    const current = () => revision === refreshRevisionRef.current
+      && isCurrentScopeRequest(request, activeScopeKeyRef.current, scopeGenerationRef.current);
     setLoading(true);
-    const promise = (async () => {
-      try {
-        const response = await apiFetch('/api/autonomy/work');
-        if (!response.ok) throw new Error(`Task status request failed (${response.status})`);
-        const payload = await response.json();
-        if (!isCurrentScopeRequest(request, activeScopeKeyRef.current, scopeGenerationRef.current)) return;
-        const items = Array.isArray(payload?.items) ? payload.items : [];
-        setTasks(items
-          .map(item => normalizeCommandCenterTask(item, isZh ? 'zh' : 'en'))
-          .filter((task): task is CommandCenterTask => Boolean(task)));
-        setTaskError(payload?.degraded ? copy.degradedTaskState : '');
-      } catch (error: any) {
-        if (isCurrentScopeRequest(request, activeScopeKeyRef.current, scopeGenerationRef.current)) {
-          setTaskError(copy.degradedTaskState);
-        }
-      } finally {
-        if (isCurrentScopeRequest(request, activeScopeKeyRef.current, scopeGenerationRef.current)) setLoading(false);
-        refreshInFlightRef.current = null;
+    try {
+      const response = await apiFetch('/api/autonomy/work', { signal: AbortSignal.timeout(6_000) });
+      if (!response.ok) throw new Error('Task status unavailable');
+      const payload = await response.json();
+      if (!current()) return;
+      const items = Array.isArray(payload?.items) ? payload.items : [];
+      setTasks(items.map(item => normalizeCommandCenterTask(item, isZh ? 'zh' : 'en'))
+        .filter((task): task is CommandCenterTask => Boolean(task)));
+      setTaskError(payload?.degraded ? copy.degradedTaskState : '');
+    } catch {
+      if (current()) {
+        setTasks([]);
+        setTaskError(copy.degradedTaskState);
       }
-    })();
-    refreshInFlightRef.current = promise;
-    return promise;
+    } finally {
+      if (current()) setLoading(false);
+    }
   }, [copy.degradedTaskState, isZh, scopeKey]);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    void refresh();
+    const interval = setInterval(() => { if (!document.hidden) void refresh(); }, 10_000);
+    return () => { clearInterval(interval); refreshRevisionRef.current++; };
+  }, [refresh]);
 
   useEffect(() => {
     const socket = socketService.getSocket();
@@ -265,6 +228,9 @@ export function CommandCenterPanel({
       timer = setTimeout(() => { void refresh(); void refreshRuntime(); }, 100);
     };
     const events = [
+      'connect',
+      'agent:status',
+      'chat:conversation_updated',
       'autonomous:task_started',
       'autonomous:task_paused',
       'autonomous:task_retry_scheduled',
@@ -301,10 +267,8 @@ export function CommandCenterPanel({
   }, [controlInFlightIds, copy.degradedTaskState, refresh, refreshRuntime, scopeKey]);
 
   const orbitTasks = useMemo(() => buildLumiCoreOrbitTasks(tasks), [tasks]);
-  const activeTasks = useMemo(() => tasks.filter(commandCenterTaskIsActive), [tasks]);
   const recentTasks = useMemo(() => tasks.slice(0, 8), [tasks]);
-  const hasAttention = tasks.some(task => task.phase === 'failed' || task.phase === 'blocked');
-  const coreState = hasAttention ? 'attention' : activeTasks.length > 0 ? 'working' : 'ready';
+  const coreState = orbitTasks.some(task => task.state === 'working') ? 'working' : 'ready';
 
   return (
     <section
@@ -339,14 +303,13 @@ export function CommandCenterPanel({
               labels={{
                 aria: copy.taskViewAria,
                 lumiCore: copy.core,
-                ready: copy.ready,
+                ready: taskError ? copy.runtimeUnavailable : copy.ready,
                 working: copy.working,
-                attention: copy.attention,
-                noTasks: copy.noTasks,
+                noTasks: taskError || copy.noTasks,
               }}
             />
             {!backgroundOnly && <div className="absolute bottom-4 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2">
-              <button type="button" onClick={() => onOpenNexus ? onOpenNexus() : onViewChange('core')} className="flex h-10 items-center gap-2 rounded-2xl border border-violet-300/15 bg-[#080d17]/78 px-3.5 text-[10px] font-bold text-violet-100/70 shadow-2xl backdrop-blur-2xl hover:bg-violet-400/[0.12] hover:text-violet-50"><Cpu size={13} />{copy.core}</button>
+              <button type="button" onClick={() => onViewChange('core')} className="flex h-10 items-center gap-2 rounded-2xl border border-violet-300/15 bg-[#080d17]/78 px-3.5 text-[10px] font-bold text-violet-100/70 shadow-2xl backdrop-blur-2xl hover:bg-violet-400/[0.12] hover:text-violet-50"><Cpu size={13} />{copy.core}</button>
               <button type="button" onClick={() => { void refresh(); void refreshRuntime(); }} className="flex h-10 w-10 items-center justify-center rounded-2xl border border-white/[0.08] bg-[#080d17]/78 text-white/35 shadow-2xl backdrop-blur-2xl hover:bg-white/[0.07] hover:text-white/70" title={copy.refresh}><RefreshCw size={13} className={loading ? 'animate-spin' : ''} /></button>
             </div>}
           </div>
@@ -354,16 +317,11 @@ export function CommandCenterPanel({
 
         {view === 'core' && (
           <div className="space-y-4">
-            {onOpenNexus && (
-              <button type="button" onClick={onOpenNexus} className="flex w-full items-center justify-between rounded-2xl border border-violet-300/18 bg-gradient-to-r from-violet-400/[0.10] to-cyan-400/[0.08] px-4 py-3 text-left hover:border-violet-200/30">
-                <span><span className="block text-sm font-bold text-white/85">{copy.openCore}</span><span className="mt-1 block text-[10px] text-white/35">LumiCore · local runtime</span></span><ArrowUpRight size={16} className="text-violet-200" />
-              </button>
-            )}
             <RuntimeEvidencePanel status={status} loading={runtimeLoading} error={runtimeError} />
             <LumiScenePanel scene={scene} loading={sceneLoading} error={sceneError} />
             {!runtimeLoading && !status && <div className="flex items-center gap-2 rounded-2xl border border-amber-300/15 bg-amber-400/[0.05] p-4 text-xs text-amber-100/65"><CircleAlert size={14} />{copy.runtimeUnavailable}</div>}
             <div className="grid grid-cols-2 gap-3">
-              <div className="rounded-2xl border border-white/[0.07] bg-white/[0.025] p-4"><div className="flex items-center gap-2 text-xs text-white/45"><Activity size={13} />{copy.tasks}</div><div className="mt-2 text-xl font-black text-white/80">{status?.counts.activeTasks || activeTasks.length}</div></div>
+              <div className="rounded-2xl border border-white/[0.07] bg-white/[0.025] p-4"><div className="flex items-center gap-2 text-xs text-white/45"><Activity size={13} />{copy.tasks}</div><div className="mt-2 text-xl font-black text-white/80">{status?.counts.activeTasks ?? orbitTasks.length}</div></div>
               <div className="rounded-2xl border border-white/[0.07] bg-white/[0.025] p-4"><div className="flex items-center gap-2 text-xs text-white/45"><Cpu size={13} />{copy.receipts}</div><div className="mt-2 text-xl font-black text-white/80">{status?.counts.verifiedReceipts || 0}</div></div>
             </div>
 

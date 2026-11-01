@@ -25,7 +25,7 @@ describe('LumiCore engine and product-variant identity', () => {
     expect(read('src-tauri/src/main.rs')).toContain('lumi_core_lib::run()');
     expect(tauri.productName).toBe(PRODUCT_VARIANT.runtime.productName);
     expect(tauri.app.windows[0]?.title).toBe(PRODUCT_VARIANT.runtime.desktopTitle);
-    expect(fs.existsSync(path.join(root, 'assets', 'lumiCore-icon.svg'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'assets', 'lumiCore-icon.png'))).toBe(true);
     expect(fs.existsSync(path.join(root, 'assets', 'lumiOS-icon.svg'))).toBe(false);
     expect(read('scripts/smoke-windows-installer.ps1')).toContain('$($TauriConfig.productName)_$($PackageJson.version)_x64-setup.exe');
     expect(read('scripts/smoke-windows-installer.ps1')).toContain('lumi-core.exe');

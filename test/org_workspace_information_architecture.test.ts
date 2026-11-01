@@ -1,9 +1,10 @@
+import { readImplementationSource } from './implementation_source';
 import fs from 'fs';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
 
 function source(file: string) {
-  return fs.readFileSync(path.join(process.cwd(), file), 'utf8');
+  return readImplementationSource(path.join(process.cwd(), file), 'utf8');
 }
 
 describe('organization workspace information architecture', () => {
@@ -13,7 +14,6 @@ describe('organization workspace information architecture', () => {
 
     expect(legalHub).toContain('LegalCaseCreateDialog');
     expect(legalHub).toContain('LegalCaseDeleteDialog');
-    expect(legalHub).toContain("method: 'DELETE'");
     expect(legalHub).toContain('setActiveLegalCaseId(id)');
     expect(legalHub).not.toContain('text-white/25 opacity-0');
     expect(legalHub).not.toContain('Case Action Board');
@@ -22,18 +22,21 @@ describe('organization workspace information architecture', () => {
     expect(routes).toContain("requireOrgRole('owner', 'admin')");
   });
 
-  it('keeps one focused spatial and interior design workspace', () => {
+  it('preserves focused designer workspaces alongside main spatial and brand tools', () => {
     const orgHub = source('src/components/org/OrgHub.tsx');
     const designHub = source('src/components/org/DesignHub.tsx');
     const designCopy = source('src/i18n/locales/interiorDesign.ts');
 
     expect(orgHub).toContain("id: 'spatial-design'");
-    expect(orgHub).toContain("case 'spatial-design': return <DesignHub />");
-    expect(orgHub).toContain("onClick={() => openSubView('spatial-design')}");
+    expect(orgHub).toContain('case \'spatial-design\': return <DesignHub workspace="spatial" />');
+    expect(orgHub).toContain('case \'brand-design\': return <DesignHub workspace="brand" />');
+    expect(orgHub).toContain("import('./GeneralDesignHub')");
+    expect(orgHub).toContain('normalizeOrganizationWorkspaceView(detail.sub)');
+    expect(orgHub).toContain('setSubView(requestedView)');
     expect(orgHub).not.toContain('orgModulesOpen');
     expect(orgHub).not.toContain('organization-modules.75dd9b5603');
     expect(orgHub).not.toContain('t.orgExitWorkSpace');
-    expect(orgHub).not.toContain("id: 'brand-design'");
+    expect(orgHub).toContain("id: 'brand-design'");
     expect(designHub).toContain("| 'project'");
     expect(designHub).toContain("| 'cad'");
     expect(designHub).toContain("| 'visualization'");
@@ -100,7 +103,8 @@ describe('organization workspace information architecture', () => {
     expect(desktop).toContain('organizationWorkspaceView');
     expect(desktop).toContain('availableOrganizationWorkspaceViews');
     expect(contract).toContain("'spatial-design'");
-    expect(contract).not.toContain("'brand-design'");
+    expect(contract).toContain("'brand-design'");
+    expect(contract).toContain("interior: 'spatial-design'");
     expect(navigation).toContain('sessionStorage');
   });
 

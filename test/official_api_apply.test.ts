@@ -30,6 +30,7 @@ describe('Lumi official API one-click adaptation', () => {
     { id: 'aliyun/qwen-image-edit-2509', capability: 'image_edit' },
     { id: 'aliyun/Wan2.2-T2V-A14B', capability: 'video_generation' },
     { id: 'aliyun/Wan2.2-I2V-A14B', capability: 'video_generation' },
+    { id: 'aliyun/wan3.0-video', capability: 'video_generation' },
     { id: 'aliyun/bge-m3', capability: 'embedding' },
     { id: 'aliyun/bge-reranker-v2-m3', capability: 'rerank' },
     { id: 'aliyun/qwen-audio-3.0-asr-flash-streaming', capability: 'speech_recognition' },
@@ -113,7 +114,7 @@ describe('Lumi official API one-click adaptation', () => {
       ok: true,
       provider: 'relay',
       verification: 'catalog_verified_and_configuration_persisted',
-      catalog: { modelCount: 11, roleCount: 11 },
+      catalog: { modelCount: 12, roleCount: 11 },
     });
     expect(body.applied.map((item: any) => item.role)).toEqual([...LUMI_OFFICIAL_SUPPORTED_ROLES]);
     expect(body.skipped.map((item: any) => item.role)).toEqual([...LUMI_OFFICIAL_UNSUPPORTED_ROLES]);
@@ -130,8 +131,8 @@ describe('Lumi official API one-click adaptation', () => {
       'aliyun/qwen3-vl-flash',
       'aliyun/qwen-image',
       'aliyun/qwen-image-edit-2509',
-      'aliyun/Wan2.2-T2V-A14B',
-      'aliyun/Wan2.2-I2V-A14B',
+      'aliyun/wan3.0-video',
+      'aliyun/wan3.0-video',
       'aliyun/bge-m3',
       'aliyun/bge-reranker-v2-m3',
       'aliyun/qwen-audio-3.0-asr-flash-streaming',
@@ -139,8 +140,8 @@ describe('Lumi official API one-click adaptation', () => {
     ]);
     expect(getUserPreferredGenerationModels(userId)).toMatchObject({
       imageEdit: { provider: 'relay', model: 'aliyun/qwen-image-edit-2509' },
-      video: { provider: 'relay', model: 'aliyun/Wan2.2-T2V-A14B' },
-      imageToVideo: { provider: 'relay', model: 'aliyun/Wan2.2-I2V-A14B' },
+      video: { provider: 'relay', model: 'aliyun/wan3.0-video' },
+      imageToVideo: { provider: 'relay', model: 'aliyun/wan3.0-video' },
     });
     expect(body.roles.vision.selectionReason).toBe('recommended_default');
     expect(body.roles.world.selectionReason).toBe('recommended_default');
@@ -153,7 +154,7 @@ describe('Lumi official API one-click adaptation', () => {
     expect(JSON.stringify(body)).not.toContain('sk-official-apply-test');
   });
 
-  it('preflights every role and writes nothing when the catalog is incomplete', async () => {
+  it('adapts available roles and explicitly preserves the unavailable role', async () => {
     const incompleteUserId = `${userId}-incomplete`;
     const incompleteToken = jwt.sign({ uid: incompleteUserId, username: 'incomplete-test', role: 'admin' }, JWT_SECRET);
     const before = getUserPreferredLLM(incompleteUserId);
@@ -164,15 +165,50 @@ describe('Lumi official API one-click adaptation', () => {
         headers: { Authorization: `Bearer ${incompleteToken}` },
         signal: AbortSignal.timeout(requestTimeoutMs),
       });
-      expect(response.status).toBe(409);
-      expect(await response.json()).toMatchObject({
-        code: 'OFFICIAL_API_CATALOG_INCOMPLETE',
-        error: expect.stringContaining('image_edit'),
-      });
-      expect(getUserPreferredLLM(incompleteUserId)).toEqual(before);
+      expect(response.status).toBe(200);
+      const result = await response.json();
+      expect(result).toMatchObject({ ok: true, status: 'partial', failed: [{ role: 'image_edit', reason: 'catalog_model_unavailable' }] });
+      expect(result.applied).toHaveLength(10);
+      expect(result.roles.image_edit).toMatchObject({ status: 'failed', reason: 'catalog_model_unavailable' });
+      expect(result.applied.some((row: any) => row.role === 'image_edit')).toBe(false);
+      expect(getUserPreferredGenerationModels(incompleteUserId).imageEdit).toEqual(getUserPreferredGenerationModels(`${incompleteUserId}-untouched`).imageEdit);
+      expect(getUserPreferredLLM(incompleteUserId).provider).toBe('relay');
     } finally {
       activeCatalogModels = completeCatalogModels;
     }
+  });
+
+  it('reports both missing video roles without undoing valid chat or image adaptation', async () => {
+    const videoUser = `${userId}-without-video`;
+    const videoToken = jwt.sign({ uid: videoUser, username: 'video-test', role: 'admin' }, JWT_SECRET);
+    const before = getUserPreferredGenerationModels(videoUser);
+    activeCatalogModels = completeCatalogModels.filter(model => model.capability !== 'video_generation');
+    try {
+      const response = await fetch(`${url}/api/preferences/official/apply`, { method: 'POST', headers: { Authorization: `Bearer ${videoToken}` }, signal: AbortSignal.timeout(requestTimeoutMs) });
+      expect(response.status).toBe(200);
+      const result = await response.json();
+      expect(result.status).toBe('partial');
+      expect(result.failed.map((row: any) => row.role)).toEqual(['video_generation', 'image_to_video']);
+      expect(result.applied).toHaveLength(9);
+      expect(result.applied.some((row: any) => /video/.test(row.role))).toBe(false);
+      expect(getUserPreferredGenerationModels(videoUser)).toMatchObject({ video: before.video, imageToVideo: before.imageToVideo });
+      expect(getUserPreferredLLM(videoUser).provider).toBe('relay');
+      expect(JSON.stringify(result)).not.toContain('sk-official-apply-test');
+    } finally { activeCatalogModels = completeCatalogModels; }
+  });
+
+  it('adapts a gateway exposing only the documented Wan3 prime video route to both video roles', async () => {
+    const primeUser = `${userId}-prime-only`;
+    const primeToken = jwt.sign({ uid: primeUser, username: 'prime-test', role: 'admin' }, JWT_SECRET);
+    activeCatalogModels = [...completeCatalogModels.filter(model => model.capability !== 'video_generation'), { id: 'aliyun/wan3.0-video-prime', capability: 'video_generation' }];
+    try {
+      const response = await fetch(`${url}/api/preferences/official/apply`, { method: 'POST', headers: { Authorization: `Bearer ${primeToken}` }, signal: AbortSignal.timeout(requestTimeoutMs) });
+      expect(response.status).toBe(200);
+      const result = await response.json();
+      expect(result).toMatchObject({ status: 'complete', failed: [] });
+      expect(result.roles.video_generation).toMatchObject({ status: 'applied', model: 'aliyun/wan3.0-video-prime' });
+      expect(result.roles.image_to_video).toMatchObject({ status: 'applied', model: 'aliyun/wan3.0-video-prime' });
+    } finally { activeCatalogModels = completeCatalogModels; }
   });
 
   it('persists only live-catalog speech models and exposes the effective ids', async () => {
@@ -342,7 +378,7 @@ describe('Lumi official API one-click adaptation', () => {
     const db = readDB();
     db.settings.push({ key, value: original });
     writeDB(db);
-    activeCatalogModels = completeCatalogModels.filter(model => model.capability !== 'image_edit');
+    activeCatalogModels = [];
     try {
       const response = await fetch(`${url}/api/preferences/official/apply`, {
         method: 'POST', headers: { Authorization: `Bearer ${legacyToken}` },

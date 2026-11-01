@@ -1,12 +1,13 @@
+import { cloneDatabaseValue } from '../db/snapshot_changes';
 /** Durable autonomous task queue for Lumi's unattended background work. */
 import { randomUUID } from 'crypto';
-import { flushDBOrThrow, readDB, writeDB } from '../../db_layer';
+import { flushDBOrThrow, readDatabaseTables, commitDatabaseTables } from '../../db_layer';
 import type { ToolExecutionRecord } from '../tools/types';
 import type { OrganizationMembershipAuthorization } from '../org/membership_authorization';
 import { isAutonomousTaskFinalizationPending, projectAutonomousTaskFinalization, resetAutonomousTaskFinalizationsForTests } from './task_finalization';
 export { setAutonomousTaskFinalizationPending } from './task_finalization';
 import { sanitizeDiagnosticValue } from '../client/diagnostic_sanitizer';
-import type { PersistedCapabilityExecutionPlan } from '../conversation/action_ledger';
+import type { PersistedCapabilityExecutionPlan } from "../conversation/ledger/contracts";
 import {
   diagnoseDurableTaskFailure,
   evaluateDurableResumeSafety,
@@ -191,7 +192,7 @@ function cloneTask(task: AutonomousTask): AutonomousTask {
   return {
     ...task,
     membershipAuthorization: task.membershipAuthorization ? { ...task.membershipAuthorization } : undefined,
-    actions: task.actions ? structuredClone(task.actions) : undefined,
+    actions: task.actions ? cloneDatabaseValue(task.actions) : undefined,
     checkpoint: task.checkpoint ? {
       ...task.checkpoint,
       receiptIds: [...(task.checkpoint.receiptIds || [])],
@@ -212,6 +213,16 @@ function cloneTask(task: AutonomousTask): AutonomousTask {
 
 function isTerminal(status: AutonomousTaskStatus): boolean {
   return status === 'completed' || status === 'failed' || status === 'blocked' || status === 'cancelled';
+}
+
+/** Preserve unresolved blockers while bounding ordinary terminal history. */
+function retainTaskHistory(tasks: readonly AutonomousTask[], at = Date.now()): AutonomousTask[] {
+  const ordered = tasks.filter(task => isTerminal(task.status))
+    .sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)));
+  const cutoff = at - TASK_TTL_DAYS * 86_400_000;
+  const recent = new Set(ordered.filter(task => task.status !== 'blocked'
+    && new Date(task.createdAt).getTime() > cutoff).slice(-MAX_HISTORY));
+  return ordered.filter(task => task.status === 'blocked' || recent.has(task));
 }
 
 function normalizeStoredTask(value: unknown): AutonomousTask | null {
@@ -312,9 +323,10 @@ export function recoverPersistedTask(task: AutonomousTask, recoveredAt = nowIso(
 
 function persist(): void {
   try {
-    const db = readDB();
-    db.autonomousTasks = [...queue, ...history.slice(-MAX_HISTORY)].map(cloneTask);
-    writeDB(db);
+    const db = readDatabaseTables(["autonomousTasks"]);
+    history = retainTaskHistory(history);
+    db.autonomousTasks = [...queue, ...history].map(cloneTask);
+    commitDatabaseTables(db);
   } catch {
     // Unit tests and early bootstrap can legitimately run before SQLite exists.
   }
@@ -322,9 +334,10 @@ function persist(): void {
 
 /** Admission/terminal lifecycle barriers may never use best-effort persistence. */
 export async function persistAutonomousTaskQueue(): Promise<void> {
-  const db = readDB();
-  db.autonomousTasks = [...queue, ...history.slice(-MAX_HISTORY)].map(cloneTask);
-  writeDB(db);
+  const db = readDatabaseTables(["autonomousTasks"]);
+  history = retainTaskHistory(history);
+  db.autonomousTasks = [...queue, ...history].map(cloneTask);
+  commitDatabaseTables(db);
   await flushDBOrThrow();
 }
 
@@ -413,7 +426,7 @@ export async function settleAutonomousTaskAction(id: string, leaseId: string, re
   if (action.name !== record.name) throw new Error('Autonomous terminal receipt action mismatch.');
   // Keep the bounded canonical receipt already redacted by the tool engine.
   // Oversized receipts remain unknown rather than silently losing replay data.
-  const stored = sanitizeDiagnosticValue(structuredClone(record));
+  const stored = sanitizeDiagnosticValue(cloneDatabaseValue(record));
   if (JSON.stringify(stored).length > 64_000) throw new Error('Autonomous terminal receipt exceeds its durable limit.');
   action.record = stored;
   action.state = 'settled';
@@ -427,7 +440,7 @@ export async function settleAutonomousTaskAction(id: string, leaseId: string, re
 }
 
 export function getAutonomousTaskPriorRecords(task: AutonomousTask): ToolExecutionRecord[] {
-  return (task.actions || []).flatMap(action => action.state === 'settled' && action.record ? [structuredClone(action.record)] : []);
+  return (task.actions || []).flatMap(action => action.state === 'settled' && action.record ? [cloneDatabaseValue(action.record)] : []);
 }
 
 export function hydrateAutonomousTasksFromDb(force = false): number {
@@ -435,7 +448,7 @@ export function hydrateAutonomousTasksFromDb(force = false): number {
   if (activeExecutors.size > 0) return 0;
   let db: any;
   try {
-    db = readDB();
+    db = readDatabaseTables(["autonomousTasks"]);
   } catch {
     return 0;
   }
@@ -443,13 +456,26 @@ export function hydrateAutonomousTasksFromDb(force = false): number {
   const stored = (Array.isArray(db.autonomousTasks) ? db.autonomousTasks : [])
     .map(normalizeStoredTask)
     .filter((task): task is AutonomousTask => Boolean(task));
+  // Older plan dispatchers wrote their plan key into the conversation field.
+  // Only a matching owner-scoped stateless plan can retire that exact sentinel;
+  // explicit, deleted, foreign, and unrelated anchors retain normal validation.
+  const legacyPlanTasks = stored.filter(task => task.planId
+    && task.conversationId === `command-center-plan:${task.planId}`
+    && task.idempotencyKey?.startsWith(`command-center-plan:${task.planId}:`));
+  const legacyPlans = legacyPlanTasks.length
+    ? readDatabaseTables(["commandCenterPlans"]).commandCenterPlans || [] : [];
   let recoveredCount = 0;
   const recovered = stored.map(task => {
     const next = recoverPersistedTask(task, recoveredAt);
-    if (next.status !== task.status || next.recoveryCount !== task.recoveryCount) recoveredCount += 1;
+    if (legacyPlanTasks.includes(task) && legacyPlans.some(plan => plan.id === task.planId
+      && plan.userId === task.userId && !plan.conversationId
+      && autonomousTaskMatchesScope(task, plan))) {
+      next.conversationId = undefined;
+    }
+    if (next.status !== task.status || next.recoveryCount !== task.recoveryCount
+      || next.conversationId !== task.conversationId) recoveredCount += 1;
     return next;
   });
-  const cutoff = Date.now() - TASK_TTL_DAYS * 86_400_000;
   const currentById = new Map([...queue, ...history].map(task => [task.id, task]));
   for (const task of recovered) {
     const current = currentById.get(task.id);
@@ -458,10 +484,7 @@ export function hydrateAutonomousTasksFromDb(force = false): number {
   }
   const all = Array.from(currentById.values());
   queue = all.filter(task => task.status === 'pending' || task.status === 'running' || task.status === 'pausing' || task.status === 'paused');
-  history = all
-    .filter(task => isTerminal(task.status) && new Date(task.createdAt).getTime() > cutoff)
-    .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
-    .slice(-MAX_HISTORY);
+  history = retainTaskHistory(all);
   cancellationRequests.clear();
   for (const task of queue) if (task.cancelRequestedAt) cancellationRequests.add(task.id);
   hydrated = true;
@@ -633,33 +656,6 @@ export function markCompleted(
     evidenceRefs: [...verification.terminalReceipt!.evidenceRefs],
     toolNames: [...verification.terminalReceipt!.toolNames],
   };
-  clearLease(task);
-  moveToHistory(task);
-  persist();
-  return cloneTask(task);
-}
-
-export function markFailed(id: string, error: string, leaseId?: string): AutonomousTask | null {
-  ensureHydrated();
-  const task = findTask(id);
-  if (!task) return null;
-  if (!hasLiveLease(task, leaseId)) return null;
-  if (isTaskCancellationRequested(id)) return markCancelled(id, error);
-  if (task.pauseRequestedAt) return markPaused(id);
-  const timestamp = nowIso();
-  task.status = 'failed';
-  task.completedAt = timestamp;
-  task.updatedAt = timestamp;
-  task.error = error;
-  task.terminalReceipt = buildTaskTerminalReceipt({
-    taskId: task.id,
-    runtime: 'autonomous',
-    outcome: 'failed',
-    reasonCode: 'autonomous_execution_failed',
-    reason: error,
-    evidenceRefs: task.checkpoint?.receiptIds,
-    createdAt: timestamp,
-  });
   clearLease(task);
   moveToHistory(task);
   persist();
@@ -883,8 +879,7 @@ function findTask(id: string, userId?: string): AutonomousTask | null {
 function moveToHistory(task: AutonomousTask): void {
   queue = queue.filter(item => item.id !== task.id);
   cancellationRequests.delete(task.id);
-  history.push(task);
-  if (history.length > MAX_HISTORY) history = history.slice(-MAX_HISTORY);
+  history = retainTaskHistory([...history, task]);
 }
 
 export function resetAutonomousTaskQueueForTest(options: { clearPersisted?: boolean; markHydrated?: boolean } = {}): void {
@@ -896,4 +891,9 @@ export function resetAutonomousTaskQueueForTest(options: { clearPersisted?: bool
   resetAutonomousTaskFinalizationsForTests();
   hydrated = options.markHydrated === true;
   if (options.clearPersisted) persist();
+}
+
+/** Diagnostics read only persisted owned rows and do not trigger queue recovery. */
+export function listPersistedAutonomousTasks(userId: string): AutonomousTask[] {
+  return userId ? cloneDatabaseValue((readDatabaseTables(["autonomousTasks"]).autonomousTasks || []).filter(task => task.userId === userId)) : [];
 }

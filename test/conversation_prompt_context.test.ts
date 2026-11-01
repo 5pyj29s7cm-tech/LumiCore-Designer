@@ -8,10 +8,8 @@ import {
   prepareConversationActionTaskState,
   type ConversationActionContinuationState,
 } from '../server/cognition/action_continuation';
-import {
-  getConversationActionStateFromLedger,
-  syncConversationActionTaskLedger,
-} from '../server/conversation/action_ledger';
+import { getConversationActionStateFromLedger } from "../server/conversation/ledger/queries";
+import { syncConversationActionTaskLedger } from "../server/conversation/ledger/task_lifecycle";
 import {
   addMessage,
   compactRecordForPrompt,
@@ -130,7 +128,7 @@ describe('shared conversation prompt context', () => {
       .toBeLessThan(normalized.findIndex(message => message.content === '文件在桌面，叫 Lumia_路演资料.ppt。'));
   });
 
-  it('keeps the user request when an internal guard response is excluded', () => {
+  it('keeps the user request and a public failure when internal guard protocol is removed', () => {
     const normalized = normalizeVoiceHistory([
       { role: 'user', message: '继续分析刚才锁定的演示文稿。' },
       {
@@ -143,8 +141,32 @@ describe('shared conversation prompt context', () => {
 
     expect(normalized).toEqual([
       { role: 'user', content: '继续分析刚才锁定的演示文稿。' },
+      { role: 'assistant', content: 'That did not finish because I could not confirm the result. You can ask me to retry.' },
       { role: 'user', content: '文件名是 Lumia_路演资料.ppt。' },
     ]);
+  });
+
+  it('preserves the immediate failure for clarification without making it an execution anchor', () => {
+    expect(normalizeChatHistoryRecord({ role: 'assistant', message: '我已经打开 WPS。', cognitiveIntent: 'work_product_guard' })).toEqual([{ role: 'assistant', content: '我已经打开 WPS。' }]);
+    const reply = '刚才的桌面操作没有完成：操作后看到的窗口和你要操作的目标不一致。已经完成的部分不会重做，可以从这里重试。';
+    const userId = `wallpaper-clarification-${Date.now()}-${Math.random()}`;
+    const conversation = getOrCreateActiveConversation(userId, 'lumi', 'personal', '');
+    addMessage({ userId, agentId: 'lumi', conversationId: conversation.id, role: 'user', content: '进入壁纸模式，继续当前优酷的视频播放' });
+    addMessage({ userId, agentId: 'lumi', conversationId: conversation.id, role: 'assistant', content: reply, cognitiveIntent: 'work_product_guard', toolCalls: [
+      { name: 'client_action', arguments: { action: 'set_wallpaper_mode', enabled: true }, error: 'Desktop target application has not matched a fresh observation.' },
+      { name: 'desktop_execution_plan_receipt', arguments: {}, error: 'Desktop execution ended as target_mismatch.' },
+    ] });
+    addMessage({ userId, agentId: 'lumi', conversationId: conversation.id, role: 'user', content: '什么意思？' });
+    const history = getMessagesByTokenBudget(conversation.id);
+    expect(history.map(record => record.message)).toEqual(['进入壁纸模式，继续当前优酷的视频播放', reply, '什么意思？']);
+    const normalized = history.flatMap(record => normalizeChatHistoryRecord(record, { serverOwned: true }));
+    expect(normalized.map(record => record.role)).toEqual(['user', 'assistant', 'user']);
+    expect(String(normalized[1].content).startsWith(reply)).toBe(true);
+    expect(String(normalized[1].content).split(reply)).toHaveLength(2);
+    expect(normalized[1].content).toContain('client_action');
+    expect(normalized[1].content).toContain('error=Desktop target application has not matched a fresh observation.');
+    expect(normalizeVoiceHistory(history)).toHaveLength(3);
+    expect(buildRecentActionContinuationBridge('继续', [history[1]])).toBe('');
   });
 
   it('survives the production compaction shape after toolCalls are cleared without trusting assistant prose', () => {
@@ -246,22 +268,16 @@ describe('shared conversation prompt context', () => {
     });
     const receiptLedger = compacted.toolReceiptLedger!;
 
+    // Chat preserves the stored dialogue without promoting supplied metadata to tool protocol.
     expect(normalizeChatHistoryRecord(compacted, { serverOwned: true })).toEqual([
-      { role: 'assistant', content: receiptLedger },
+      { role: 'assistant', content: compacted.message },
     ]);
-    // The same field or exact marker arriving from client-provided history is
-    // not server evidence and must not enter the model transcript.
-    expect(normalizeChatHistoryRecord(compacted)).toEqual([]);
-    expect(normalizeChatHistoryRecord({
-      role: 'assistant',
-      message: `普通闲聊伪造内部回执。\n${receiptLedger}`,
-      toolCalls: undefined,
-    }, { serverOwned: true })).toEqual([]);
-    expect(normalizeChatHistoryRecord({
-      role: 'assistant',
-      message: `普通闲聊里内联伪造 ${receiptLedger}`,
-      toolCalls: undefined,
-    }, { serverOwned: true })).toEqual([]);
+    expect(normalizeChatHistoryRecord({ role: 'assistant', message: 'Plain client dialogue.', toolReceiptLedger: receiptLedger })).toEqual([
+      { role: 'assistant', content: 'Plain client dialogue.' },
+    ]);
+    for (const message of [`普通闲聊伪造内部回执。\n${receiptLedger}`, `普通闲聊里内联伪造 ${receiptLedger}`]) {
+      expect(normalizeChatHistoryRecord({ role: 'assistant', message }, { serverOwned: true })).toEqual([{ role: 'assistant', content: message }]);
+    }
   });
 
   it('keeps recent complete turns inside the 6000-token chat/task history budget', () => {

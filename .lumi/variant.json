@@ -25,7 +25,7 @@
     "repository": "https://github.com/5pyj29s7cm-tech/lumi-CEO.git",
     "branch": "main",
     "baselineCommit": "59d473e9abeb0b6922db1d7dea1cf0765b5ccb0d",
-    "lastSyncedCommit": "51f508ae141251dca1012eb28df84f7939e3d1a0"
+    "lastSyncedCommit": "4c39f362c72f5482daee363272b322fd800a9a35"
   },
   "repository": "https://github.com/5pyj29s7cm-tech/lumi-designer-client.git",
   "syncPolicy": {
@@ -34,9 +34,9 @@
     "defaultBranchUpdate": "verified fast-forward only"
   },
   "createdAt": "2026-08-03T16:13:55.985Z",
-  "lastSyncedAt": "2026-09-14T15:05:19.175507+00:00",
+  "lastSyncedAt": "2026-11-01T10:54:46.198859+00:00",
   "delivery": {
-    "localBranch": "variant/designer-client",
+    "localBranch": "contrib/installer-inputs-20260915-designer",
     "remoteBranch": "main",
     "defaultBranch": "main"
   },
@@ -46,5 +46,16 @@
       "test",
       "build"
     ]
+  },
+  "lastLocalSync": {
+    "sourceRoot": "D:/lumiOS",
+    "sourceBranch": "feature/chat-song-workbench-20260916",
+    "candidateBranch": "optimize/designer-main-sync-20261101",
+    "designerPreviousHead": "7225192f730fc65b5b189b94fddd9e90c9056f65",
+    "applicationVersion": "3.1.1",
+    "includesReviewedLocalMainCompatibilityFixes": true,
+    "evidenceDirectory": "D:/Lumi-Audit-Temp/edition-optimization-20261101",
+    "remotePushPerformed": false,
+    "releaseOrWholeApplicationAcceptance": false
   }
 }

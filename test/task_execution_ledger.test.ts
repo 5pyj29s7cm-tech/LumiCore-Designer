@@ -1,3 +1,4 @@
+import { buildConfirmedStepContinuationMessages } from '../server/llm/tool_loop/recovery';
 import { describe, expect, it } from 'vitest';
 import {
   buildConversationActionContinuationState,
@@ -8,7 +9,8 @@ import {
 import {
   applyTaskPolicySnapshot,
   coalesceToolExecutionRecords,
-  confirmedStepNeedsContinuation,
+  mergeToolExecutionRecords,
+  mergeTaskReceipts,
   normalizeConversationTaskReceipt,
   recordsToTaskReceipts,
   taskCompletionFromReceipts,
@@ -16,6 +18,9 @@ import {
   toolRecordSucceeded,
 } from '../server/cognition/task_execution_ledger';
 import { toolRecordIdempotencyKey } from '../server/tools/execution_envelope';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const CUSTOMER_INTERNAL_EXECUTION_COPY = /(?:\u6b63\u5728\u505a\u4ec0\u4e48|\u5f53\u524d\u76ee\u6807|\u5df2\u5b8c\u6210\u4ec0\u4e48|\u5361\u5728\u54ea\u91cc|\u662f\u5426\u9700\u8981\u4f60\u64cd\u4f5c|\u4e0b\u4e00\u6b65|\u72b6\u6001|\u8bc1\u636e|\u5177\u4f53\u963b\u585e|\u6267\u884c\u56de\u9988)\s*[:\uff1a]|\u56de\u6267|target_mismatch|terminalVerification|\b(?:taskId|requestId|desktop_open|client_action|desktop_execution_plan_receipt|verified|blocked|failed)\b|No successful current-turn tool execution/iu;
 
@@ -74,14 +79,18 @@ describe('durable conversation task execution ledger', () => {
   });
 
   it('does not treat an intentionally unopened generated artifact as a failed operation', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi-ledger-cad-'));
+    const output = path.join(dir, 'plan.dxf'), preview = path.join(dir, 'plan.svg');
+    fs.writeFileSync(output, 'non-empty synthetic DXF'); fs.writeFileSync(preview, '<svg/>');
+    try {
     expect(toolRecordSucceeded({
       name: 'cad_generate_dxf',
       arguments: {},
       result: JSON.stringify({
         ok: true,
         status: 'verified',
-        path: 'C:\\Lumi\\plan.dxf',
-        previewPath: 'C:\\Lumi\\plan.svg',
+        path: output,
+        previewPath: preview,
         exists: true,
         size: 128,
         previewExists: true,
@@ -89,12 +98,14 @@ describe('durable conversation task execution ledger', () => {
         opened: false,
       }),
       terminalVerification: { status: 'verified', strategy: 'artifact', reason: 'files exist' },
+      capability: { capabilityId: 'cad.dxf.generate', lane: 'cad', operation: 'create', risk: 'medium', sideEffects: [], verification: { strategy: 'artifact', required: true, requiredFields: ['path', 'previewPath'], requiredArtifacts: ['path', 'previewPath'], successSignals: [], limitations: [] } },
     })).toBe(true);
     expect(toolRecordSucceeded({
       name: 'desktop_open',
       arguments: { target: 'C:\\Lumi\\plan.dxf' },
       result: JSON.stringify({ ok: true, status: 'verified', opened: false }),
     })).toBe(false);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('keeps verified WPS document creation successful when the document is intentionally unsaved', () => {
@@ -130,6 +141,58 @@ describe('durable conversation task execution ledger', () => {
     expect(records.filter(record => record.name === 'desktop_keyboard_press')).toHaveLength(1);
     expect(records.find(record => record.name === 'desktop_keyboard_press')?.error).toBeUndefined();
     expect(records.filter(record => record.name === 'desktop_ui_snapshot')).toHaveLength(2);
+  });
+
+  it('deduplicates repeated call delivery without losing distinct observations or other request owners', () => {
+    const first = { id: 'call-1', name: 'read_file', arguments: { path: 'fixture.txt' }, result: 'value', taskId: 'task-1', requestId: 'request-1' };
+    const second = { ...first, id: 'call-2' };
+    const foreign = { ...first, requestId: 'request-2' };
+    expect(mergeToolExecutionRecords([first], [{ ...first }, second, foreign])).toEqual([first, second, foreign]);
+    const snapshot = { ...first, name: 'desktop_execution_plan_receipt' };
+    const updated = { ...snapshot, result: 'new observations' };
+    expect(mergeToolExecutionRecords([snapshot], [updated])).toEqual([updated]);
+    const { id: _id, ...anonymous } = first;
+    expect(mergeToolExecutionRecords([anonymous], [{ ...anonymous }, { ...anonymous, arguments: { path: 'other.txt' } }])).toHaveLength(2);
+  });
+
+
+  it('keeps distinct call failures after an earlier success with the same arguments', () => {
+    const first = { id: 'call-before', taskId: 'task', requestId: 'request', name: 'write_file', arguments: { path: 'D:/isolated/output.txt', content: 'Approved' }, result: 'saved' };
+    const failed = { ...first, id: 'call-after', result: '', error: 'Disk full.' };
+    expect(coalesceToolExecutionRecords([first, failed])).toEqual([first, failed]);
+    expect(mergeTaskReceipts(recordsToTaskReceipts([first]), [failed]).map(record => record.outcome)).toEqual(['success', 'failure']);
+  });
+
+  it('keeps the current request failure separate from an older call with the same arguments', () => {
+    const first = { id: 'same-call-id', taskId: 'task', requestId: 'request-before', name: 'write_file', arguments: { path: 'D:/isolated/output.txt', content: 'Approved' }, result: 'saved' };
+    const failed = { ...first, requestId: 'request-after', result: '', error: 'Access denied.' };
+    expect(coalesceToolExecutionRecords([first, failed])).toEqual([first, failed]);
+    const persisted = mergeTaskReceipts(recordsToTaskReceipts([first]), [failed]);
+    expect(persisted).toHaveLength(2);
+    expect(persisted[1]).toMatchObject({ requestId: 'request-after', outcome: 'failure', error: 'Access denied.' });
+  });
+
+  it('does not complete an unclassified goal from an unrelated successful receipt', () => {
+    const receipts = recordsToTaskReceipts([{ name: 'read_file', arguments: { path: 'D:/isolated/source.txt' }, result: 'Source text.' }]);
+    expect(taskCompletionFromReceipts('perform the requested custom operation', receipts)).toMatchObject({ complete: false, blocker: 'The task has no verified completion receipt.' });
+  });
+
+  it('does not complete legal drafting from a successful source read', () => {
+    const receipts = recordsToTaskReceipts([{ name: 'read_file', arguments: { path: 'D:/isolated/evidence.txt' }, result: 'Unverified source material.' }]);
+    expect(taskCompletionFromReceipts('Generate a legal complaint.', receipts).complete).toBe(false);
+  });
+
+
+  it('does not let the retired WPS adapter bypass the original mutation goal', () => {
+    const receipts = recordsToTaskReceipts([{ name: 'wps_create_document', arguments: {}, result: 'Document created.' }]);
+    expect(taskCompletionFromReceipts('打开 WPS 并写入会议安排，然后保存文档', receipts).complete).toBe(false);
+  });
+
+  it('uses the existing legal production and review evidence together', () => {
+    const record = { name: 'legal_generate_litigation_packet', arguments: {}, result: 'currentLawGate: pending; major premise; minor premise; conclusion' };
+    expect(taskCompletionFromReceipts('Generate a legal complaint.', recordsToTaskReceipts([record])).complete).toBe(false);
+    const reviewed = { ...record, name: 'legal_finalize_delivery_package', result: '{"currentLawGate":"passed","reasoning":"major premise; minor premise; conclusion"}', receipt: { ok: true, status: 'generated' } };
+    expect(taskCompletionFromReceipts('Generate a legal complaint.', recordsToTaskReceipts([reviewed])).complete).toBe(true);
   });
 
   it('creates state before tools run and preserves task identity and capability envelope on confirmation', () => {
@@ -421,22 +484,14 @@ describe('durable conversation task execution ledger', () => {
       }),
     };
 
-    expect(confirmedStepNeedsContinuation(
-      'Open WPS and create a Word document',
-      [confirmedOpen],
-    )).toBe(true);
-    expect(confirmedStepNeedsContinuation(
-      'Open WPS',
-      [confirmedOpen],
-    )).toBe(true);
-    expect(confirmedStepNeedsContinuation(
-      'Open WPS and create a Word document',
-      [{ ...confirmedOpen, result: '', error: 'permission denied' }],
-    )).toBe(true);
-    expect(confirmedStepNeedsContinuation(
-      'Open WPS',
-      [],
-    )).toBe(false);
+    for (const goal of ['Open WPS and create a Word document', 'Open WPS']) {
+      for (const record of [confirmedOpen, { ...confirmedOpen, result: '', error: 'permission denied' }]) {
+        const messages = buildConfirmedStepContinuationMessages(goal, record);
+        expect(messages[0]).toMatchObject({ role: 'user', content: goal });
+        expect(messages).toContainEqual(expect.objectContaining({ role: 'tool', name: 'desktop_open' }));
+        expect(messages.at(-1)?.content).toContain('confirmation has already been consumed');
+      }
+    }
   });
 
   it('keeps the substantive workflow failure ahead of a later permission drift', () => {
@@ -608,7 +663,7 @@ describe('durable conversation task execution ledger', () => {
     expect(toolRecordSucceeded(record)).toBe(true);
     const receipts = recordsToTaskReceipts([record]);
     expect(receipts[0].outcome).toBe('success');
-    expect(receipts[0].result.length).toBeLessThan(record.result.length);
+    expect(receipts[0].result).toBe(record.result);
     expect(toolRecordSucceeded(taskReceiptsToRecords(receipts)[0])).toBe(true);
   });
 });

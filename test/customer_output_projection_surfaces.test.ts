@@ -1,3 +1,4 @@
+import { readImplementationSource } from './implementation_source';
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -7,26 +8,21 @@ import {
   sanitizeAgentStreamingTextForDisplay,
 } from '../src/lib/agentResponseDelivery';
 import { containsInternalExecutionLanguage } from '../shared/public_execution_language';
+import { normalizeChatHistoryRecord } from '../server/socket/chat/history';
+import { normalizeVoiceHistoryRecord } from '../server/socket/voice_history';
 
 const root = process.cwd();
-const source = (relativePath: string) => fs.readFileSync(path.join(root, relativePath), 'utf8');
+const source = (relativePath: string) => readImplementationSource(path.join(root, relativePath), 'utf8');
 const code = (relativePath: string) => ts.createPrinter({ removeComments: true }).printFile(
   ts.createSourceFile(relativePath, source(relativePath), ts.ScriptTarget.Latest, true,
     relativePath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS),
 );
 
 describe('customer-facing assistant output projection', () => {
-  it('keeps ordinary Markdown intact and replaces runtime diagnostics', () => {
-    const markdown = '### Result\n\n- **Ready**\n- [Open](https://example.com)';
-    expect(sanitizeAgentResponseTextForDisplay(markdown, 'en')).toBe(markdown);
-
-    const projected = sanitizeAgentResponseTextForDisplay([
-      'Status: failed.',
-      'Evidence: Desktop execution ended as target_mismatch.',
-      'Concrete blocker: Desktop target application has not matched a fresh observation.',
-    ].join('\n'), 'en');
-    expect(projected).toContain('window no longer matched the target');
-    expect(projected).not.toMatch(/Status:|Evidence:|Concrete blocker:|target_mismatch|Desktop execution/i);
+  it('preserves ordinary Markdown and literal diagnostic commentary', () => {
+    for (const text of ['### Result\n\n- **Ready**\n- [Open](https://example.com)', 'Status: failed.\nEvidence: Desktop execution ended as target_mismatch.\nConcrete blocker: Desktop target application has not matched a fresh observation.']) {
+      expect(sanitizeAgentResponseTextForDisplay(text, 'en')).toBe(text);
+    }
   });
 
   it('does not mistake technical identifiers or desktop tool names for leaked status reports', () => {
@@ -52,7 +48,7 @@ describe('customer-facing assistant output projection', () => {
     expect(sanitizeAgentResponseTextForDisplay(codeExample, 'en')).toBe(codeExample);
   });
 
-  it('still projects explicit recovery codes and structured failure reports', () => {
+  it('recognizes recovery codes without rewriting supplied prose', () => {
     for (const diagnostic of [
       'Desktop execution ended as target_mismatch.',
       'Internal execution recovery: execution_recovery_incomplete.',
@@ -60,24 +56,39 @@ describe('customer-facing assistant output projection', () => {
     ]) {
       expect(containsInternalExecutionLanguage(diagnostic), diagnostic).toBe(true);
       const projected = sanitizeAgentResponseTextForDisplay(diagnostic, 'zh');
-      expect(projected).not.toBe(diagnostic);
-      expect(projected).not.toMatch(/target_mismatch|execution_recovery_incomplete|状态：|证据：|具体阻塞：/u);
+      expect(projected).toBe(diagnostic);
     }
   });
 
-  it('buffers a short stream prefix and never flashes an internal report heading', () => {
+  it('buffers short stream prefixes while preserving complete ordinary status prose', () => {
     expect(sanitizeAgentStreamingTextForDisplay('状态：', 'zh')).toBe('');
     expect(sanitizeAgentStreamingTextForDisplay('Status:', 'en')).toBe('');
     expect(sanitizeAgentStreamingTextForDisplay('这是一条正常但还很短的回复', 'zh')).toBe('');
     expect(sanitizeAgentStreamingTextForDisplay('这是一条已经足够长、可以安全显示给用户阅读的普通流式回复。', 'zh'))
       .toContain('可以安全显示');
     expect(sanitizeAgentStreamingTextForDisplay('状态：受阻。\n证据：暂时没有可核验的执行结果。', 'zh'))
-      .not.toMatch(/状态|证据|回执/u);
+      .toBe('状态：受阻。\n证据：暂时没有可核验的执行结果。');
+  });
+
+
+
+  it('hides tool markup after prose in final, history, voice, and every stream prefix', () => {
+    const prose = '我先把客户端当前状态拉出来看一眼，按真实界面给你讲，不凭印象说。\n\n';
+    for (const protocol of ['<client_get_state>\n</client_get_state>', '&lt;client_get_state&gt;&lt;/client_get_state&gt;']) {
+      const leaked = prose + protocol;
+      expect(containsInternalExecutionLanguage(leaked)).toBe(true);
+      const projected = sanitizeAgentResponseTextForDisplay(leaked, 'zh');
+      expect(projected).not.toMatch(/client_get_state|&lt;|<\//u);
+      expect(normalizeChatHistoryRecord({ role: 'assistant', message: leaked })).toEqual([{ role: 'assistant', content: leaked }]);
+      expect(JSON.stringify(normalizeVoiceHistoryRecord({ role: 'assistant', message: leaked }))).not.toContain('client_get_state');
+      for (let i = 1; i <= leaked.length; i += 1) {
+        expect(sanitizeAgentStreamingTextForDisplay(leaked.slice(0, i), 'zh')).not.toMatch(/client_get|<client|&lt;client/u);
+      }
+    }
   });
 
   it('applies the shared sanitizer at every secondary assistant surface', () => {
     const surfaces = [
-      'src/components/ChatPanel.tsx',
       'src/hooks/useMemoryAvatarConversation.ts',
       'src/components/org/CentralLumiChat.tsx',
       'src/hooks/useVoiceCall.ts',
@@ -87,15 +98,11 @@ describe('customer-facing assistant output projection', () => {
     for (const relativePath of surfaces) {
       expect(source(relativePath), relativePath).toContain('sanitizeAgentResponseTextForDisplay');
     }
-
-    expect(source('src/components/ChatPanel.tsx')).toMatch(
-      /onMessages[\s\S]*sanitizeAgentResponseTextForDisplay[\s\S]*onResponse[\s\S]*sanitizeAgentResponseTextForDisplay[\s\S]*onProgress[\s\S]*sanitizeAgentResponseTextForDisplay/,
-    );
-    expect(source('src/components/ChatPanel.tsx')).toContain(
-      "const streamingPublicText = sanitizeAgentStreamingTextForDisplay(streamingText, isZh ? 'zh' : 'en')",
+    expect(source('src/components/agent_chat/chat_stream_receivers.ts')).toMatch(
+      /onChunk[\s\S]*streamingRawTextRef[\s\S]*sanitizeAgentStreamingTextForDisplay\(rawText/,
     );
     expect(source('src/components/AgentChatPage.tsx')).toMatch(
-      /onChunk[\s\S]*streamingRawTextRef[\s\S]*sanitizeAgentStreamingTextForDisplay\(rawText[\s\S]*onError[\s\S]*sanitizeAgentResponseTextForDisplay/,
+      /onError[\s\S]*sanitizeAgentResponseTextForDisplay/,
     );
     const territoryConversation = code('src/hooks/useMemoryAvatarConversation.ts');
     expect(territoryConversation).toMatch(

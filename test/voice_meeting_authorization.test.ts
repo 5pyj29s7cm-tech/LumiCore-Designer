@@ -1,15 +1,26 @@
+import { readImplementationSource } from './implementation_source';
+import { extractSourceExpression } from './source_expression';
 // Real voice/meeting handlers with isolated models, PCM and DesktopUI callbacks.
 import './helpers';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
-import * as ts from 'typescript';
 
 const mocks = vi.hoisted(() => ({
-  stream: vi.fn(), model: vi.fn(), transcribe: vi.fn(), learning: vi.fn(),
-  summaries: vi.fn(), flushGate: vi.fn(), stt: [] as any[],
+  errors: [] as string[], tools: vi.fn(), stream: vi.fn(), model: vi.fn(), transcribe: vi.fn(), learning: vi.fn(),
+  summaries: vi.fn(), convergence: vi.fn(), flushGate: vi.fn(), receiptGate: vi.fn(), stt: [] as any[],
 }));
+vi.mock('../db_layer', async original => {
+  const actual = await original<typeof import('../db_layer')>();
+  return { ...actual, runSQL: async (...args: Parameters<typeof actual.runSQL>) => {
+    const result = await actual.runSQL(...args);
+    if (args[0].includes('INSERT INTO chat_execution_terminal_receipts') && args[1]?.[6] === 'completed')
+      await mocks.receiptGate();
+    return result;
+  } };
+});
+vi.mock('../logger', () => ({ logger: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: (...args: any[]) => { mocks.errors.push(args.map(String).join(' ')); } } }));
 vi.mock('../server/stt/adapter', async original => ({
   ...await original<typeof import('../server/stt/adapter')>(),
   getActiveStreamingSTTProvider: () => 'ark',
@@ -17,6 +28,7 @@ vi.mock('../server/stt/adapter', async original => ({
     let result: (input: any) => any;
     const session = {
       end: vi.fn(), sendAudio: vi.fn(), updateEndpointing: vi.fn(), onError: vi.fn(),
+      onReady: (callback: () => void) => callback(),
       onResult: (handler: any) => { result = handler; },
       final: (text: string) => result({ text, isFinal: true }),
     };
@@ -30,7 +42,14 @@ vi.mock('../server/socket/chat_terminal_boundary', async original => {
     await input.flush(); await mocks.flushGate();
   } }) };
 });
-vi.mock('../server/stt/file_transcription', () => ({ transcribeAudioFile: (...args: any[]) => mocks.transcribe(...args) }));
+vi.mock('../server/conversation/manager', async original => {
+  const actual = await original<typeof import('../server/conversation/manager')>();
+  return { ...actual, convergeForegroundRequestBeforeRelease: (...args: Parameters<typeof actual.convergeForegroundRequestBeforeRelease>) => {
+    mocks.convergence(...args);
+    return actual.convergeForegroundRequestBeforeRelease(...args);
+  } };
+});
+vi.mock('../server/stt/file_transcription', async original => ({ ...await original<typeof import('../server/stt/file_transcription')>(), transcribeAudioFile: (...args: any[]) => mocks.transcribe(...args) }));
 vi.mock('../server/tts/adapter', async original => ({
   ...await original<typeof import('../server/tts/adapter')>(),
   getActiveProvider: () => null,
@@ -43,7 +62,7 @@ vi.mock('../server/llm/providers', async original => ({
 }));
 vi.mock('../server/llm/adapter', async original => ({
   ...await original<typeof import('../server/llm/adapter')>(),
-  runWithTools: vi.fn(() => { throw new Error('Unexpected tool execution in voice audit'); }),
+  runWithTools: (...args: any[]) => mocks.tools(...args),
 }));
 vi.mock('../server/llm/embedding_provider', async original => ({
   ...await original<typeof import('../server/llm/embedding_provider')>(),
@@ -70,11 +89,13 @@ vi.mock('../server/cognition/post_turn_learning', async original => {
   } };
 });
 
-import { initDatabase, readDB, flushDBOrThrow } from '../db_layer';
+import { initDatabase, readDB, flushDBOrThrow, querySQL } from '../db_layer';
 import { registerVoiceHandlers } from '../server/socket/voice';
+import { toolRegistry } from '../server/tools/registry';
+import { registerAllTools } from '../server/tools/definitions';
 import { createOrg, addMember, removeMember, getMember, updateMemberRole } from '../server/org/db';
 import { addMessage, getMessages, getOrCreateActiveConversation } from '../server/conversation/manager';
-import { waitForChatExecutionPersistence } from '../server/socket/chat_execution_registry';
+import { getChatExecution, waitForChatExecutionPersistence } from '../server/socket/chat_execution_registry';
 
 const ORG_MARKER = 'SYNTHETIC_ORG_PLAN_ALPHA';
 const USER_TEXT = '我希望你以后回答自然顺畅，请解释我们之前记录的项目安排。';
@@ -114,10 +135,14 @@ function fixture(organization = false) {
   return { socket, userId, org };
 }
 const start = (sessionId: string, transcriptionOnly = false) => ({ sessionId, captureSessionId: sessionId, audioInputKind: 'physical_microphone', transcriptionOnly });
-beforeAll(async () => { await initDatabase(); });
+beforeAll(async () => { await initDatabase(); registerAllTools(toolRegistry); });
 beforeEach(() => {
+  mocks.errors.length = 0;
+  mocks.tools.mockReset().mockImplementation(() => { throw new Error('Unexpected tool execution in voice audit'); });
   mocks.stream.mockReset(); mocks.model.mockReset(); mocks.transcribe.mockReset();
-  mocks.learning.mockClear(); mocks.summaries.mockClear(); mocks.flushGate.mockReset().mockResolvedValue(undefined); mocks.stt.length = 0;
+  mocks.learning.mockClear(); mocks.summaries.mockClear(); mocks.flushGate.mockReset().mockResolvedValue(undefined);
+  mocks.receiptGate.mockReset().mockResolvedValue(undefined);
+  mocks.convergence.mockReset(); mocks.stt.length = 0;
   mocks.model.mockResolvedValue({ text: JSON.stringify({ correctsIdentity: false }), toolCalls: [], usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } });
 });
 afterEach(async () => {
@@ -130,26 +155,15 @@ afterEach(async () => {
 
 // Extract and execute the exact callbacks from the currently mounted DesktopUI.
 // React rendering and the OS media devices are intentionally not simulated here.
-const desktopSource = fs.readFileSync(new URL('../src/components/DesktopUI.tsx', import.meta.url), 'utf8');
-const desktopAst = ts.createSourceFile('DesktopUI.tsx', desktopSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-function realDesktopCallback(name: string, context: Record<string, any>): any {
-  let callback: ts.Expression | undefined;
-  const visit = (node: ts.Node) => {
-    if (ts.isVariableDeclaration(node) && node.name.getText(desktopAst) === name && node.initializer && ts.isCallExpression(node.initializer)) callback = node.initializer.arguments[0];
-    ts.forEachChild(node, visit);
-  };
-  visit(desktopAst);
-  if (!callback || !ts.isArrowFunction(callback)) throw new Error(`Missing actual DesktopUI callback ${name}`);
-  const code = ts.transpileModule(`return (${callback.getText(desktopAst)});`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-  return new Function(...Object.keys(context), code)(...Object.values(context));
-}
+const realDesktopCallback = extractSourceExpression.bind(null, 'src/components/DesktopUI.tsx');
 function meetingUi(socket: FixtureSocket) {
   const state = { notes: [] as any[], persisted: [] as any[], report: '', startedAt: 1000, paused: false };
   const writes = new Map<string, string>();
   const events = new EventTarget();
   const common: Record<string, any> = {
+    crypto, Date,
     lang: 'en', meetingPreferenceScopeKey: 'fixture-scope', meetingStartedAt: state.startedAt, meetingStorageKeys: { report: 'report', notes: 'notes', startedAt: 'started' },
-    setMeetingNotes: (value: any) => { state.notes = typeof value === 'function' ? value(state.notes) : value; },
+    setMeetingNotes: (value: any) => { state.notes = typeof value === 'function' ? value(state.notes) : value; state.persisted = state.notes; },
     setMeetingSpeakerCount: vi.fn(), setMeetingReport: (value: string) => { state.report = value; },
     setMeetingStartedAt: (value: any) => { state.startedAt = typeof value === 'function' ? value(state.startedAt) : value; },
     persistMeetingNotes: (notes: any[]) => { state.persisted = notes; },
@@ -159,7 +173,10 @@ function meetingUi(socket: FixtureSocket) {
     meetingModeRef: { current: true }, meetingPausedRef: { current: false },
     meetingIdentityRef: { current: { scope: 'fixture-scope', meetingId: '', refinementId: '' } },
     meetingRefinementCancelRef: { current: null }, meetingCaptureResetRef: { current: null },
-    setMeetingReportGenerating: vi.fn(),
+    setMeetingReportGenerating: vi.fn(), meetingReportGenerating: false, meetingExportBusy: false,
+    operationMode: 'meeting', meetingPaused: true, copy: { newConfirm: 'Create new record' },
+    window: { confirm: vi.fn(() => true) }, pauseMeetingCapture: vi.fn(),
+    createMeetingRecord: () => { common.renewMeetingIdentity(); state.notes = []; state.persisted = []; state.report = ''; return true; },
   };
   common.renewMeetingIdentity = realDesktopCallback('renewMeetingIdentity', common);
   const apply = realDesktopCallback('applyRefinedMeetingTranscript', common);
@@ -172,7 +189,7 @@ function meetingUi(socket: FixtureSocket) {
     const identity = { scope: 'fixture-scope', meetingId, refinementId: `refine-${meetingId}` };
     common.meetingIdentityRef.current = identity;
     return wait(identity);
-  }, identity: common.meetingIdentityRef, resetCapture: common.meetingCaptureResetRef, clear: realDesktopCallback('clearMeetingNotes', common), events };
+  }, identity: common.meetingIdentityRef, resetCapture: common.meetingCaptureResetRef, clear: realDesktopCallback('clearMeetingNotes', common), clearWhileBusy: realDesktopCallback('clearMeetingNotes', { ...common, meetingReportGenerating: true }), events };
 }
 
 describe('voice organization authority through actual STT and model pipeline', () => {
@@ -223,7 +240,7 @@ describe('voice organization authority through actual STT and model pipeline', (
     await flushDBOrThrow();
   }, 15000);
 
-  it('revocation during terminal flush replaces unpublished success with one safe cancellation and skips learning', async () => {
+  it.each(['flush', 'receipt'] as const)('revocation during terminal %s makes delivery, transcript and SQLite receipt agree on cancellation', async boundary => {
     const { socket, userId, org } = fixture(true);
     const entered = deferred(); const gate = deferred();
     mocks.stream.mockImplementation(async (_m: any, _t: any, _o: any, onChunk: any) => {
@@ -231,7 +248,7 @@ describe('voice organization authority through actual STT and model pipeline', (
       onChunk(MODEL_TEXT);
       return { text: MODEL_TEXT, toolCalls: [], usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
     });
-    mocks.flushGate.mockImplementationOnce(async () => { entered.resolve(); await gate.promise; });
+    mocks[boundary === 'flush' ? 'flushGate' : 'receiptGate'].mockImplementationOnce(async () => { entered.resolve(); await gate.promise; });
     await socket.receive('audio:start', start('terminal-authority'));
     await mocks.stt.at(-1).final(USER_TEXT);
     await entered.promise;
@@ -241,6 +258,19 @@ describe('voice organization authority through actual STT and model pipeline', (
     expect(socket.outputs.filter(([event, data]) => event === 'agent:response' && data.finalized)[0][1]).toMatchObject({ reason: 'cancelled' });
     expect(mocks.learning).not.toHaveBeenCalled();
     expect(mocks.summaries).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(socket.data.audioSession.isProcessing).toBe(false));
+    await waitForChatExecutionPersistence();
+    const terminal = socket.outputs.find(([event, data]) => event === 'agent:response' && data.finalized)![1];
+    const receipts = await querySQL<any>('SELECT status, payload FROM chat_execution_terminal_receipts WHERE userId = ? AND requestId = ?', [userId, terminal.requestId]);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0].status).toBe('cancelled');
+    expect(JSON.parse(receipts[0].payload)).toMatchObject({ reason: 'cancelled', text: terminal.text });
+    expect(getChatExecution({ userId, domain: 'work', orgId: org!.id, source: 'voice', conversationId: terminal.conversationId }, terminal.requestId)).toMatchObject({ status: 'cancelled', terminal: true });
+    const assistants = getMessages(terminal.conversationId, 20).filter(message => message.role === 'assistant' && message.requestId === terminal.requestId);
+    expect(assistants).toHaveLength(1);
+    expect(assistants[0].message).toBe(terminal.text);
+    expect(assistants[0].completionFeedback?.status).toBe('cancelled');
+    expect(mocks.convergence.mock.calls.filter(([input]) => input.identity.requestId === terminal.requestId)).toHaveLength(1);
   });
 });
 
@@ -274,7 +304,7 @@ describe('meeting capture ownership and complete paused recordings', () => {
     const firstWaiter = ui.wait('meeting-before-clear');
     await socket.receive('audio:stop', { sessionId: 'meeting-before-clear', refineTranscript: true, refinementId: ui.identity.current.refinementId });
     expect(mocks.transcribe).toHaveBeenCalledOnce();
-    ui.clear(); // The real Clear button is enabled even while reportGenerating.
+    ui.clear(); // The prepared, paused owner creates a fresh record and invalidates the prior refinement.
     expect(ui.state.notes).toEqual([]);
     await socket.receive('audio:start', start('meeting-after-clear', true));
     await socket.receive('audio:chunk', Buffer.alloc(16000, 0x44));
@@ -289,6 +319,16 @@ describe('meeting capture ownership and complete paused recordings', () => {
     expect(ui.state.persisted.map(note => note.text)).toEqual(['CURRENT MEETING NOTES']);
     const event = socket.outputs.find(([name]) => name === 'meeting:refined_transcript')![1];
     expect(event).toMatchObject({ sessionId: 'meeting-before-clear', meetingId: 'meeting-before-clear', refinementId: 'refine-meeting-before-clear' });
+  });
+
+  it('cannot clear an active report while the matching refinement still owns the record', async () => {
+    const { socket } = fixture(); const ui = meetingUi(socket);
+    const completed = ui.wait('busy-report'), identity = ui.identity.current;
+    ui.clearWhileBusy();
+    expect(ui.identity.current).toBe(identity);
+    socket.client.emit('meeting:refined_transcript', { ...identity, text: 'CURRENT REPORT RECORD' });
+    expect((await completed)[0].text).toBe('CURRENT REPORT RECORD');
+    expect(ui.state.notes.map(note => note.text)).toEqual(['CURRENT REPORT RECORD']);
   });
 
   it('pause/resume keeps both PCM segments and refines the complete meeting', async () => {
@@ -444,7 +484,7 @@ describe('meeting capture ownership and complete paused recordings', () => {
     await socket.receive('audio:stop', { preserveMeeting: true });
     const directory = path.dirname(firstPath);
     const manifest = path.join(directory, `meeting_${meetingId.length}_${meetingId}_segments.json`);
-    const original = fs.readFileSync(manifest, 'utf8');
+    const original = readImplementationSource(manifest, 'utf8');
     const rename = fs.renameSync;
     const failure = vi.spyOn(fs, 'renameSync').mockImplementation((source, target) => {
       if (String(target) === manifest) throw new Error('Synthetic disk replacement failure');
@@ -452,9 +492,43 @@ describe('meeting capture ownership and complete paused recordings', () => {
     });
     try { await socket.receive('audio:start', { ...start('atomic-second', true), meetingId }); }
     finally { failure.mockRestore(); }
-    expect(fs.readFileSync(manifest, 'utf8')).toBe(original);
-    expect(fs.readFileSync(firstPath)).toEqual(Buffer.alloc(16000, 0x37));
+    expect(readImplementationSource(manifest, 'utf8')).toBe(original);
+    expect(readImplementationSource(firstPath)).toEqual(Buffer.alloc(16000, 0x37));
     expect(fs.readdirSync(directory).filter(name => name.endsWith('.pcm'))).toEqual([path.basename(firstPath)]);
     expect(fs.readdirSync(directory).some(name => name.endsWith('.tmp'))).toBe(false);
   });
+});
+
+describe('natural voice commands use the shared model and tool loop', () => {
+  it.each(['打开聊天界面', '打开AutoCAD。', '看一下现在知识库里有多少的文件内容。',
+    '打开 WPS，然后新建文档，在正文写入：语音共享入口测试。'])(
+    'routes %s through the shared loop without a detached shortcut and releases after the durable terminal', async text => {
+      const { socket } = fixture();
+      socket.data.trustedLocalExecution = true;
+      mocks.tools.mockResolvedValue({ text: 'This synthetic attempt cannot complete the requested action.',
+        toolCalls: [], usageRecords: [], completionGuard: { blocked: true, text: 'This synthetic attempt cannot complete the requested action.',
+          reason: 'missing_execution_evidence' } });
+      await socket.receive('audio:start', start('shared-model-' + sequence));
+      await mocks.stt.at(-1).final(text);
+      await vi.waitFor(() => expect(mocks.tools, JSON.stringify({ errors: mocks.errors, outputs: socket.outputs.map(([event, data]) => ({ event, status: data?.status, reason: data?.reason, message: data?.message, text: data?.text })) })).toHaveBeenCalled(), { timeout: 5000 });
+      const acceptedText = socket.outputs.find(([event]) => event === 'audio:confirm')?.[1].text;
+      expect(mocks.tools.mock.calls[0][0].at(-1).content).toBe(acceptedText);
+      expect(mocks.tools.mock.calls[0][11].toolPolicy).toBeDefined();
+      await vi.waitFor(() => expect(socket.outputs.filter(([event, data]) => event === 'agent:response' && data.finalized)).toHaveLength(1));
+      await vi.waitFor(() => expect(socket.data.audioSession.isProcessing).toBe(false));
+      expect(mocks.tools.mock.calls.length).toBeLessThanOrEqual(2); // One shared, bounded evidence recovery is permitted.
+      for (const call of mocks.tools.mock.calls) {
+        expect(call[11].requestId).toBe(mocks.tools.mock.calls[0][11].requestId);
+        expect(call[11].toolPolicy).toBe(mocks.tools.mock.calls[0][11].toolPolicy);
+      }
+      expect(socket.outputs.some(([event]) => event === 'desktop:tool_call')).toBe(false);
+      const terminal = socket.outputs.filter(([event, data]) => event === 'agent:response' && data.finalized)[0][1];
+      expect(terminal.blocked).toBe(true);
+      await waitForChatExecutionPersistence();
+      expect(terminal.conversationId).toBeTruthy();
+      const saved = getMessages(terminal.conversationId, 20).filter(message => message.role === 'assistant');
+      expect(saved).toHaveLength(1);
+      expect(saved[0].message).toBe(terminal.text);
+    }, 15000,
+  );
 });

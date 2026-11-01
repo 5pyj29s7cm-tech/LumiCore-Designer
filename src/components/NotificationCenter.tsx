@@ -3,6 +3,7 @@ import { Bell, CheckCheck, Trash2, Info, AlertTriangle, CheckCircle, Zap, Messag
 import { useApp } from '@/contexts/AppContext';
 import { useT } from '../lib/useT';
 import { useState } from 'react';
+import { settingsRecoveryCopy } from '@/i18n/locales/settingsRecovery';
 
 const ICONS: Record<string, React.ReactNode> = {
   info: <Info size={14} className="text-blue-400" />,
@@ -12,8 +13,14 @@ const ICONS: Record<string, React.ReactNode> = {
 };
 
 export function NotificationCenter({ onChatMessage }: { onChatMessage?: (item: any) => void }) {
-  const { notifications, markAllNotificationsRead, clearNotifications } = useApp();
+  const { user } = useApp();
+  return <NotificationCenterContent key={user?.uid || 'anonymous'} onChatMessage={onChatMessage} />;
+}
+
+function NotificationCenterContent({ onChatMessage }: { onChatMessage?: (item: any) => void }) {
+  const { notifications, notificationsBusy, notificationsLoading, notificationsError, refreshNotifications, markAllNotificationsRead, clearNotifications } = useApp();
   const t = useT();
+  const recovery = settingsRecoveryCopy(t.langCode);
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
 
   const handleClick = (item: any) => {
@@ -25,45 +32,39 @@ export function NotificationCenter({ onChatMessage }: { onChatMessage?: (item: a
   const visibleItems = notifications
     .filter(n => !dismissedIds.has(n.id))
     .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  const unread = visibleItems.filter(n => !n.read).length;
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-zinc-950/55 text-white backdrop-blur-xl">
       <div className="flex items-center gap-3 border-b border-white/[0.08] px-6 py-4">
         <div className="relative flex h-10 w-10 items-center justify-center rounded-xl border border-amber-300/15 bg-amber-500/15">
           <Bell size={20} className="text-amber-400" />
-          {visibleItems.filter(n => !n.read).length > 0 && (
+          {unread > 0 && (
             <span className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-xs font-black">
-              {visibleItems.filter(n => !n.read).length > 9 ? '9+' : visibleItems.filter(n => !n.read).length}
+              {unread > 9 ? '9+' : unread}
             </span>
           )}
         </div>
         <div>
           <h2 className="text-sm font-bold text-white/90">{t.ncTitle || 'Notification Center'}</h2>
           <p className="text-xs text-white/55">
-            {visibleItems.length > 0 ? visibleItems.filter(n => !n.read).length + ' ' + (t.unreadCount || 'unread') : (t.allCaughtUp || 'All caught up')}
+            {notificationsLoading ? recovery.loading : notificationsError ? recovery.failed : visibleItems.length > 0 ? unread + ' ' + (t.unreadCount || 'unread') : (t.allCaughtUp || 'All caught up')}
           </p>
         </div>
         <div className="flex-1" />
-        {visibleItems.length > 0 && (
+        {visibleItems.length > 0 && !notificationsLoading && !notificationsError && (
           <div className="flex gap-2">
-            <button
-              onClick={markAllNotificationsRead}
-              className="lumi-icon-button h-8 w-8 rounded-lg"
-            >
-              <CheckCheck size={14} />
-            </button>
-            <button
-              onClick={clearNotifications}
-              className="lumi-icon-button h-8 w-8 rounded-lg hover:text-red-300"
-            >
-              <Trash2 size={14} />
-            </button>
+            {[{ action: markAllNotificationsRead, label: t.markAllRead, Icon: CheckCheck }, { action: clearNotifications, label: t.clearAll, Icon: Trash2 }].map(({ action, label, Icon }) => (
+              <button key={label} onClick={action} disabled={notificationsBusy} aria-label={label} title={label} className="lumi-icon-button h-8 w-8 rounded-lg disabled:opacity-40">
+                <Icon size={14} />
+              </button>
+            ))}
           </div>
         )}
       </div>
 
       <div className="custom-scrollbar flex-1 overflow-y-auto p-4">
-        {visibleItems.length === 0 ? (
+        {notificationsLoading ? <p role="status">{recovery.loading}</p> : notificationsError ? <div role="alert">{recovery.failed} <button onClick={() => void refreshNotifications()}>{recovery.retry}</button></div> : visibleItems.length === 0 ? (
           <div className="lumi-panel flex flex-col items-center justify-center py-16 text-white/40">
             <Bell size={48} className="mb-4 opacity-20" />
             <span className="text-xs font-bold uppercase tracking-widest">{t.ncEmpty || 'No notifications'}</span>

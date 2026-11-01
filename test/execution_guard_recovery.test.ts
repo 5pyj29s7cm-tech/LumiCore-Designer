@@ -1,3 +1,6 @@
+import { readImplementationSource } from './implementation_source';
+import { shouldAllowLocalFileWriteForTurn } from '../server/socket/chat/attachments';
+import { readVoiceImplementationSource } from './voice_implementation_source';
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -13,13 +16,17 @@ import {
 } from '../server/cognition/execution_guard_recovery';
 import type { ExecutionGuardRecoveryFinalization } from '../server/cognition/execution_guard_recovery';
 import type { ToolExecutionRecord } from '../server/tools/types';
-import { sanitizeToolRecordsForPersistence } from '../server/cognition/user_output_protection';
+import { normalizeActionIntent } from '../server/cognition/normalized_action_intent';
+import { buildActionContract } from '../server/cognition/action_contract';
+import { shouldAllowToolUseForTurn, hasRequestedArtifactMutation } from '../server/cognition/tool_intent';
+import { sanitizeToolRecordsForPersistence, sanitizeUserFacingExecutionOutput } from '../server/cognition/user_output_protection';
 import {
   clearAllPendingConfirmationsForTests,
+  formatPendingConfirmationPrompt,
   formatPendingConfirmationRequest,
   recordPendingConfirmation,
 } from '../server/tools/pending_confirmation';
-import { formatDesktopControlPausePresentation } from '../server/regions/packs/cn/desktop_control_messages';
+import { formatDesktopControlPausePresentation } from "../server/regions/messages/desktop_control_messages";
 
 function record(patch: Partial<ToolExecutionRecord> = {}): ToolExecutionRecord {
   return {
@@ -37,6 +44,135 @@ function expectNaturalCustomerReply(text: string): void {
 }
 
 describe('execution guard recovery', () => {
+  it.each([
+    '请把桌面的“共同验收甲.docx”和“共同验收乙.docx”合并成“共同验收合并.docx”，保留两份文件的全部正文，完成后把合并文件发到当前聊天。',
+    '请把“甲.docx”和“乙.docx”合并为“丙.docx”，原文件保持不变。',
+    'Merge "first.docx" and "second.docx" into "combined.docx".',
+    'Make a Word document.',
+  ])('retains existing explicit local deliverable authorization: %s', task => {
+    expect(shouldAllowLocalFileWriteForTurn(task, [])).toBe(true);
+  });
+  it.each([
+    '我怎么把甲.docx和乙.docx合并成丙.docx？',
+    '先只读取“甲.docx”，不要合并成“丙.docx”。',
+    '请解释“合并成丙.docx”的意思，不执行。',
+    '删除“合并成结果.docx”。',
+    '请搜索桌面的“甲.docx”和“乙.docx”。',
+  ])('does not infer local output authorization from a non-deliverable merge mention: %s', task => {
+    expect(shouldAllowLocalFileWriteForTurn(task, [])).toBe(false);
+  });
+
+  it.each([
+    '请把桌面的“共同验收甲.docx”和“共同验收乙.docx”合并成“共同验收合并.docx”，保留两份文件的全部正文，完成后把合并文件发到当前聊天。',
+    '请将“季度报告.docx”和“附录.docx”合并为“完整报告.docx”，完成后发到当前聊天。',
+    'Merge "source-one.docx" and "source-two.docx" into "combined.docx" and return it here.',
+  ])('keeps a named document merge executable through recovery: %s', task => {
+    expect(normalizeActionIntent(task)).toMatchObject({ kind: 'desktop_operation', operation: 'mutate', relation: 'new' });
+    expect(classifyExecutionGuardIntent(task)).toBe('action_execution');
+    expect(decideExecutionGuardRecovery({ task, blocked: true, allowToolUse: true, toolRecords: [], reason: 'Missing core evidence for requested action.' })).toMatchObject({ recoverable: true, intent: 'action_execution' });
+  });
+
+  it.each([
+    '不要合并“甲.docx”和“乙.docx”。',
+    '请把“甲.docx”和“乙.docx”不合并。',
+    '请解释“合并甲.docx”的含义，不要执行。',
+    '请读取“合并成.docx”，不要修改。',
+    '请把`合并成结果.docx`读一下。',
+    '请把```修改为新.docx```读一下。',
+    '如果把“甲.docx”和“乙.docx”合并成“丙.docx”，会怎样？',
+  ])('does not turn a forbidden, quoted, or hypothetical merge into mutation: %s', task => {
+    expect(normalizeActionIntent(task).sideEffectClass).toBe('none');
+  });
+
+  it('binds the affirmative quoted file rather than the prohibited file before a contrast', () => {
+    expect(normalizeActionIntent('不要修改“旧.docx”但修改“新.docx”')).toMatchObject({ kind: 'desktop_operation', operation: 'mutate', target: '新.docx' });
+  });
+
+  it.each([
+    '仅执行一次 get_video_generation_status，参数为 {"recoveryId":"existing-provider-job"}，返回真实状态；禁止重新生成视频。',
+    '请使用 get_video_generation_status，参数 JSON 为 {"recoveryId":"existing-provider-job"}，把这一个工具返回的结果完整发回本次聊天。只取回原有结果；本次禁止生成视频、禁止生成音乐，也不改变任何工程。',
+    '请调用 company_query 查询企业信息，把实际结果返回本次聊天；不要修改文件。',
+  ])('keeps fresh tool result retrieval executable instead of reporting saved state: %s', task => {
+    expect(classifyExecutionGuardIntent(task), JSON.stringify({ task, normalized: normalizeActionIntent(task), tools: shouldAllowToolUseForTurn(task), contract: buildActionContract(task) })).toBe('action_execution');
+    expect(decideExecutionGuardRecovery({ task, blocked: true, allowToolUse: true, toolRecords: [], reason: 'No successful current-turn tool execution.' })).toMatchObject({ recoverable: true, intent: 'action_execution' });
+  });
+
+  it.each(['继续回答。', 'Continue answering.'])('never asks the user to choose a conversation category after a filtered answer: %s', task => {
+    const result = sanitizeExecutionResponseForDelivery({ text: '状态：受阻。\n证据：No successful current-turn tool execution.', blocked: true, reason: 'No successful current-turn tool execution.' }, { task, intent: 'conversation', toolRecords: [] });
+    expect(result.text).toBeTruthy();
+    expect(result.text).not.toMatch(/普通对话|ordinary conversation|specific target|具体目标执行/u);
+    expectNaturalCustomerReply(String(result.text));
+  });
+
+  it.each(['aborted', 'pendingConfirmation'] as const)('does not restore a continued answer across %s', async boundary => {
+    let attempts = 0;
+    const result = await recoverBlockedExecutionOnce({
+      task: '继续回答。', intent: 'conversation', responseText: '这段内容是边界发生前的旧回答。', allowToolUse: true, toolRecords: [], [boundary]: true,
+      finalization: { text: '请求已停止或正在等待确认。', blocked: true, reason: 'No successful current-turn tool execution.' },
+      attempt: async () => { attempts++; throw new Error('Boundary forbids recovery'); },
+      finalize: () => { throw new Error('No second finalization across boundary'); },
+    });
+    expect(attempts).toBe(0);
+    expect(result.decision.reason).toBe(boundary === 'aborted' ? 'request_cancelled' : 'waiting_for_user_confirmation');
+    expect(result.responseText).not.toBe('这段内容是边界发生前的旧回答。');
+    expect(result.finalization.blocked).toBe(true);
+  });
+
+  it.each(['reason', 'receipt'] as const)('keeps existing confirmation evidence blocked before restoring an answer: %s', async source => {
+    let attempts = 0;
+    const result = await recoverBlockedExecutionOnce({
+      task: '继续回答。', intent: 'conversation', responseText: '我可以继续解释文件的保存位置。', allowToolUse: true,
+      toolRecords: source === 'receipt' ? [record({ name: 'file_write', error: 'requires explicit user confirmation' })] : [],
+      finalization: { text: '请确认是否继续这项操作。', blocked: true, reason: source === 'reason' ? 'requires explicit user confirmation' : 'No successful current-turn tool execution.' },
+      attempt: async () => { attempts++; throw new Error('Confirmation forbids recovery'); },
+      finalize: () => { throw new Error('Confirmation forbids finalization retry'); },
+    });
+    expect(attempts).toBe(0);
+    expect(result.decision.reason).toBe('waiting_for_user_confirmation');
+    expect(result.finalization.blocked).toBe(true);
+    expect(result.responseText).not.toBe('我可以继续解释文件的保存位置。');
+  });
+
+  it.each(['claimed tool execution without matching tool records', 'unsupported current-turn real-world claim: runtime_configuration'])('does not restore a verifier-rejected factual claim: %s', async reason => {
+    let attempts = 0;
+    const rejected = '我查过了，当前记忆库共有40条。';
+    const result = await recoverBlockedExecutionOnce({
+      task: '什么是记忆读取？请只解释概念。', intent: 'conversation', responseText: rejected, allowToolUse: false, toolRecords: [],
+      finalization: { text: '这项查询未得到核实。', blocked: true, reason },
+      attempt: async () => { attempts++; throw new Error('No automatic action replay'); },
+      finalize: () => { throw new Error('No automatic finalization retry'); },
+    });
+    expect(attempts).toBe(0);
+    expect(result.responseText).not.toBe(rejected);
+  });
+
+  it.each([false, true])('keeps a required fresh confirmation authoritative over a conversation hint (tools=%s)', async allowToolUse => {
+    let attempts = 0;
+    const rejected = '这段是切换目标之前的回答。';
+    const result = await recoverBlockedExecutionOnce<ExecutionGuardRecoveryFinalization>({
+      task: '继续回答。', intent: 'conversation', requiresFreshConfirmation: true, responseText: rejected, allowToolUse, toolRecords: [],
+      finalization: { text: '需要重新确认操作目标。', blocked: false },
+      attempt: async () => { attempts++; throw new Error('No exact confirmation obtained'); },
+      finalize: text => ({ text, blocked: true, reason: 'missing_fresh_confirmation' }),
+    });
+    expect(attempts).toBe(allowToolUse ? 1 : 0);
+    expect(result.decision.intent).toBe('action_execution');
+    expect(result.finalization.blocked).toBe(true);
+    expect(result.responseText).not.toBe(rejected);
+  });
+
+  it('recovers an unsupported playback claim instead of silently ending before tools run', () => {
+    expect(decideExecutionGuardRecovery({ task: '播放音乐', blocked: true, allowToolUse: true,
+      reason: 'desktop_operation: unsupported current-turn real-world claim: playback.', toolRecords: [] }))
+      .toMatchObject({ recoverable: true, code: 'invented_runtime_state', intent: 'action_execution' });
+    expect(classifyExecutionGuardIntent('你现在是什么模型')).toBe('action_execution');
+  });
+  it('keeps new document navigation and inspection executable despite status words in the file path', () => {
+    expect(classifyExecutionGuardIntent('用电脑上的 WPS 打开 D:/LumiCore-Audit-Reports/20260920/chat-task-repair/cloud-output/采购报表_执行进度复测更新.xlsx，核对表格的总金额和图表，告诉我实际看到的结果。')).toBe('action_execution');
+    expect(classifyExecutionGuardIntent('刚才任务的结果是什么？')).toBe('status_query');
+    expect(hasRequestedArtifactMutation('打开 D:/reports/采购报表_更新.xlsx，核对总额。')).toBe(false);
+    expect(hasRequestedArtifactMutation('修改 D:/reports/采购报表_更新.xlsx 的数量。')).toBe(true);
+  });
   it('keeps conceptual evidence questions in conversation while preserving real task-status queries', () => {
     expect(classifyExecutionGuardIntent('“文件保存成功”应该依据什么证据判断？请只解释，不执行任何操作。'))
       .toBe('conversation');
@@ -193,7 +329,8 @@ describe('execution guard recovery', () => {
     const status = formatExecutionStatusFeedback('刚才任务的进度怎么样了？', []);
 
     for (const reply of [failure, status]) {
-      expect(reply).toContain('没有拿到可以确认的操作结果');
+      expect(reply).toMatch(/没有完成/u);
+      expect(reply).not.toMatch(/可验证|没有拿到|回执/u);
       expect(reply).not.toMatch(/已有进度|保留已有进度|已执行步骤/u);
       expectNaturalCustomerReply(reply);
     }
@@ -438,8 +575,8 @@ describe('execution guard recovery', () => {
   });
 
   it('routes every socket notification event through the shared sanitizer', () => {
-    for (const file of ['chat.ts', 'task.ts', 'voice.ts']) {
-      const source = readFileSync(path.resolve('server/socket', file), 'utf8');
+    for (const file of ['chat.ts', 'voice.ts']) {
+      const source = file === 'voice.ts' ? readVoiceImplementationSource() : readImplementationSource(path.resolve('server/socket', file), 'utf8');
       expect(source).toContain("event === 'agent:notification'");
       expect(source).toContain('sanitizeExecutionNotificationForDelivery');
     }
@@ -567,7 +704,8 @@ describe('execution guard recovery', () => {
       );
       const confirmationRequest = formatPendingConfirmationRequest(pending);
       expect(confirmationRequest).toContain('C:\\isolated\\lumi-task-regression\\account.json');
-      expect(confirmationRequest).toContain('[redacted]');
+      expect(confirmationRequest).toContain('owner');
+      expect(confirmationRequest).not.toContain('clientSecret');
       expect(confirmationRequest).not.toContain('must-never-leak');
       expect(confirmationRequest).not.toContain('also-must-never-leak');
 
@@ -592,14 +730,33 @@ describe('execution guard recovery', () => {
         blocked: false,
         reason: 'waiting_confirmation',
       }, { task: 'Log in with the isolated account' });
-      expect(untrusted.text).not.toBe(confirmationRequest);
-      expect(untrusted.text).not.toContain('C:\\isolated\\account.json');
+      // Public prose no longer contains the raw argument envelope requiring a bypass.
+      expect(untrusted.text).toBe(confirmationRequest);
+      expect(untrusted.text).toContain(pending.target);
     } finally {
       clearAllPendingConfirmationsForTests();
     }
   });
 
-  it('persists verified receipt facts without storing screenshot or oversized raw payloads', () => {
+  it('never exempts a model-only prompt or legacy instruction dump as trusted confirmation text', () => {
+    clearAllPendingConfirmationsForTests();
+    try {
+      const pending = recordPendingConfirmation('confirmation-no-prompt-bypass', 'computer_use', {
+        task: 'Read the WPS window and wait for the next model instruction.', target_application: 'WPS', max_steps: 20,
+      }, 'voice', { actionIntent: '检查会议文档' });
+      const modelPrompt = formatPendingConfirmationPrompt(pending);
+      const legacy = `这项操作还没有执行，需要你确认后才能继续。\n操作：computer_use\n参数：${JSON.stringify(pending.safeArgs)}`;
+      for (const text of [modelPrompt, legacy]) {
+        const protectedText = sanitizeUserFacingExecutionOutput(text, { trustedConfirmationRequestText: text });
+        expect(protectedText).not.toBe(text);
+        expect(protectedText).not.toMatch(/computer_use|max_steps|target_application|next model instruction|Pending id|Arguments/u);
+      }
+    } finally {
+      clearAllPendingConfirmationsForTests();
+    }
+  });
+
+  it('persists verified receipt facts and bounded document text without screenshot payloads', () => {
     const records = sanitizeToolRecordsForPersistence([record({
       name: 'desktop_capture_screen',
       arguments: {
@@ -639,9 +796,9 @@ describe('execution guard recovery', () => {
     expect(records?.[0].terminalVerification.status).toBe('verified');
     expect(records?.[0].envelope.status).toBe('verified_success');
     expect(serialized).toContain('binary image omitted');
-    expect(serialized).toContain('stored result truncated');
+    expect(records?.[1].result).toBe('plain text '.repeat(2_000));
     expect(serialized).not.toMatch(/must-not-persist|data:image|AAAAA|BBBBB|CCCCC/iu);
-    expect(serialized.length).toBeLessThan(12_000);
+    expect(serialized.length).toBeLessThan(30_000);
   });
 
   it('keeps long desktop inventory receipts as valid bounded JSON with document and window evidence', () => {
@@ -851,6 +1008,18 @@ describe('execution guard recovery', () => {
     expect(serialized).not.toMatch(/Alice|portrait\.png|source-secret|result-secret/u);
     expect(serialized).toContain('verified.mp4');
     expect(JSON.parse(records?.[0].result || '{}')).not.toHaveProperty('inputPath');
+  });
+
+  it.each([
+    ['generate_video', { first_frame_image: 'C:/private/product.png' }, { operation: 'image_to_video', hasReference: true }],
+    ['generate_image', { referencePaths: ['C:/private/product.png'] }, { operation: 'text_to_image', hasReference: true, referenceCount: 1 }],
+    ['ai_edit_image', { filePath: 'C:/private/product.png' }, { operation: 'image_edit', hasSource: true }],
+  ])('preserves %s media source evidence across repeated persistence projection', (name, args, expected) => {
+    const once = sanitizeToolRecordsForPersistence([record({ name, arguments: { ...args, prompt: 'product', duration: 30 }, result: '{"ok":true}' })]);
+    const twice = sanitizeToolRecordsForPersistence(once);
+    expect(twice).toEqual(once);
+    expect(twice?.[0].arguments).toMatchObject(expected);
+    expect(JSON.stringify(twice)).not.toContain('private/product.png');
   });
 
   it('returns only a human-readable blocker when the single recovery remains blocked', async () => {
@@ -1131,46 +1300,61 @@ describe('execution guard recovery', () => {
     })).rejects.toMatchObject({ name: 'AbortError', message: 'Request cancelled' });
   });
 
-  it('wires the shared one-shot recovery into chat, task and voice terminal paths', () => {
+  it('wires the shared one-shot recovery into chat and voice terminal paths', () => {
     const root = process.cwd();
-    const chatSource = readFileSync(path.join(root, 'server/socket/chat.ts'), 'utf8');
-    const taskSource = readFileSync(path.join(root, 'server/socket/task.ts'), 'utf8');
-    const voiceSource = readFileSync(path.join(root, 'server/socket/voice.ts'), 'utf8');
+    const chatSource = readImplementationSource(path.join(root, 'server/socket/chat.ts'), 'utf8');
+    const voiceSource = readVoiceImplementationSource();
 
-    for (const source of [chatSource, taskSource, voiceSource]) {
-      expect(source).toContain('await recoverBlockedExecutionOnce({');
+    for (const source of [chatSource, voiceSource]) {
       expect(source).toContain('pendingConfirmation: Boolean(pendingConfirmationCreatedThisTurn)');
       expect(source).toContain('requiresFreshConfirmation: correctionRequiresFreshConfirmation');
-      expect(source).toContain('priorToolRecords,');
     }
-    expect(chatSource).toContain('...normalTurnMessages');
-    expect(chatSource).toContain('normalTurnMessages = messages;');
-    expect(chatSource).toContain('recordTool(record);');
+    expect(chatSource).toContain('await runLumiEntryTurn<void>({');
+    expect(voiceSource).toContain('await runLumiEntryTurn<void>({');
+    const voiceData = readFileSync(path.join(root, 'server/socket/voice/turn/execute_voice_model_turn.ts'), 'utf8');
+    expect(voiceData).toContain('systemPrompt: context.voiceSystemPrompt, messages, taskText: context.routedUserText');
+    expect(voiceData).not.toContain('runPreparedLumiTurn(');
+    expect(readFileSync(path.join(root, 'server/cognition/turn_execution.ts'), 'utf8')).toContain('await runPreparedLumiTurn({');
+    const recoveryOwner = readImplementationSource(path.join(root, 'server/cognition/turn_recovery.ts'), 'utf8');
+    expect(recoveryOwner).toContain('...model.messages');
+    expect(recoveryOwner).toContain('priorToolRecords: recovery.priorToolRecords');
+    expect(recoveryOwner).toContain('await model.onToolCall?.(record);');
+    expect(recoveryOwner).toContain('recovery.recordTool({');
+    expect(recoveryOwner.indexOf('await model.onToolCall?.(record);')).toBeLessThan(recoveryOwner.indexOf('recovery.recordTool({'));
+    const driver = readFileSync(path.join(root, 'server/cognition/prepared_turn.ts'), 'utf8');
+    expect(driver).toContain('await runResolvedLumiTurn(input.model)');
+    expect(driver).toContain('await runResolvedLumiRecovery({ model, responseText, recovery })');
+    expect(driver).toContain('await finalizeLumiResponseForDelivery({');
+    const chatData = readFileSync(path.join(root, 'server/socket/chat/model_execution.ts'), 'utf8');
+    expect(chatData).toContain('systemPrompt: context.effectiveSystemPrompt, messages, taskText: context.executionTaskText');
+    expect(chatData).toContain('model: { registry: toolRegistry');
+    expect(chatData).not.toContain('runPreparedLumiTurn(');
+    expect(chatSource).not.toContain('normalTurnMessages');
+    expect(chatSource).not.toContain('runAuthorizedRecovery');
     expect(chatSource).toContain('...toolSecurityContext,');
     expect(chatSource).toContain('executionBoundary');
     expect(chatSource).not.toContain('const guardRecovery = decideExecutionGuardRecovery');
-    expect(taskSource).toContain("source: 'task_guard_recovery'");
-    expect(taskSource).toContain('normalizeTaskHistory(recentMsgs)');
-    expect(taskSource).toContain('isPendingConfirmation: () => Boolean(pendingConfirmationCreatedThisTurn)');
     expect(voiceSource).toContain("source: 'voice_guard_recovery'");
     expect(voiceSource).toContain('isAborted: () => !isCurrentTurn()');
 
-    for (const source of [chatSource, taskSource, voiceSource]) {
-      expect(source).toMatch(/correctionRequiresFreshConfirmation\s+&& !pendingConfirmationMatchesExactProposal\(/);
-      expect(source).toContain("throw new Error('Corrected action confirmation was not bound to the current task request')");
+    for (const source of [chatSource, voiceSource]) {
+      expect(source).toContain('createTurnConfirmation({');
+      expect(source).toContain('correctionRequiresFreshConfirmation,');
+      expect(source).not.toContain('!pendingConfirmationMatchesExactProposal(');
     }
+    const confirmationSource = readImplementationSource(path.join(root, 'server/tools/turn_confirmation.ts'), 'utf8');
+    expect(confirmationSource).toContain('input.correctionRequiresFreshConfirmation && !pendingConfirmationMatchesExactProposal(');
+    expect(confirmationSource).toContain("throw new Error('Corrected action confirmation was not bound to the current task request')");
   });
 
   it('keeps desktop pause and request cancellation separate in chat, task and voice recovery wiring', () => {
     const root = process.cwd();
     const cases = [{
-      source: readFileSync(path.join(root, 'server/socket/chat.ts'), 'utf8'),
+      source: readImplementationSource(path.join(root, 'server/socket/chat.ts'), 'utf8'),
       cancellationCheck: 'isAborted: isChatCancelled',
+
     }, {
-      source: readFileSync(path.join(root, 'server/socket/task.ts'), 'utf8'),
-      cancellationCheck: 'isAborted: () => authority.isCancelled()',
-    }, {
-      source: readFileSync(path.join(root, 'server/socket/voice.ts'), 'utf8'),
+      source: readVoiceImplementationSource(),
       cancellationCheck: 'isAborted: () => !isCurrentTurn()',
     }];
 
@@ -1178,15 +1362,49 @@ describe('execution guard recovery', () => {
       if (cancellationCheck === 'isAborted: isChatCancelled') {
         expect(source).toContain('const isChatCancelled = () => !turnAuthorization.isCurrent() || abortController.signal.aborted');
       }
-      const recoveryStart = source.indexOf('const guardRecovery = await recoverBlockedExecutionOnce({');
+      const recoveryStart = source.indexOf('prepared: { projectRecords,');
       expect(recoveryStart).toBeGreaterThanOrEqual(0);
       const recoveryBlock = source.slice(recoveryStart, recoveryStart + 13_000);
       expect(recoveryBlock).toContain(cancellationCheck);
       expect(recoveryBlock).not.toMatch(/isAborted:\s*\(\)\s*=>[^\n]*desktopPauseBlocksCurrentTask/u);
-      expect(recoveryBlock).toContain('if (!desktopPauseBlocksCurrentTask(recoveredRecords)) return candidate;');
-      expect(recoveryBlock).toContain('text: pausePresentation.text');
-      expect(recoveryBlock).toContain('blocked: true');
-      expect(recoveryBlock).toContain('reason: pausePresentation.reason');
+      expect(recoveryBlock).toContain('refinalize:');
+      expect(recoveryBlock).toContain('responseFinalizer.finalize({');
+      expect(recoveryBlock).toContain('toolRecords: projectRecords(records)');
+      expect(source).toContain('controlPauseReason: () => desktopRelay.getControlPauseReason()');
     }
+    const finalizer = readImplementationSource(path.join(root, 'server/cognition/turn_response_finalizer.ts'), 'utf8');
+    expect(finalizer).toContain('shouldBlockForDesktopControlPause({');
+    expect(finalizer).toContain('pauseReason: controlPauseReason()');
+    expect(finalizer).toContain('waitingForConfirmation: Boolean(pendingConfirmation())');
+    expect(finalizer).toContain('if (!isDesktopPaused(candidate.toolRecords || [])) return result;');
+    expect(finalizer).toContain('text: pause.text, blocked: true, reason: pause.reason');
+  });
+});
+
+
+describe('explicit task-status question scope', () => {
+  it.each([
+    "这是第4项的虚构验收，只检查原告网上立案材料是否齐备并列出下一步，不生成或修改文书，不创建或归档案件，也不向法院提交。拟向北京市海淀区人民法院起诉，案由民间借贷。已提供的材料清单仅有：已签名民事起诉状.pdf、原告身份证.pdf、借条.pdf、银行转账凭证.pdf。这里提供的只是材料名称，不代表你已读取文件。原告由律师代理，其他材料和当事人身份、地址等未提供。请以这份清单为准，具体说明现有材料、还需补哪些、哪些须查所选法院，并给出可核对的官方立案入口。未提供的材料不能当作已具备，不能把材料已齐备或已经提交当成结果。直接在当前聊天回答。",
+    '请在当前聊天回答。不要把资料齐备当作结果。',
+    '当前我只提供名称清单。请分别列出可能的结果。',
+    '请讨论结果的不同含义。当前仅有一份名称列表。',
+    'Use the current chat to explain these labels. Report the result here.',
+    'The current context contains only labels. Discuss possible results.',
+  ])('does not join unrelated status words into a question: %s', task => {
+    expect(classifyExecutionGuardIntent(task)).not.toBe('status_query');
+  });
+  it.each([
+    '刚才任务的结果是什么？',
+    '当前任务进度怎么样了？',
+    '刚才那次执行有什么证据？',
+    'What is the current task status?',
+  ])('keeps a direct question about an actual task subject: %s', task => {
+    expect(classifyExecutionGuardIntent(task)).toBe('status_query');
+  });
+  it.each([
+    '请解释“当前任务的结果是什么”这句话的含义。',
+    '不要询问当前任务的结果是什么。请分析这个清单。',
+  ])('does not treat quoted or forbidden questions as current status requests: %s', task => {
+    expect(classifyExecutionGuardIntent(task)).not.toBe('status_query');
   });
 });

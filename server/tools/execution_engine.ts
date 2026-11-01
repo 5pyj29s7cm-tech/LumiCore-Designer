@@ -1,7 +1,12 @@
+import { defaultLocalToolExecutionKey, toolExecutionIdentity } from './execution_identity';
+import { brandCanonicalToolExecutionRecord, isCanonicalToolExecutionRecord, type ToolExecutionInputDigests } from './canonical_execution_record';
+export { isCanonicalToolExecutionRecord, getCanonicalToolExecutionInputDigests } from './canonical_execution_record';
+export type { ToolExecutionInputDigests } from './canonical_execution_record';
 import { createHash, createHmac } from 'crypto';
 import { preservedSourceWriteBlockReason, requestedArtifactFormatBlockReason } from '../cognition/artifact_write_scope';
 import { getJwtSecret } from '../config/local_identity';
 import type { ToolContext, ToolExecutionRecord } from './types';
+import type { beginToolMetric } from '../runtime/tool_metrics';
 import { externalCommitInputDigest, type ToolRegistry } from './registry';
 import { verifyCapabilityReceipt } from './capability_verification';
 import { decodeToolResult } from './result_envelope';
@@ -23,19 +28,12 @@ import {
   requiresMediaPlaybackAction,
 } from '../cognition/action_contract';
 
-const CANONICAL_TOOL_EXECUTION_RECORD = Symbol('lumi.canonical_tool_execution_record');
 const CANONICAL_EXTERNAL_COMMIT_RECONCILIATION = Symbol('lumi.canonical_external_commit_reconciliation');
-const canonicalRecordDigests = new WeakMap<ToolExecutionRecord, string>();
-const canonicalInputDigests = new WeakMap<ToolExecutionRecord, ToolExecutionInputDigests>();
 const serverTargetPolicyRecords = new WeakMap<object, {
   scopeKey: string;
   records: ToolExecutionRecord[];
 }>();
 
-export interface ToolExecutionInputDigests {
-  argumentsDigest: string;
-  targetDigest: string;
-}
 
 function stableInputValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableInputValue);
@@ -78,21 +76,6 @@ export function toolExecutionInputDigests(args: Record<string, unknown>): ToolEx
   };
 }
 
-function canonicalRecordDigest(record: ToolExecutionRecord): string {
-  try { return JSON.stringify(record); } catch { return ''; }
-}
-
-export function isCanonicalToolExecutionRecord(record: ToolExecutionRecord): boolean {
-  return (record as ToolExecutionRecord & { [CANONICAL_TOOL_EXECUTION_RECORD]?: true })[CANONICAL_TOOL_EXECUTION_RECORD] === true
-    && canonicalRecordDigests.get(record) === canonicalRecordDigest(record);
-}
-
-export function getCanonicalToolExecutionInputDigests(record: ToolExecutionRecord): ToolExecutionInputDigests | undefined {
-  if (!isCanonicalToolExecutionRecord(record)) return undefined;
-  const digests = canonicalInputDigests.get(record);
-  return digests ? { ...digests } : undefined;
-}
-
 export function isCanonicalExternalCommitReconciliationRecord(record: ToolExecutionRecord): boolean {
   return isCanonicalToolExecutionRecord(record)
     && (record as ToolExecutionRecord & { [CANONICAL_EXTERNAL_COMMIT_RECONCILIATION]?: true })[CANONICAL_EXTERNAL_COMMIT_RECONCILIATION] === true;
@@ -111,21 +94,6 @@ export function attachedExternalCommitReconciliationFingerprint(input: {
     toolName: input.toolName,
   });
   return createHash('sha256').update(stable).digest('hex');
-}
-
-function brandCanonicalToolExecutionRecord(
-  record: ToolExecutionRecord,
-  inputDigests: ToolExecutionInputDigests,
-): ToolExecutionRecord {
-  Object.defineProperty(record, CANONICAL_TOOL_EXECUTION_RECORD, {
-    value: true,
-    enumerable: false,
-    configurable: false,
-    writable: false,
-  });
-  canonicalRecordDigests.set(record, canonicalRecordDigest(record));
-  canonicalInputDigests.set(record, { ...inputDigests });
-  return record;
 }
 
 function serverTargetPolicyTaskText(context?: ToolContext): string {
@@ -275,6 +243,7 @@ export interface ExecuteToolCallInput {
   arguments?: Record<string, any>;
   id?: string;
   executionOrigin?: ToolExecutionRecord['executionOrigin'];
+  modelRoutingReceiptId?: string;
   context?: ToolContext;
   /**
    * Optional domain guard. It may normalize arguments or block execution, but
@@ -342,10 +311,8 @@ export async function executeAttachedExternalCommitReconciliation(
     limitations: ['This observation can prove a commit; absence or ambiguous evidence remains unknown and never authorizes replay.'],
   };
   const record: ToolExecutionRecord = {
+    ...toolExecutionIdentity(input.context),
     id: input.reconciliationRecordId,
-    taskId: input.context.taskId,
-    turnId: input.context.turnId,
-    requestId: input.context.requestId,
     name,
     arguments: sanitizeReceiptValue(input.originalArguments) as Record<string, any>,
     result: '',
@@ -477,9 +444,6 @@ export async function executeAttachedExternalCommitReconciliation(
   }
 
   record.envelope = buildToolExecutionEnvelope(record, {
-    taskId: input.context.taskId,
-    turnId: input.context.turnId,
-    requestId: input.context.requestId,
     startedAt,
     completedAt: new Date().toISOString(),
     durationMs: Math.max(0, Date.now() - startedMs),
@@ -537,6 +501,8 @@ export async function executeToolCall(
   const targetPolicy = callerPreflight.allowed && (isFileTargetTask(targetPolicyTaskText) || input.context?.acceptedTaskTarget)
     ? guardTaskTargetToolCall({
         taskText: targetPolicyTaskText,
+        requestId: input.context?.requestId,
+        taskId: input.context?.taskId,
         toolName: semanticToolName,
         arguments: callerArguments,
         toolRecords: serverTargetPolicyEvidence(input.context, targetPolicyTaskText),
@@ -588,9 +554,19 @@ export async function executeToolCall(
   const desktopAuthorization = serverPreflight.allowed
     ? input.context?.desktopExecutionTracker?.authorize(semanticToolName, capability)
     : undefined;
-  const preflight = desktopAuthorization && !desktopAuthorization.allowed
+  let preflight = desktopAuthorization && !desktopAuthorization.allowed
     ? { allowed: false, arguments: serverPreflight.arguments, reason: desktopAuthorization.reason }
     : serverPreflight;
+  if (preflight.allowed && capability && input.context?.prepareSelectedToolCall) {
+    try {
+      const binding = await input.context.prepareSelectedToolCall();
+      Object.assign(input.context, binding, { currentTurnExecutionRequested: true });
+    } catch (error) {
+      if (input.context.executionSignal?.aborted || input.context.isCancelled?.()) throw error;
+      preflight = { allowed: false, arguments: preflight.arguments,
+        reason: error instanceof Error ? error.message : 'The selected tool lost its accepted turn.' };
+    }
+  }
   const executionArguments = preflight.arguments || callerArguments;
   // Allocate a durable action identity only after all argument binding. The
   // task-level key is not a tool-call key: distinct steps may use one tool.
@@ -604,10 +580,9 @@ export async function executeToolCall(
   const evidenceBuilder = (input.registry as any)?.buildEvidenceRecord;
   const record: ToolExecutionRecord = {
     id: input.context?.resolveToolIdempotencyKey ? resolvedIdempotencyKey : input.id,
-    taskId: input.context?.taskId,
-    turnId: input.context?.turnId,
-    requestId: input.context?.requestId,
+    ...toolExecutionIdentity(input.context),
     executionOrigin: input.executionOrigin,
+    modelRoutingReceiptId: input.modelRoutingReceiptId,
     name: input.name,
     arguments: receiptArguments,
     result: '',
@@ -626,22 +601,25 @@ export async function executeToolCall(
         }
       : undefined,
   };
-  record.idempotencyKey = resolvedIdempotencyKey || toolRecordIdempotencyKey(record);
+  const canonicalLocalCallKey = !resolvedIdempotencyKey && record.id && record.requestId && capability
+    && !capability.sideEffects.some((effect: { type: string }) => (
+      effect.type === 'external_state_change' || effect.type === 'external_communication'
+    )) ? defaultLocalToolExecutionKey(record) : undefined;
+  record.idempotencyKey = resolvedIdempotencyKey || canonicalLocalCallKey || toolRecordIdempotencyKey(record);
+  let finishMetric: ReturnType<typeof beginToolMetric> | undefined;
   const finalizeRecord = (): ToolExecutionRecord => {
     record.envelope = buildToolExecutionEnvelope(record, {
-      taskId: input.context?.taskId,
-      turnId: input.context?.turnId,
-      requestId: input.context?.requestId,
       startedAt,
       completedAt: new Date().toISOString(),
       durationMs: Math.max(0, Date.now() - startedMs),
     });
+    finishMetric?.(record.envelope.status);
+    const finalized = brandCanonicalToolExecutionRecord(record, toolExecutionInputDigests(executionArguments));
     try {
-      input.context?.desktopExecutionTracker?.record(record);
+      input.context?.desktopExecutionTracker?.record(finalized);
     } catch {
       // Desktop observability must not change the canonical tool outcome.
     }
-    const finalized = brandCanonicalToolExecutionRecord(record, toolExecutionInputDigests(executionArguments));
     rememberServerTargetPolicyRecord(input.context, targetPolicyTaskText, finalized);
     try { input.context?.onToolRecord?.(finalized); } catch { /* Observation never changes execution. */ }
     try { input.context?.onToolFinished?.({ id: record.id, name: record.name, recorded: true }); } catch { /* Observation only. */ }
@@ -662,6 +640,7 @@ export async function executeToolCall(
   try {
     input.context?.onToolStart?.({
       id: record.id,
+      idempotencyKey: record.idempotencyKey,
       name: input.name,
       arguments: receiptArguments,
     });
@@ -676,7 +655,7 @@ export async function executeToolCall(
       executionArguments,
       {
         ...(input.context || {}),
-        ...(resolvedIdempotencyKey ? { idempotencyKey: resolvedIdempotencyKey } : {}),
+        ...(resolvedIdempotencyKey || canonicalLocalCallKey ? { idempotencyKey: resolvedIdempotencyKey || canonicalLocalCallKey } : {}),
         onAdapterStart: async call => {
           await input.context?.onAdapterStart?.({ ...call, idempotencyKey: call.idempotencyKey || record.idempotencyKey });
           adapterStarted = true;
@@ -687,6 +666,7 @@ export async function executeToolCall(
           await input.context?.onAdapterSettlement?.(settlement);
         },
       },
+      finish => { finishMetric = finish; },
     );
     record.adapterStarted = adapterStarted;
     const decoded = decodeToolResult(rawResult);
@@ -697,6 +677,7 @@ export async function executeToolCall(
     // branded failure into a normal record would let callers publish a false
     // terminal state or retry an adapter whose start may already be durable.
     if (isToolLifecyclePersistenceFailure(error)) {
+      finishMetric?.('failed');
       try { input.context?.onToolFinished?.({ id: record.id, name: record.name, recorded: false }); } catch { /* Observation only. */ }
       throw error;
     }

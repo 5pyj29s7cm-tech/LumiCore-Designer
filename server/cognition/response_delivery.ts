@@ -1,14 +1,15 @@
-import { buildActionContract } from './action_contract';
+import { finalizeLumiResponse, type LumiResultFinalizerInput, type LumiResultFinalizerResult } from './result_finalizer';
+import { finalizeExecutionForOutboundDelivery, type OutboundExecutionFinalizationInput } from './execution_guard_recovery';
+import { buildActionEvidenceContract, extractPrimaryTaskText } from './action_contract';
 import { needsRecentActionContinuationContext } from './action_continuation';
 import type { LumiTurnFlow } from './turn_flow';
 import { isOperationModeMetaQuestion } from './capability_meta';
-import { hasImmediateExecutionPromise } from './execution_claims';
+import { hasImmediateExecutionPromise, hasTerminalExecutionClaim } from './execution_claims';
+import { capturePublicArtifactEvidenceSnapshot, projectPublicArtifactPayload } from '../conversation/chat_artifacts';
+import { observeFinalArchivedOutputIdentities } from '../files/generated_archive';
 
 const REFERENTIAL_EXECUTION_RE =
   /^(?:(?:\u4f60)?(?:\u7ee7\u7eed|\u63a5\u7740|\u5feb\u70b9|\u8d76\u7d27|\u9a6c\u4e0a|\u73b0\u5728|\u53bb).{0,20}(?:\u6267\u884c|\u5904\u7406|\u505a|\u5b8c\u6210|\u63a8\u8fdb|\u8fd9\u4e2a\u4efb\u52a1|\u5b83)|(?:continue|resume|proceed|do it|execute it|run it|finish it|go ahead).*)[.!?\u3002\uFF01\uFF1F]*$/iu;
-
-const PRE_FINALIZATION_TERMINAL_PROGRESS_RE =
-  /(?:\b(?:workflow|task|step|operation|action|write|open|send|save|transcription|verification|review)?\s*(?:completed|succeeded|successful|done|finished|saved|written|opened|sent|verified)\b|\b(?:workflow|task|operation|file|document|transcription|verification|review)\s+(?:is\s+)?(?:complete|completed|done|finished|saved|written|verified)\b|\b(?:i(?:'ve| have| am|'m)|we(?:'ve| have| are|'re))\b[^.!?\n]{0,48}\b(?:completed|finished|saved|written|opened|sent|created|generated|executing|processing)\b|\bsuccess(?:fully)?\b|\u5df2(?:\u7ecf)?(?:\u5b8c\u6210|\u5199\u597d|\u5199\u5b8c|\u6253\u5f00|\u521b\u5efa|\u65b0\u5efa|\u53d1\u9001|\u4fdd\u5b58|\u5199\u5165|\u5bfc\u51fa|\u751f\u6210|\u6267\u884c|\u5904\u7406)|(?:\u6587\u4ef6|\u6587\u6863|\u4efb\u52a1|\u5de5\u4f5c|\u8f6c\u5199|\u8bc6\u522b|\u590d\u6838|\u9a8c\u8bc1|\u4e0b\u8f7d|\u5904\u7406)[^\u3002\uff01\uff1f.!?\n]{0,18}(?:\u5df2(?:\u7ecf)?|\u6210\u529f)?(?:\u5b8c\u6210|\u5199\u5b8c|\u5199\u597d|\u641e\u5b9a|\u4fdd\u5b58|\u6210\u529f)(?:\u4e86)?|(?:\u5b8c\u6210|\u5199\u597d|\u5199\u5b8c|\u641e\u5b9a|\u4fdd\u5b58|\u6253\u5f00|\u521b\u5efa|\u65b0\u5efa|\u53d1\u9001|\u5bfc\u51fa|\u751f\u6210|\u6267\u884c|\u5904\u7406)(?:\u597d|\u5b8c)?\u4e86|\u6267\u884c\u6210\u529f|\u64cd\u4f5c\u6210\u529f|\u6210\u529f(?:\u5b8c\u6210|\u6253\u5f00|\u5199\u5165|\u521b\u5efa|\u53d1\u9001|\u4fdd\u5b58|\u5bfc\u51fa)|(?:\u6211|\u6211\u4eec|\u8fd9\u8fb9)[^\u3002\uff01\uff1f.!?\n]{0,24}(?:\u73b0\u5728|\u9a6c\u4e0a|\u6b63\u5728)[^\u3002\uff01\uff1f.!?\n]{0,18}(?:\u6267\u884c|\u5904\u7406|\u5199\u5165|\u6253\u5f00|\u4fdd\u5b58|\u53d1\u9001|\u751f\u6210))/iu;
 
 // Keep only a short suffix while ordinary conversation is streaming. That
 // suffix is enough to catch an execution/completion phrase split across model
@@ -46,12 +47,13 @@ export interface FinalizedOutputGateInput {
   allowToolUse?: boolean;
   flow: Pick<
     LumiTurnFlow,
+    | 'acceptedActionContract'
     | 'allowToolUseForTurn'
     | 'selfRepairTurn'
     | 'clientActionOnlyTurn'
     | 'completionEvidenceNeeded'
     | 'routeText'
-    | 'specialWorkflow'
+    | 'workflowHint'
     | 'workSurfaceRoute'
     | 'workTakeover'
   >;
@@ -67,14 +69,14 @@ export function shouldDeferModelOutputUntilFinalized(
 ): boolean {
   const taskText = String(input.taskText || '').trim();
   const routeText = String(input.flow.routeText || taskText).trim();
-  const contract = buildActionContract(routeText);
+  const contract = buildActionEvidenceContract(routeText, undefined, input.flow.acceptedActionContract);
 
   return Boolean(
     input.allowToolUse
     || input.flow.allowToolUseForTurn
     || input.flow.selfRepairTurn
     || input.flow.clientActionOnlyTurn
-    || input.flow.specialWorkflow
+    || input.flow.workflowHint
     || input.flow.completionEvidenceNeeded
     || input.flow.workSurfaceRoute.directDesktop
     || input.flow.workSurfaceRoute.artifactFirst
@@ -93,7 +95,7 @@ export function shouldDeferModelOutputUntilFinalized(
  */
 export function shouldForwardPreFinalizationProgress(text: string): boolean {
   const value = String(text || '').trim();
-  return Boolean(value) && !PRE_FINALIZATION_TERMINAL_PROGRESS_RE.test(value)
+  return Boolean(value) && !hasTerminalExecutionClaim(value)
     && !hasImmediateExecutionPromise(value);
 }
 
@@ -169,4 +171,46 @@ export function createPreFinalizationTextGate(): PreFinalizationTextGate {
       };
     },
   };
+}
+
+type LumiOutboundInput = OutboundExecutionFinalizationInput<LumiResultFinalizerResult>;
+export interface LumiResponseDeliveryInput extends LumiResultFinalizerInput,
+  Partial<Pick<LumiOutboundInput, 'allowToolUse' | 'attempt' | 'pendingConfirmation' | 'requiresFreshConfirmation' | 'aborted' | 'isPendingConfirmation' | 'isAborted' | 'trustedConfirmationRequestText'>> {
+  initialFinalization?: LumiResultFinalizerResult;
+  refinalize?: LumiOutboundInput['finalize'];
+}
+
+/** Shared result verification and bounded recovery; each channel supplies its scoped receipts. */
+export async function finalizeLumiResponseForDelivery(input: LumiResponseDeliveryInput) {
+  const toolRecords = input.toolRecords || [];
+  const finalize = (responseText: string, records: NonNullable<LumiResultFinalizerInput['toolRecords']>, source: string, completionGuard?: LumiResultFinalizerInput['completionGuard']) => finalizeLumiResponse({
+    taskText: input.taskText, responseText, toolRecords: records, source,
+    flow: input.flow, taskId: input.taskId, requestId: input.requestId, completionGuard,
+  });
+  const outbound = await finalizeExecutionForOutboundDelivery({
+    task: input.taskText,
+    publicContext: { requestId: input.requestId, taskId: input.taskId, completionRequest: {
+      currentText: input.taskText, rootText: extractPrimaryTaskText(input.flow?.routeText || input.flow?.rootTaskText || ''),
+    } },
+    responseText: input.responseText,
+    finalization: input.initialFinalization || finalize(input.responseText, toolRecords, input.source, input.completionGuard),
+    allowToolUse: input.allowToolUse === true,
+    pendingConfirmation: input.pendingConfirmation,
+    requiresFreshConfirmation: input.requiresFreshConfirmation,
+    aborted: input.aborted,
+    isPendingConfirmation: input.isPendingConfirmation,
+    trustedConfirmationRequestText: input.trustedConfirmationRequestText,
+    isAborted: input.isAborted,
+    toolRecords,
+    attempt: input.attempt,
+    finalize: input.refinalize || ((candidateText, records, completionGuard) => finalize(candidateText, records, `${input.source}_guard_recovery`, completionGuard)),
+  });
+  const publicContext = { taskId: input.taskId, requestId: input.requestId };
+  const publicEvidence = capturePublicArtifactEvidenceSnapshot(outbound.toolRecords, publicContext);
+  await observeFinalArchivedOutputIdentities(outbound.toolRecords, publicContext, publicEvidence);
+  // Apply the same public artifact verdict before the caller persists terminal status.
+  // Technical receipts remain successful; unavailable public delivery is not whole-task completion.
+  const finalization = projectPublicArtifactPayload(outbound.finalization, outbound.toolRecords, undefined,
+    publicContext, publicEvidence);
+  return { ...outbound, finalization, responseText: finalization.text };
 }

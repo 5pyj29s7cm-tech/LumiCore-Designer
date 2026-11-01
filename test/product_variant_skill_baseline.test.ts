@@ -3,7 +3,7 @@ import { PRODUCT_VARIANT } from '../shared/product_variant';
 import { selectNonDefaultVariantSkillsToDisable } from '../server/runtime/product_variant_skills';
 
 describe('product variant skill baseline', () => {
-  it('disables inherited built-in domain skills without touching edition defaults or external connectors', () => {
+  it('preserves inherited built-in domain skills and external connectors in the synchronized Designer runtime', () => {
     const configured: any = {
       'cad-drafting': { enabled: true, source: 'local' },
       'design-studio-pack': { enabled: true, source: 'local' },
@@ -21,6 +21,6 @@ describe('product variant skill baseline', () => {
     );
     expect(disabled).not.toContain('stockbot');
     for (const retained of PRODUCT_VARIANT.runtime.defaultSkills) expect(disabled).not.toContain(retained);
-    expect(disabled.length).toBeGreaterThan(0);
+    expect(disabled).toEqual([]);
   });
 });

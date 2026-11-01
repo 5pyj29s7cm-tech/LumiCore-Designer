@@ -2,6 +2,7 @@ import { executeToolCall } from '../tools/execution_engine';
 import type { ToolRegistry } from '../tools/registry';
 import type { ToolContext, ToolExecutionRecord } from '../tools/types';
 import { getIndustryWorkflowContract } from './workflow_contracts';
+import { getIndustryWorkflowTask, recordMatchesWorkflowBinding } from './workflow_service';
 
 function parseObject(value: unknown): Record<string, any> {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
@@ -78,18 +79,23 @@ export async function completeIndustryWorkflowFromVerifiedReceipts(input: {
     context.industryWorkflowEntryId,
   );
   const required = Array.from(new Set(
-    (context.industryWorkflowRequiredToolReceipts?.length
-      ? context.industryWorkflowRequiredToolReceipts
-      : contract?.requiredToolReceipts || [])
+    (contract?.requiredToolReceipts || [])
       .map(String)
       .filter(Boolean),
   ));
   if (!required.length) return null;
-  if (input.records.some(isVerifiedIndustryWorkflowCompletionRecord)) return null;
+  const taskId = String(context.industryWorkflowTaskId || '').trim() || taskIdFromStartRecord(input.records);
+  if (!taskId || !context.userId) return null;
+  const task = getIndustryWorkflowTask({userId: context.userId, domain: context.domain === 'work' ? 'work' : 'personal', orgId: context.domain === 'work' ? String(context.orgId || '') : ''}, taskId);
+  const metadata = task?.metadata?.industryWorkflow;
+  if (!task || metadata?.entryId !== contract?.entryId || metadata?.productLine !== contract?.productLine
+    || context.taskId !== metadata.conversationTaskId || context.requestId !== metadata.requestId) return null;
+  const scopedRecords = input.records.filter(record => recordMatchesWorkflowBinding(task, record));
+  if (scopedRecords.some(record => isVerifiedIndustryWorkflowCompletionRecord(record) && parseObject(parseObject(record.result).task).id === taskId)) return null;
 
   const latestRequiredRecords = required.map((name) => {
-    for (let index = input.records.length - 1; index >= 0; index -= 1) {
-      const record = input.records[index];
+    for (let index = scopedRecords.length - 1; index >= 0; index -= 1) {
+      const record = scopedRecords[index];
       if (record.name === name) return { index, record };
     }
     return { index: -1, record: undefined };
@@ -104,17 +110,13 @@ export async function completeIndustryWorkflowFromVerifiedReceipts(input: {
   // that result. Retry only when a newer required capability receipt arrives.
   const newestRequiredIndex = Math.max(...latestRequiredRecords.map(item => item.index));
   let latestCompletionAttemptIndex = -1;
-  for (let index = input.records.length - 1; index >= 0; index -= 1) {
-    if (input.records[index].name === 'industry_workflow_complete') {
+  for (let index = scopedRecords.length - 1; index >= 0; index -= 1) {
+    if (scopedRecords[index].name === 'industry_workflow_complete') {
       latestCompletionAttemptIndex = index;
       break;
     }
   }
   if (latestCompletionAttemptIndex >= newestRequiredIndex) return null;
-
-  const taskId = String(context.industryWorkflowTaskId || '').trim()
-    || taskIdFromStartRecord(input.records);
-  if (!taskId) return null;
 
   return executeToolCall({
     registry: input.registry,

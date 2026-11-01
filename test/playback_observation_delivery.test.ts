@@ -40,7 +40,7 @@ vi.mock('../server/conversation/summary_scheduler', async original => ({
 import { initDatabase, readDB, flushDBOrThrow } from '../db_layer';
 import { registerVoiceHandlers } from '../server/socket/voice';
 import { registerChatHandler } from '../server/socket/chat';
-import { getConversationActionStateFromLedger } from '../server/conversation/action_ledger';
+import { getConversationActionStateFromLedger } from "../server/conversation/ledger/queries";
 import { addMessage, getMessages, getOrCreateActiveConversation } from '../server/conversation/manager';
 import { buildTransportNeutralConfirmationScope, recordPendingConfirmationDurably } from '../server/tools/pending_confirmation';
 import { getChatExecution, waitForChatExecutionPersistence } from '../server/socket/chat_execution_registry';
@@ -48,7 +48,8 @@ import { toolRegistry } from '../server/tools/registry';
 import { registerComputerUseTool } from '../server/tools/definitions/computer_use_tool';
 import { capabilityContract } from '../server/tools/capability_contracts';
 import { buildPlaybackVerification, type PlaybackSample } from '../server/cognition/playback_verification';
-import { CN_EXECUTION_EVIDENCE_MESSAGES } from '../server/regions/packs/cn/execution_evidence_messages';
+import { saveStoredDesktopExecutionPreference } from '../server/cognition/operation_mode_store';
+import { CN_EXECUTION_EVIDENCE_MESSAGES } from "../server/regions/messages/execution_evidence_messages";
 
 const task = '用爱奇艺播放蜡笔小新第一集';
 const getter = () => ({});
@@ -115,6 +116,7 @@ describe('actual accepted voice task observes playback before its durable termin
     ['verified', false], ['advertisement', true], ['unknown', true], ['cancelled', true],
   ] as const)('delivers %s without premature success or repeating desktop control', async (outcome, blocked) => {
     const socket = new VoiceSocket(`playback-delivery-${randomUUID()}`);
+    await saveStoredDesktopExecutionPreference(socket.userId, 'external');
     const io = { to: () => ({ emit: (event: string, data: any) => socket.emit(event, data) }), emit: (event: string, data: any) => socket.emit(event, data) };
     registerVoiceHandlers(socket as any, llm as any, devices, () => socket.userId, io as any);
     const gate = deferred();
@@ -182,6 +184,7 @@ describe('actual accepted voice task observes playback before its durable termin
 describe('actual chat progress retains the current request during playback observation', () => {
   it.each(['normal', 'confirmation'] as const)('forwards waiting progress through the %s tool path', async path => {
     const userId = `chat-playback-${randomUUID()}`;
+    if (path === 'normal') await saveStoredDesktopExecutionPreference(userId, 'external');
     const conversation = getOrCreateActiveConversation(userId, 'lumi', 'personal', '');
     const requestId = `chat-playback-request-${randomUUID()}`;
     if (path === 'confirmation') {

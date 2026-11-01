@@ -35,7 +35,7 @@ vi.mock('../server/agents/rag', async importOriginal => {
 });
 
 import { initDatabase, readDB } from '../db_layer';
-import { getConversationActionStateByTaskId } from '../server/conversation/action_ledger';
+import { getConversationActionStateByTaskId } from "../server/conversation/ledger/queries";
 import { getConversationActionTurn } from '../server/conversation/action_turn_ledger';
 import { getOrCreateActiveConversation } from '../server/conversation/manager';
 import {
@@ -48,6 +48,7 @@ import {
 import { registerChatHandler } from '../server/socket/chat';
 import { registerAllTools } from '../server/tools/definitions';
 import { toolRegistry } from '../server/tools/registry';
+import { cancelConversationExecution, getConversationExecution } from '../server/cognition/conversation_execution';
 
 const LONG_COMMAND = '\u8bf7\u5b9e\u9645\u67e5\u770b\u5f53\u524d\u524d\u53f0\u7a97\u53e3\uff0c\u5fc5\u987b\u8c03\u7528\u684c\u9762\u89c2\u5bdf\u5de5\u5177\uff0c\u7136\u540e\u544a\u8bc9\u6211\u7a97\u53e3\u6807\u9898\u3002';
 
@@ -72,6 +73,15 @@ function waitForRequestEvent<T extends Record<string, any>>(
   });
 }
 
+async function bindSelectedFixtureTool(context: any) {
+  // runWithTools includes tool selection/entry; this held-tool fixture must use its real lazy owner.
+  const binding = await context.prepareSelectedToolCall();
+  Object.assign(context, binding);
+  expect(binding.taskId).toMatch(/^task_/u);
+  expect(binding.turnRowId).toBeTruthy();
+  expect(getConversationActionTurn({ userId: context.userId, conversationId: context.conversationId, requestId: context.requestId }))
+    .toMatchObject({ id: binding.turnRowId, taskId: binding.taskId, status: 'leased' });
+}
 describe('chat status/stop/repeat control chain', () => {
   const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const userId = `chat-control-chain-${suffix}`;
@@ -112,6 +122,7 @@ describe('chat status/stop/repeat control chain', () => {
         };
       }
       expect(context.requestId).toBe(longRequestId);
+      await bindSelectedFixtureTool(context);
       expect(signal).toBeInstanceOf(AbortSignal);
       releaseStarted();
       return new Promise(resolve => {
@@ -235,7 +246,7 @@ describe('chat status/stop/repeat control chain', () => {
       requestId: longRequestId,
       finalized: true,
       blocked: false,
-      reason: 'request_cancelled',
+      reason: 'cancelled',
     });
     expect(stopTerminal).toMatchObject({
       requestId: stopRequestId,
@@ -353,6 +364,7 @@ describe('chat status/stop/repeat control chain', () => {
       const signal = args[2]?.signal as AbortSignal | undefined;
       const context = args[11];
       expect(context.requestId).toBe(directAbortRequestId);
+      await bindSelectedFixtureTool(context);
       markDirectStarted();
       return new Promise(resolve => {
         const finishCancelled = () => resolve({
@@ -402,7 +414,7 @@ describe('chat status/stop/repeat control chain', () => {
       requestId: directAbortRequestId,
       finalized: true,
       blocked: false,
-      reason: 'request_cancelled',
+      reason: 'cancelled',
     });
     expect(events.filter(item => (
       item.event === 'agent:response'
@@ -419,4 +431,40 @@ describe('chat status/stop/repeat control chain', () => {
     expect(getChatExecution({ ...scope, conversationId }, directAbortRequestId))
       .toMatchObject({ terminal: true, status: 'cancelled' });
   });
+  it('stops the accepted active request while preserving an unrelated queued conversation', async () => {
+    const liveId = 'active-with-queued-' + suffix, queuedId = 'unrelated-queued-' + suffix, stopId = 'stop-active-with-queued-' + suffix;
+    const resource = { ...scope, conversationId };
+    let liveSignal: AbortSignal | undefined;
+    mocks.runWithTools.mockImplementationOnce(async (...args: any[]) => {
+      expect(args[11].requestId).toBe(liveId);
+      await bindSelectedFixtureTool(args[11]);
+      liveSignal = args[2].signal;
+      return new Promise(resolve => {
+        const finish = () => resolve({ text: 'Task was cancelled before the model response could be applied.', toolCalls: [], usageRecords: [] });
+        if (liveSignal!.aborted) finish(); else liveSignal!.addEventListener('abort', finish, { once: true });
+      });
+    });
+    const story = 'A small cloud drifted quietly across the sky.';
+    mocks.runWithTools.mockResolvedValueOnce({ text: story, toolCalls: [], usageRecords: [] });
+    const liveTerminal = waitForRequestEvent<Record<string, any>>(client, 'agent:response', liveId);
+    let queuedTerminal: Promise<Record<string, any>> | undefined;
+    try {
+      expect(await client.timeout(5_000).emitWithAck('agent:chat', { text: LONG_COMMAND, source: scope.source, requestId: liveId, conversationId })).toMatchObject({ ok: true });
+      await vi.waitFor(() => expect(liveSignal).toBeDefined());
+      queuedTerminal = waitForRequestEvent<Record<string, any>>(client, 'agent:response', queuedId);
+      expect(await client.timeout(5_000).emitWithAck('agent:chat', { text: 'Tell me a brief story about a small cloud.', source: scope.source, requestId: queuedId, conversationId })).toMatchObject({ ok: true });
+      expect(getConversationExecution(resource, queuedId)?.state).toBe('queued');
+      const stopTerminal = waitForRequestEvent<Record<string, any>>(client, 'agent:response', stopId);
+      expect(await client.timeout(5_000).emitWithAck('agent:chat', { text: '停止', source: scope.source, requestId: stopId, conversationId })).toMatchObject({ ok: true });
+      expect(await stopTerminal).toMatchObject({ reason: 'cancelled_by_user' });
+      expect(liveSignal!.aborted).toBe(true);
+      expect(getChatSidecarCancellationTarget(resource, stopId)).toBe(liveId);
+      expect(await liveTerminal).toMatchObject({ reason: 'cancelled' });
+      expect(await queuedTerminal).toMatchObject({ finalized: true, blocked: false, text: story });
+    } finally {
+      await cancelConversationExecution(resource, liveId);
+      await Promise.allSettled([liveTerminal, ...(queuedTerminal ? [queuedTerminal] : [])]);
+    }
+  });
+
 });

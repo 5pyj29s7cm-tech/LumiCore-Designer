@@ -1,3 +1,4 @@
+import { normalizePromptBlockMessages } from './prompt_blocks';
 import type { MessageContent, NormalizedMessage } from './providers';
 
 export interface ModelRequestToolDeclaration {
@@ -29,26 +30,20 @@ export interface PreparedModelRequestContext {
 export class ModelRequestSourceProvenanceError extends Error {
   readonly code = 'model_request_source_provenance_invalid';
 
-  constructor(message: string) {
+  constructor(message: string, readonly capacityExceeded = false) {
     super(message);
     this.name = 'ModelRequestSourceProvenanceError';
   }
 }
 
-export const DEFAULT_MODEL_REQUEST_INPUT_BUDGET_TOKENS = 24_000;
-const MIN_MODEL_REQUEST_INPUT_BUDGET_TOKENS = 4_096;
-const MAX_MODEL_REQUEST_INPUT_BUDGET_TOKENS = 131_072;
 const IMAGE_INPUT_TOKEN_ESTIMATE = 1_100;
 
+/** No implicit application cap. Actual candidate capacity is applied at the provider boundary. */
 export function resolveModelRequestInputBudget(value?: unknown): number {
-  const configured = Number(value ?? process.env.LUMI_MODEL_INPUT_TOKEN_BUDGET);
-  const selected = Number.isFinite(configured) && configured > 0
-    ? Math.trunc(configured)
-    : DEFAULT_MODEL_REQUEST_INPUT_BUDGET_TOKENS;
-  return Math.max(
-    MIN_MODEL_REQUEST_INPUT_BUDGET_TOKENS,
-    Math.min(MAX_MODEL_REQUEST_INPUT_BUDGET_TOKENS, selected),
-  );
+  const explicit = [value, process.env.LUMI_MODEL_INPUT_TOKEN_BUDGET]
+    .map(candidate => Math.trunc(Number(candidate)))
+    .filter(candidate => Number.isSafeInteger(candidate) && candidate > 0);
+  return explicit.length ? Math.min(...explicit) : Infinity;
 }
 
 /** Conservative mixed-language estimate used before the provider sees data. */
@@ -146,12 +141,18 @@ function clipContentToTokens(content: MessageContent, budget: number, label: str
     : part);
 }
 
-function compactMessage(message: NormalizedMessage, budget: number, label: string): NormalizedMessage {
-  const fixedTokens = 8 + estimateModelRequestTextTokens(JSON.stringify(message.toolCalls || []));
+function compactMessage(message: NormalizedMessage, budget: number, label: string, preserveAssistantReasoning = false): NormalizedMessage {
+  if (message.promptBlock?.required) {
+    if (messageTokens(message) > budget) throw new Error('Model request budget cannot retain required prompt block ' + message.promptBlock.id);
+    return { ...message };
+  }
+  const reasoningContent = preserveAssistantReasoning ? message.reasoningContent : null;
+  const fixedTokens = 8 + estimateModelRequestTextTokens(JSON.stringify(message.toolCalls || []))
+    + estimateModelRequestTextTokens(reasoningContent || '');
   return {
     ...message,
     content: clipContentToTokens(message.content, Math.max(1, budget - fixedTokens), label),
-    reasoningContent: null,
+    reasoningContent,
   };
 }
 
@@ -215,6 +216,13 @@ function compactSystemBlock(value: string, budget: number): string {
 }
 
 function compactSystemMessage(message: NormalizedMessage, budget: number): NormalizedMessage {
+  if (message.promptBlock?.required) return compactMessage(message, budget, message.promptBlock.kind);
+  if (message.promptBlock) {
+    // Typed optional context has no authority to promote itself with safety keywords.
+    const compacted = compactMessage(message, budget, message.promptBlock.kind);
+    return { ...compacted, promptBlock: { ...message.promptBlock, content: String(compacted.content || ''),
+      fields: undefined, requiredFields: undefined } };
+  }
   if (typeof message.content !== 'string') return compactMessage(message, budget, 'system message');
   if (messageTokens(message) <= budget) return { ...message };
   const blocks = message.content.split(/\n{2,}/).map(block => block.trim()).filter(Boolean);
@@ -381,6 +389,65 @@ function messageText(message: NormalizedMessage | undefined): string {
   return message.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
 }
 
+function toolContinuationBatches(
+  messages: NormalizedMessage[],
+): number[][] {
+  const batches: Array<{
+    assistantIndex: number;
+    callIds: string[];
+    resultIndexes: number[];
+    seenResultIds: Set<string>;
+  }> = [];
+  const batchByCallId = new Map<string, typeof batches[number]>();
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    // Provider call IDs identify calls within one assistant batch, not the whole history.
+    if (message.role === 'assistant' || message.role === 'user') batchByCallId.clear();
+    if (message.role === 'assistant' && (message.toolCalls || []).length > 0) {
+      const calls = message.toolCalls || [];
+      const callIds = calls.map(call => String(call.id || '').trim());
+      if (
+        callIds.some(id => !id)
+        || new Set(callIds).size !== callIds.length
+      ) {
+        throw new ModelRequestSourceProvenanceError(
+          'Model request preflight blocked a malformed assistant tool_call batch; every call must have one unique id.',
+        );
+      }
+      const batch = {
+        assistantIndex: index,
+        callIds,
+        resultIndexes: [],
+        seenResultIds: new Set<string>(),
+      };
+      batches.push(batch);
+      for (const id of callIds) batchByCallId.set(id, batch);
+      continue;
+    }
+    if (message.role === 'tool') {
+      const resultId = String(message.toolCallId || '').trim();
+      const batch = resultId ? batchByCallId.get(resultId) : undefined;
+      if (!batch || batch.seenResultIds.has(resultId)) {
+        throw new ModelRequestSourceProvenanceError(
+          'Model request preflight blocked an orphan or duplicate tool receipt; assistant tool_call and tool receipts are an indivisible boundary.',
+        );
+      }
+      batch.seenResultIds.add(resultId);
+      batch.resultIndexes.push(index);
+    }
+  }
+
+  for (const batch of batches) {
+    if (batch.callIds.some(id => !batch.seenResultIds.has(id))) {
+      throw new ModelRequestSourceProvenanceError(
+        'Model request preflight blocked an incomplete tool continuation; every assistant tool_call requires its matching tool receipt.',
+      );
+    }
+  }
+  return batches.map(batch => [batch.assistantIndex, ...batch.resultIndexes]);
+}
+
 function historySegments(messages: NormalizedMessage[], excluded: Set<number>): number[][] {
   const segments: number[][] = [];
   let current: number[] = [];
@@ -400,6 +467,7 @@ function compactHistorySegment(
   messages: NormalizedMessage[],
   indexes: number[],
   budget: number,
+  preserveAssistantReasoning = false,
 ): Array<[number, NormalizedMessage]> {
   const selected: Array<[number, NormalizedMessage]> = [];
   let remaining = budget;
@@ -408,9 +476,13 @@ function compactHistorySegment(
     const original = messages[index];
     const remainingMessages = indexes.length - position;
     const share = Math.max(24, Math.floor(remaining / Math.max(1, remainingMessages)));
+    // An opaque reasoning field belongs to this exact assistant message.
+    // Optional history may omit it as a whole, never pair it with clipped text.
+    if (preserveAssistantReasoning && original.role === 'assistant' && original.reasoningContent
+      && messageTokens(original) > remaining) continue;
     const candidate = messageTokens(original) <= remaining
-      ? { ...original, reasoningContent: null }
-      : compactMessage(original, Math.min(remaining, share), `${original.role} history`);
+      ? { ...original, ...(preserveAssistantReasoning ? {} : { reasoningContent: null }) }
+      : compactMessage(original, Math.min(remaining, share), `${original.role} history`, preserveAssistantReasoning);
     const cost = messageTokens(candidate);
     if (cost > remaining) continue;
     selected.push([index, candidate]);
@@ -429,6 +501,12 @@ export function prepareModelRequestContext(input: {
   messages: NormalizedMessage[];
   toolDeclarations: ModelRequestToolDeclaration[];
   inputTokenBudget?: number;
+  /** Observed provider capacity may be smaller than the configured input budget. */
+  maxInputTokens?: number;
+  /** Local replay retains the complete latest tool-call/receipt batch or fails. */
+  atomicToolProtocol?: boolean;
+  /** DeepSeek tool requests retain opaque assistant reasoning unchanged for every retained message. */
+  preserveAssistantReasoning?: boolean;
   /**
    * Declaration names selected by the server execution plan that must reach
    * the provider unchanged. Optional schemas may be ranked away, but a
@@ -437,8 +515,9 @@ export function prepareModelRequestContext(input: {
    */
   protectedToolNames?: readonly string[];
 }): PreparedModelRequestContext {
-  const budgetTokens = resolveModelRequestInputBudget(input.inputTokenBudget);
-  const originalMessages = (input.messages || []).map(message => ({ ...message }));
+  const budgetTokens = Math.min(resolveModelRequestInputBudget(input.inputTokenBudget), input.maxInputTokens ?? Infinity);
+  if ((budgetTokens !== Infinity && !Number.isSafeInteger(budgetTokens)) || budgetTokens < 128) throw new Error('Model request has insufficient input capacity.');
+  const originalMessages = normalizePromptBlockMessages(input.messages || []);
   const originalTools = (input.toolDeclarations || []).map(declaration => ({
     ...declaration,
     function: { ...declaration.function, parameters: { ...(declaration.function.parameters || {}) } },
@@ -447,6 +526,7 @@ export function prepareModelRequestContext(input: {
     (input.protectedToolNames || []).map(name => String(name || '').trim()).filter(Boolean),
   );
   const sourceUserIndex = resolveAnnotatedSourceUserIndex(originalMessages);
+  const protocolBatches = input.atomicToolProtocol || input.preserveAssistantReasoning ? toolContinuationBatches(originalMessages) : [];
   const originalEstimatedInputTokens = estimateModelRequestInputTokens(originalMessages, originalTools);
   if (originalEstimatedInputTokens <= budgetTokens) {
     return {
@@ -465,8 +545,26 @@ export function prepareModelRequestContext(input: {
   for (let index = originalMessages.length - 1; index >= 0; index -= 1) {
     if (originalMessages[index].role === 'user') { latestUserIndex = index; break; }
   }
-  const protectedUserIndexes = [sourceUserIndex, latestUserIndex]
-    .filter((index, position, indexes) => index >= 0 && indexes.indexOf(index) === position);
+  const lastBatch = protocolBatches.at(-1) || [];
+  const acceptedTurnUserIndex = sourceUserIndex >= 0 ? sourceUserIndex : latestUserIndex;
+  // A completed older batch has already been consumed by a later model turn.
+  // Keep the current continuation immutable; older batches may yield only as
+  // complete assistant/call/receipt units, never as clipped opaque reasoning.
+  const continuationUserIndex = input.preserveAssistantReasoning ? acceptedTurnUserIndex : latestUserIndex;
+  const lastBatchConsumed = lastBatch.length > 0 && originalMessages.slice(Math.max(...lastBatch) + 1)
+    .some(message => message.role === 'assistant' && !message.toolCalls?.length);
+  const continuationIndexes = lastBatch.length && !lastBatchConsumed
+    && (continuationUserIndex < 0 || lastBatch[0] > continuationUserIndex) ? lastBatch : [];
+  const continuationCost = continuationIndexes.reduce((sum, index) => sum + messageTokens(originalMessages[index]), 0);
+  const requiredUserIndexes = originalMessages.map((message, index) => message.role === 'user' && message.promptBlock?.required ? index : -1);
+  const protectedUserIndexes = [sourceUserIndex, latestUserIndex, ...requiredUserIndexes]
+    .filter((index, position, indexes) => index >= 0 && indexes.indexOf(index) === position).sort((left, right) => left - right);
+  // The accepted user instruction owns its facts and prohibitions in full.
+  // Optional schemas and prose may yield; a synthetic follow-up cannot shrink it.
+  const minimumUserCost = (index: number) => index === acceptedTurnUserIndex || originalMessages[index].promptBlock?.required
+    ? messageTokens(originalMessages[index])
+    : Math.min(64, messageTokens(originalMessages[index]));
+  const minimumProtectedUserCost = protectedUserIndexes.reduce((sum, index) => sum + minimumUserCost(index), 0);
   const systemIndexes = originalMessages
     .map((message, index) => message.role === 'system' ? index : -1)
     .filter(index => index >= 0);
@@ -476,10 +574,12 @@ export function prepareModelRequestContext(input: {
     .join('\n');
   const originalCurrentCost = protectedUserIndexes
     .reduce((sum, index) => sum + messageTokens(originalMessages[index]), 0);
+  const requiredSystemCost = systemIndexes.reduce((sum, index) => sum + (originalMessages[index].promptBlock?.required
+    ? Math.max(messageTokens(originalMessages[index]), originalMessages[index].promptBlock!.minBudget || 0) : 32), 0);
   const minimumSystemBudget = systemIndexes.length > 0
     ? Math.min(
         originalMessages.filter(message => message.role === 'system').reduce((sum, message) => sum + messageTokens(message), 0),
-        Math.max(768, Math.floor(budgetTokens * 0.22)),
+        Math.max(requiredSystemCost, 768, Math.floor(budgetTokens * 0.22)),
       )
     : 0;
   const baseToolBudget = originalTools.length > 0
@@ -494,12 +594,13 @@ export function prepareModelRequestContext(input: {
       .filter(item => protectedToolNames.has(item.declaration.function.name))
       .map(item => item.declaration),
   );
-  const minimumProtectedMessageBudget = protectedUserIndexes.length * 64
-    + (systemIndexes.length > 0 ? minimumSystemBudget : 0);
+  const minimumProtectedMessageBudget = minimumProtectedUserCost
+    + (systemIndexes.length > 0 ? minimumSystemBudget : 0) + continuationCost;
+  if (minimumProtectedMessageBudget > budgetTokens) throw new ModelRequestSourceProvenanceError('Model request budget cannot retain required prompt blocks and the complete assistant tool_call/tool receipt boundary.', true);
   const maximumToolBudget = Math.max(0, budgetTokens - minimumProtectedMessageBudget);
   if (protectedToolCost > maximumToolBudget) {
-    throw new Error(
-      `Model request budget cannot retain ${protectedToolNames.size} protected tool declarations and protected messages`,
+    throw new ModelRequestSourceProvenanceError(
+      `Model request budget cannot retain ${protectedToolNames.size} protected tool declarations and protected messages`, true,
     );
   }
   const toolBudget = originalTools.length > 0
@@ -514,23 +615,22 @@ export function prepareModelRequestContext(input: {
   const tools = toolSelection.selected;
   const toolCost = declarationTokens(tools);
 
-  const selected = new Map<number, NormalizedMessage>();
-  const availableForMessages = Math.max(256, budgetTokens - toolCost);
+  const selected = new Map<number, NormalizedMessage>(continuationIndexes.map(index => [index, { ...originalMessages[index] }]));
+  const availableForMessages = Math.max(0, budgetTokens - toolCost);
   const currentBudget = protectedUserIndexes.length > 0
-    ? Math.max(0, availableForMessages - minimumSystemBudget)
+    ? Math.max(0, availableForMessages - minimumSystemBudget - continuationCost)
     : 0;
-  if (protectedUserIndexes.length > 0 && currentBudget < protectedUserIndexes.length * 64) {
+  if (protectedUserIndexes.length > 0 && currentBudget < minimumProtectedUserCost) {
     throw new ModelRequestSourceProvenanceError(
-      `Model request budget cannot retain ${protectedUserIndexes.length} protected user messages`,
+      `Model request budget cannot retain ${protectedUserIndexes.length} protected user messages`, true,
     );
   }
   let currentInputCompacted = false;
   let remainingCurrentBudget = currentBudget;
   for (const [position, index] of protectedUserIndexes.entries()) {
     const current = originalMessages[index];
-    const protectedLeft = protectedUserIndexes.length - position - 1;
-    const reservedForLater = protectedLeft * 64;
-    const messageBudget = Math.max(64, remainingCurrentBudget - reservedForLater);
+    const reservedForLater = protectedUserIndexes.slice(position + 1).reduce((sum, later) => sum + minimumUserCost(later), 0);
+    const messageBudget = Math.max(minimumUserCost(index), remainingCurrentBudget - reservedForLater);
     const label = index === sourceUserIndex && index !== latestUserIndex
       ? 'annotated source user input'
       : index === latestUserIndex && index !== sourceUserIndex
@@ -542,7 +642,7 @@ export function prepareModelRequestContext(input: {
     const preparedCost = messageTokens(preparedCurrent);
     if (preparedCost > messageBudget) {
       throw new ModelRequestSourceProvenanceError(
-        `Model request budget could not retain protected user message ${index}`,
+        `Model request budget could not retain protected user message ${index}`, true,
       );
     }
     currentInputCompacted ||= messageTokens(current) > preparedCost;
@@ -552,31 +652,43 @@ export function prepareModelRequestContext(input: {
 
   let usedMessageTokens = [...selected.values()].reduce((sum, message) => sum + messageTokens(message), 0);
   let remaining = Math.max(0, availableForMessages - usedMessageTokens);
-  const excluded = new Set([...systemIndexes, ...protectedUserIndexes]);
+  const excluded = new Set([...systemIndexes, ...protectedUserIndexes, ...protocolBatches.flat()]);
   const segments = historySegments(originalMessages, excluded);
-  const hasHistory = segments.length > 0;
+  const olderProtocolBatches = protocolBatches.filter(batch => !batch.some(index => continuationIndexes.includes(index)));
+  const atomicHistory = new Set(olderProtocolBatches);
+  const historyUnits = [...segments, ...olderProtocolBatches].sort((left, right) => left[0] - right[0]);
+  const hasHistory = historyUnits.length > 0;
   const systemBudget = systemIndexes.length > 0
     ? Math.min(remaining, hasHistory ? Math.max(minimumSystemBudget, Math.floor(remaining * 0.72)) : remaining)
     : 0;
   let remainingSystemBudget = systemBudget;
   for (const [position, index] of systemIndexes.entries()) {
     const systemsLeft = systemIndexes.length - position;
-    const share = Math.max(32, Math.floor(remainingSystemBudget / Math.max(1, systemsLeft)));
+    const requiredLater = systemIndexes.slice(position + 1).reduce((sum, later) => sum + (originalMessages[later].promptBlock?.required
+      ? Math.max(messageTokens(originalMessages[later]), originalMessages[later].promptBlock!.minBudget || 0) : 0), 0);
+    const capacity = Math.max(0, remainingSystemBudget - requiredLater);
+    const share = originalMessages[index].promptBlock?.required
+      ? capacity
+      : Math.min(capacity, Math.max(32, Math.floor(remainingSystemBudget / Math.max(1, systemsLeft))));
     const prepared = compactSystemMessage(originalMessages[index], share);
     const cost = messageTokens(prepared);
-    if (cost > remainingSystemBudget) continue;
+    // Compaction markers still cost tokens; optional prose cannot consume
+    // the budget already reserved for a later required system block.
+    if (cost > capacity) continue;
     selected.set(index, prepared);
     remainingSystemBudget -= cost;
   }
   usedMessageTokens = [...selected.values()].reduce((sum, message) => sum + messageTokens(message), 0);
   remaining = Math.max(0, availableForMessages - usedMessageTokens);
 
-  for (let segmentIndex = segments.length - 1; segmentIndex >= 0 && remaining >= 32; segmentIndex -= 1) {
-    const indexes = segments[segmentIndex];
+  for (let segmentIndex = historyUnits.length - 1; segmentIndex >= 0 && remaining >= 32; segmentIndex -= 1) {
+    const indexes = historyUnits[segmentIndex];
     const fullCost = indexes.reduce((sum, index) => sum + messageTokens(originalMessages[index]), 0);
+    // Dropping a consumed batch is valid; retaining only part of it is not.
+    if (atomicHistory.has(indexes) && fullCost > remaining) continue;
     const prepared = fullCost <= remaining
-      ? indexes.map(index => [index, { ...originalMessages[index], reasoningContent: null }] as [number, NormalizedMessage])
-      : compactHistorySegment(originalMessages, indexes, remaining);
+      ? indexes.map(index => [index, { ...originalMessages[index], ...(input.preserveAssistantReasoning ? {} : { reasoningContent: null }) }] as [number, NormalizedMessage])
+      : compactHistorySegment(originalMessages, indexes, remaining, input.preserveAssistantReasoning);
     const cost = prepared.reduce((sum, [, message]) => sum + messageTokens(message), 0);
     if (cost > remaining) continue;
     for (const [index, message] of prepared) selected.set(index, message);

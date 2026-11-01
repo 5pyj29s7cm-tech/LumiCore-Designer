@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { readDB, writeDB } from '../../db_layer';
+import { readDatabaseTables, commitDatabaseTables } from '../../db_layer';
 import type { WorkTakeoverArtifact } from '../work_takeover/tasks';
 import type { WorkTakeoverResultVerification } from '../work_takeover/result_verifier';
 import type { InteriorProject, InteriorProjectStatus } from './projects';
@@ -174,7 +174,7 @@ export function getInteriorProjectWorkflow(
   orgId: string,
   projectId: string,
 ): InteriorProjectWorkflowState | null {
-  const project = findProject(readDB(), orgId, projectId);
+  const project = findProject(readDatabaseTables(['interiorProjects']), orgId, projectId);
   return project ? cloneWorkflow(project.workflow) : null;
 }
 
@@ -228,7 +228,7 @@ export function linkInteriorProjectWorkflowStage(input: {
   rootConversationId: string;
   rootTaskId: string;
 }): InteriorProjectWorkflowState {
-  const db = readDB();
+  const db = readDatabaseTables(['interiorProjects']);
   const project = findProject(db, input.orgId, input.projectId);
   if (!project) throw new Error('Interior project not found in the active workflow scope.');
   const timestamp = nowIso();
@@ -257,7 +257,7 @@ export function linkInteriorProjectWorkflowStage(input: {
   };
   project.workflow = workflow;
   project.updatedAt = timestamp;
-  writeDB(db);
+  commitDatabaseTables(db);
   return cloneWorkflow(workflow);
 }
 
@@ -288,7 +288,7 @@ export function settleInteriorProjectWorkflowStage(input: {
   artifacts: WorkTakeoverArtifact[];
   verification: WorkTakeoverResultVerification;
 }): InteriorProjectWorkflowState {
-  const db = readDB();
+  const db = readDatabaseTables(['interiorProjects']);
   const project = findProject(db, input.orgId, input.projectId);
   if (!project) throw new Error('Interior project not found while settling workflow stage.');
   const timestamp = nowIso();
@@ -337,7 +337,7 @@ export function settleInteriorProjectWorkflowStage(input: {
     project.status = mostAdvancedProjectStatus(project.status, STAGE_PROJECT_STATUS[input.entryId]);
   }
   project.updatedAt = timestamp;
-  writeDB(db);
+  commitDatabaseTables(db);
   return cloneWorkflow(workflow);
 }
 

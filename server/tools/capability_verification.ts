@@ -118,7 +118,7 @@ function valuesEqual(actual: unknown, expected: unknown): boolean {
   return false;
 }
 
-function localArtifactExists(candidate: unknown): boolean {
+export function localArtifactExists(candidate: unknown): boolean {
   if (typeof candidate !== 'string' || !candidate.trim() || /^https?:\/\//i.test(candidate)) return false;
   const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(candidate);
   try {
@@ -130,8 +130,8 @@ function localArtifactExists(candidate: unknown): boolean {
 
 function artifactExists(payload: unknown, rawResult: string): boolean {
   const declaredCandidates = collectValues(payload, (key, item) => (
-    PATH_KEYS.test(key) && typeof item === 'string'
-  )).map(value => String(value).trim());
+    PATH_KEYS.test(key) && (typeof item === 'string' || Array.isArray(item))
+  )).flat().filter((value): value is string => typeof value === 'string').map(value => value.trim());
   const rawCandidates = Array.from(rawResult.matchAll(RAW_ARTIFACT_PATH_RE), match => match[0].trim());
   const candidates = Array.from(new Set([...declaredCandidates, ...rawCandidates]));
   return candidates.some(localArtifactExists);

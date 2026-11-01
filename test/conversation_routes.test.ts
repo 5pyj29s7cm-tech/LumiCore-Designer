@@ -91,6 +91,33 @@ describe('conversation session routes', () => {
     expect(history.conversations.find((item: any) => item.id === second.conversation.id)?.status).toBe('closed');
   });
 
+  it('isolates creation history and search while preserving the active chat', async () => {
+    const activeBefore = await (await fetch(url + '/api/conversations/active?domain=personal&agentId=lumi', { headers: headers() })).json();
+    const createdResponse = await fetch(url + '/api/conversations/new?domain=personal&agentId=lumi&surface=creation', {
+      method: 'POST', headers: headers(), body: JSON.stringify({ agentId: 'lumi' }),
+    });
+    expect(createdResponse.status).toBe(201);
+    const { conversation } = await createdResponse.json();
+    expect(conversation).toMatchObject({ surface: 'creation', status: 'closed' });
+    const { addMessageIdempotent } = await import('../server/conversation/manager');
+    addMessageIdempotent({ userId: conversation.userId, agentId: 'lumi', conversationId: conversation.id,
+      role: 'user', content: 'isolated-creative-search-needle', requestId: crypto.randomUUID(), source: 'ai-creation', channel: 'chat', domain: 'personal', orgId: '', deferActionPreparation: true });
+    const normalHistory = await (await fetch(url + '/api/conversations?domain=personal&agentId=lumi&limit=1', { headers: headers() })).json();
+    expect(normalHistory.conversations.some((row: any) => row.id === conversation.id)).toBe(false);
+    const creationHistory = await (await fetch(url + '/api/conversations?domain=personal&agentId=lumi&surface=creation', { headers: headers() })).json();
+    expect(creationHistory.conversations.map((row: any) => row.id)).toContain(conversation.id);
+    const activeCreation = await (await fetch(url + '/api/conversations/active?domain=personal&agentId=lumi&surface=creation', { headers: headers() })).json();
+    expect(activeCreation.activeConversation?.id).toBe(conversation.id);
+    const normalSearch = await (await fetch(url + '/api/conversations/search?domain=personal&agentId=lumi&q=isolated-creative-search-needle', { headers: headers() })).json();
+    const creationSearch = await (await fetch(url + '/api/conversations/search?domain=personal&agentId=lumi&surface=creation&q=isolated-creative-search-needle', { headers: headers() })).json();
+    expect(normalSearch.results).toEqual([]);
+    expect(creationSearch.results).toHaveLength(1);
+    const activate = await fetch(url + '/api/conversations/' + conversation.id + '/activate?domain=personal&agentId=lumi', { method: 'POST', headers: headers(), body: JSON.stringify({ agentId: 'lumi' }) });
+    expect(activate.status).toBe(404);
+    const activeAfter = await (await fetch(url + '/api/conversations/active?domain=personal&agentId=lumi', { headers: headers() })).json();
+    expect(activeAfter.activeConversation?.id).toBe(activeBefore.activeConversation?.id);
+  });
+
   it('protects new and activate operations with authentication', async () => {
     const createResponse = await fetch(`${url}/api/conversations/new`, { method: 'POST' });
     const activateResponse = await fetch(`${url}/api/conversations/not-found/activate`, { method: 'POST' });
@@ -98,21 +125,26 @@ describe('conversation session routes', () => {
     expect(activateResponse.status).toBe(401);
   });
 
-  it('projects legacy verifier prose before conversation history reaches a customer', async () => {
+  it('preserves ordinary diagnostic prose before conversation history reaches a customer', async () => {
     const { projectConversationMessageForCustomer } = await import('../server/routes/conversations');
-    const projected = projectConversationMessageForCustomer({
-      role: 'assistant',
-      message: [
+    const message = [
         '状态：失败。',
         '证据：Desktop target application has not matched a fresh observation.',
         '具体阻塞：Desktop execution ended as target_mismatch.',
-      ].join('\n'),
-    });
+    ].join('\n');
+    const projected = projectConversationMessageForCustomer({ role: 'assistant', message });
+    expect(projected.message).toBe(message);
+  });
 
-    expect(projected.message).toBe(
-      '刚才没有完成，因为操作后的窗口和目标不一致。请把目标窗口保持在前台，再让我重试。',
-    );
-    expect(projected.message).not.toMatch(/状态|证据|target_mismatch|desktop_/iu);
+  it('removes explicit tool-protocol blocks while preserving surrounding diagnostic prose', async () => {
+    const { projectConversationMessageForCustomer } = await import('../server/routes/conversations');
+    const before = 'The active target changed.\n';
+    const after = '\nPlease keep the requested window in the foreground.';
+    const protocol = '<tool_calls><invoke name="desktop_open"><parameter name="target">test-app</parameter></invoke></tool_calls>';
+    const projected = projectConversationMessageForCustomer({ role: 'assistant', message: before + protocol + after });
+    expect(projected.message).toBe(before + after);
+    expect(projected.message).not.toContain('<tool_calls>');
+    expect(projected.message).not.toContain('test-app');
   });
 
   it('creates and deletes an explicitly-bound isolated conversation without moving the personal active pointer', async () => {

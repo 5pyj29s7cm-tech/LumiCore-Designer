@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { designerLifecycleCopy } from '../../i18n/locales/designerLifecycle';
 import { FolderOpen, Loader2, Pencil, Plus, Save, X } from 'lucide-react';
 import {
   createInteriorProject,
@@ -59,6 +60,7 @@ export function InteriorProjectPanel({ domain, locale, onProjectChange }: Interi
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const [reload, setReload] = useState(0);
 
   const selectedProject = useMemo(
     () => projects.find(project => project.id === selectedId) || null,
@@ -67,7 +69,9 @@ export function InteriorProjectPanel({ domain, locale, onProjectChange }: Interi
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([listInteriorProjects(domain), getActiveInteriorProject(domain)])
+    const controller = new AbortController();
+    setLoading(true); setError('');
+    Promise.all([listInteriorProjects(domain, controller.signal), getActiveInteriorProject(domain, controller.signal)])
       .then(([items, activeProject]) => {
         if (cancelled) return;
         setProjects(items);
@@ -81,10 +85,10 @@ export function InteriorProjectPanel({ domain, locale, onProjectChange }: Interi
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
-    return () => { cancelled = true; };
+    return () => { cancelled = true; controller.abort(); };
   // The initial project load is scoped to the mounted workspace and locale.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [domain, locale]);
+  }, [domain, locale, reload]);
 
   const chooseProject = async (projectId: string) => {
     const project = projects.find(item => item.id === projectId) || null;
@@ -193,7 +197,7 @@ export function InteriorProjectPanel({ domain, locale, onProjectChange }: Interi
           </button>
         </div>
 
-        {error && <p className="mt-3 text-xs text-rose-300/90">{error}</p>}
+        {error && <div role="alert" className="mt-3 text-xs text-rose-300/90"><p>{error}</p><button type="button" disabled={loading} onClick={() => setReload(value => value + 1)} className="lumi-button mt-2">{designerLifecycleCopy(locale).retry}</button><p>{designerLifecycleCopy(locale).refreshOnly}</p></div>}
         {!loading && !selectedProject && !error && (
           <p className="mt-3 text-xs leading-relaxed text-cyan-100/45">{m('projectRequiredDescription')}</p>
         )}

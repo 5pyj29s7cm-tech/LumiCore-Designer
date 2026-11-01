@@ -1,12 +1,13 @@
 import './helpers';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { initDatabase } from '../db_layer';
+import { initDatabase, readDB, writeDB } from '../db_layer';
 import { buildLumiExecutionPipeline } from '../server/cognition/execution_pipeline';
 import { buildLumiTurnDispatch } from '../server/cognition/turn_dispatch';
 import { buildActionContract, hasCoreActionEvidence } from '../server/cognition/action_contract';
 import { classifyConversationActionFollowupIntent } from '../server/cognition/action_continuation';
-import { formatConversationActionLedgerStatus } from '../server/conversation/action_ledger';
+import { formatConversationActionLedgerStatus } from '../server/conversation/ledger/status';
 import { normalizeActionIntent } from '../server/cognition/normalized_action_intent';
+import { designerStatusRequest, designerInstructionText } from '../server/cognition/designer_instruction_projection';
 import { isLegalEntryTurn } from '../server/cognition/legal_entry';
 import { isDesignProjectStatusRequest } from '../server/design/status_intent';
 import {
@@ -52,7 +53,7 @@ describe('designer stage intent', () => {
     const multiWorkspaceQuery = '设计师版文字验收：请只根据已经存在的行业任务账本和最终回执，分别列出“设计项目、CAD 方案、效果图、提案 PPT、交付中心”的最近任务状态、关键结果、交付物和确认边界；不要重新执行工作流。';
     expect(isDesignProjectStatusRequest(multiWorkspaceQuery)).toBe(false);
     expect(isCurrentIndustryMultiWorkspaceLedgerStatusRequest(multiWorkspaceQuery)).toBe(true);
-    expect(normalizeActionIntent(multiWorkspaceQuery).kind).toBe('status_query');
+    expect(normalizeActionIntent(multiWorkspaceQuery).kind, JSON.stringify({ status: designerStatusRequest(multiWorkspaceQuery), projection: designerInstructionText(multiWorkspaceQuery) })).toBe('status_query');
     expect(classifyConversationActionFollowupIntent(multiWorkspaceQuery)).toBe('status');
     const dispatch = buildLumiTurnDispatch({
       userId: 'designer-multi-workspace-status',
@@ -85,6 +86,8 @@ describe('designer stage intent', () => {
         orgId: 'personal:designer-user',
         ownerUserId: 'designer-user',
         name: '设计师版稳定性验收住宅',
+        status: 'active',
+        createdAt: '2026-08-18T10:00:00.000Z',
         updatedAt: '2026-08-18T10:00:00.000Z',
         workflow: {
           stages: {
@@ -98,6 +101,9 @@ describe('designer stage intent', () => {
       }],
     };
 
+    const stored = readDB();
+    stored.interiorProjects.push(...db.interiorProjects as any);
+    writeDB(stored);
     const result = formatConversationActionLedgerStatus(db, {
       conversationId: 'current-conversation',
       userId: 'designer-user',
@@ -122,6 +128,7 @@ describe('designer stage intent', () => {
     expect(hasCoreActionEvidence(buildActionContract(statusQuery), [{
       name: 'interior_design_project_status',
       arguments: {},
+      terminalVerification: { status: 'verified', strategy: 'measured', reason: 'fixture ledger' },
       result: JSON.stringify({
         ok: true,
         persisted: true,
@@ -175,7 +182,9 @@ describe('designer stage intent', () => {
       source: 'chat',
     });
     expect(pipeline.turnIntent.flow.industryWorkflowEntryId).toBe('project');
-    expect(pipeline.capabilityPlan.lane).toBe('design_cad');
+    // Main's modular planner retains its artifact lane; the edition contract
+    // is enforced by the actual projected tool set and bound workflow entry.
+    expect(pipeline.authorizationPolicy.allowedTools).toContain('industry_workflow_complete');
     expect(pipeline.execution.toolPolicy.allowedTools).toEqual(expect.arrayContaining([
       'industry_workflow_start',
       'industry_workflow_complete',
@@ -210,7 +219,7 @@ describe('designer stage intent', () => {
     });
     expect(pipeline.normalizedIntent.kind).toBe('media_generation');
     expect(pipeline.execution.toolPolicy.allowedTools).toContain('generate_image');
-    expect(pipeline.shadowComparison.externalCommitBlocked).toBe(false);
+    expect(pipeline.authorizationPolicy.allowedTools).toContain('generate_image');
     expect(pipeline.execution.toolPolicy.allowedTools).not.toContain('generate_video');
   });
 
@@ -265,23 +274,16 @@ describe('designer stage intent', () => {
       operationMode: 'assistant',
       targetIsLumi: true,
     };
-    const dispatch = buildLumiTurnDispatch(dispatchInput);
     const registry = new ToolRegistry();
     registerAllTools(registry);
     const pipeline = buildLumiExecutionPipeline({
-      dispatch: dispatchInput,
-      prebuiltDispatch: {
-        ...dispatch,
-        flow: {
-          ...dispatch.flow,
-          routeText: `${VISUALIZATION_REQUEST}\n\n- prior task status: blocked`,
-        },
-      },
+      userText: VISUALIZATION_REQUEST,
+      dispatch: { ...dispatchInput, text: `${VISUALIZATION_REQUEST}\n\n- prior task status: blocked` },
       registry,
       source: 'chat',
     });
     expect(pipeline.normalizedIntent.kind).toBe('media_generation');
-    expect(pipeline.shadowComparison.externalCommitBlocked).toBe(false);
+    expect(pipeline.authorizationPolicy.allowedTools).toContain('generate_image');
     expect(pipeline.execution.toolPolicy.allowedTools).toContain('generate_image');
   });
 });

@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   CheckCircle,
   FileText,
@@ -18,7 +18,7 @@ import type {
   InteriorProjectType,
   InteriorProjectWorkflowState,
 } from '../../lib/interiorProjects';
-import { getInteriorProjectWorkflow, listInteriorProjectAssets } from '../../lib/interiorProjects';
+import { getActiveInteriorProject } from '../../lib/interiorProjects';
 import {
   interiorDesignMessage,
   type InteriorDesignLocale,
@@ -27,9 +27,10 @@ import {
 import { designerWorkspaceText } from '../../i18n/locales/designerWorkspaces';
 import { InteriorProjectPanel } from './InteriorProjectPanel';
 import { InteriorProjectAssets } from './InteriorProjectAssets';
-import { startIndustryWorkflow } from '../../lib/industryWorkflowClient';
+import { useDesignChat } from '../../hooks/useDesignChat';
+import { useDesignProjectResources } from '../../hooks/useDesignProjectResources';
+import { designerLifecycleCopy } from '../../i18n/locales/designerLifecycle';
 import { useApp } from '../../contexts/AppContext';
-import { getDesktopSessionProof } from '../../services/authService';
 
 export type DesignView =
   | 'project'
@@ -106,25 +107,15 @@ const VIEW_PRESENTATION: Record<DesignView, {
   },
 };
 
-function parseSseEvent(block: string): Record<string, unknown> | null {
-  const data = block
-    .split(/\r?\n/)
-    .filter(line => line.startsWith('data:'))
-    .map(line => line.slice(5).trimStart())
-    .join('\n');
-  if (!data) return null;
-  try {
-    return JSON.parse(data) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
+export function DesignHub({ initialView = 'project' }: { initialView?: DesignView } = {}) {
+  const { user, workDomain, orgConnection } = useApp();
+  const owner = [user?.uid, user?.role, workDomain, orgConnection?.orgId, orgConnection?.orgRole].join(':');
+  return <ScopedDesignHub key={owner} initialView={initialView} owner={owner} />;
 }
 
-export function DesignHub({ initialView = 'project' }: { initialView?: DesignView } = {}) {
+function ScopedDesignHub({ initialView, owner }: { initialView: DesignView; owner: string }) {
   const [view, setView] = useState<DesignView>(initialView);
   const [activeProject, setActiveProject] = useState<InteriorProject | null>(null);
-  const [projectAssets, setProjectAssets] = useState<InteriorProjectAsset[]>([]);
-  const [projectWorkflow, setProjectWorkflow] = useState<InteriorProjectWorkflowState | null>(null);
   const t = useT();
   const { workDomain } = useApp();
   const locale: InteriorDesignLocale = t.langCode === 'en' ? 'en' : 'zh';
@@ -134,43 +125,24 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
     setView(initialView);
   }, [initialView]);
 
+  const copy = designerLifecycleCopy(locale);
+  const [activeError, setActiveError] = useState(false);
+  const [activeLoading, setActiveLoading] = useState(true);
+  const [activeRevision, setActiveRevision] = useState(0);
+  const { assets: projectAssets, setAssets: setProjectAssets, workflow: projectWorkflow, errors: resourceErrors, loading: resourcesLoading, refresh: refreshProjectWorkflow } = useDesignProjectResources(workDomain, activeProject, locale);
   React.useEffect(() => {
-    let cancelled = false;
-    if (!activeProject) {
-      setProjectAssets([]);
-      setProjectWorkflow(null);
-      return () => { cancelled = true; };
-    }
-    Promise.all([
-      listInteriorProjectAssets(workDomain, activeProject.id),
-      getInteriorProjectWorkflow(workDomain, activeProject.id),
-    ])
-      .then(([items, workflow]) => {
-        if (!cancelled) {
-          setProjectAssets(items);
-          setProjectWorkflow(workflow);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setProjectAssets([]);
-          setProjectWorkflow(null);
-        }
-      });
-    return () => { cancelled = true; };
-  }, [activeProject, workDomain]);
-
-  const refreshProjectWorkflow = useCallback(async () => {
-    if (!activeProject) {
-      setProjectWorkflow(null);
-      return;
-    }
-    try {
-      setProjectWorkflow(await getInteriorProjectWorkflow(workDomain, activeProject.id));
-    } catch {
-      setProjectWorkflow(null);
-    }
-  }, [activeProject, workDomain]);
+    const controller = new AbortController();
+    setActiveLoading(true); setActiveError(false);
+    getActiveInteriorProject(workDomain, controller.signal)
+      .then(project => { if (!controller.signal.aborted) setActiveProject(project); })
+      .catch(() => { if (!controller.signal.aborted) setActiveError(true); })
+      .finally(() => { if (!controller.signal.aborted) setActiveLoading(false); });
+    return () => controller.abort();
+  }, [workDomain, activeRevision]);
+  const refreshResources = () => {
+    if (activeError) setActiveRevision(value => value + 1);
+    else void refreshProjectWorkflow();
+  };
 
   const tools = useMemo<Record<DesignView, ToolConfig>>(() => ({
     project: {
@@ -287,6 +259,13 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
         </nav>
       </aside>
       <main data-wallpaper-tool="organization-module-workspace" className={`lumi-org-module-workspace lumi-design-workspace custom-scrollbar min-w-0 flex-1 overflow-y-auto ${presentation.canvas}`}>
+        {(activeLoading || resourcesLoading) && <p role="status" className="px-6 py-3 text-sm text-white/60">{copy.loading}</p>}
+        {(activeError || resourceErrors.length > 0) && <div role="alert" className="px-6 py-3 text-sm text-amber-200">
+          {activeError && <p>{copy.activeFailed}</p>}
+          {resourceErrors.map(error => <p key={error}>{error}</p>)}
+          <button type="button" disabled={activeLoading || resourcesLoading} onClick={refreshResources} className="lumi-button mt-2">{copy.retry}</button>
+          <p className="mt-1 text-xs">{copy.refreshOnly}</p>
+        </div>}
         {view === 'project' ? (
           <InteriorProjectPanel
             domain={workDomain}
@@ -294,6 +273,7 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
             onProjectChange={project => {
               setActiveProject(project);
               setProjectAssets([]);
+              setActiveError(false);
             }}
           />
         ) : (
@@ -332,116 +312,12 @@ export function DesignHub({ initialView = 'project' }: { initialView?: DesignVie
           assets={activeProject ? projectAssets : []}
           workflow={activeProject ? projectWorkflow : null}
           onWorkflowChange={refreshProjectWorkflow}
+          blocked={activeLoading || resourcesLoading || activeError || resourceErrors.length > 0}
+          owner={owner}
         />
       </main>
     </div>
   );
-}
-
-function useDesignChat(locale: InteriorDesignLocale, onWorkflowChange?: () => void | Promise<void>) {
-  const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
-  const [input, setInput] = useState('');
-  const [result, setResult] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [workflowTaskId, setWorkflowTaskId] = useState('');
-  const [workflowStatus, setWorkflowStatus] = useState('');
-  const abortRef = useRef<AbortController | null>(null);
-
-  React.useEffect(() => () => abortRef.current?.abort(), []);
-
-  const stop = () => abortRef.current?.abort();
-
-  const send = async (prompt: string, workflow: {
-    entryId: DesignView;
-    sourceInput: string;
-    projectId?: string;
-    projectName?: string;
-  }) => {
-    if (!prompt.trim() || loading) return;
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setLoading(true);
-    setResult('');
-    setWorkflowStatus('creating');
-    try {
-      const started = await startIndustryWorkflow({
-        entryId: workflow.entryId,
-        sourceInput: workflow.sourceInput,
-        source: workflow.projectId ? 'designer_project_workspace' : 'designer_standalone_workspace',
-        context: workflow.projectId
-          ? { projectId: workflow.projectId, projectName: workflow.projectName }
-          : { mode: 'standalone' },
-      });
-      setWorkflowTaskId(started.task.id);
-      setWorkflowStatus('in_progress');
-      await onWorkflowChange?.();
-      const desktopSessionProof = getDesktopSessionProof();
-      const res = await fetch('/api/chat?stream=true', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(desktopSessionProof ? { 'x-lumi-desktop-session': desktopSessionProof } : {}),
-        },
-        credentials: 'include',
-        signal: controller.signal,
-        body: JSON.stringify({
-          industryWorkflowTaskId: started.task.id,
-          industryWorkflowSourceInput: workflow.sourceInput,
-          messages: [{ role: 'user', content: `${started.handoffPrompt}\n\n${prompt}` }],
-        }),
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || m('requestFailed'));
-      }
-      if (!res.body) throw new Error(m('requestFailed'));
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let assembled = '';
-
-      while (true) {
-        const { value, done } = await reader.read();
-        buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
-        const blocks = buffer.split(/\r?\n\r?\n/);
-        buffer = blocks.pop() || '';
-        for (const block of blocks) {
-          const event = parseSseEvent(block);
-          if (!event) continue;
-          if (typeof event.chunk === 'string') {
-            assembled += event.chunk;
-            setResult(assembled);
-          }
-          if (event.done === true && typeof event.text === 'string') {
-            assembled = event.text;
-            setResult(assembled);
-            const workflowResult = event.industryWorkflow as Record<string, unknown> | undefined;
-            if (typeof workflowResult?.status === 'string') setWorkflowStatus(workflowResult.status);
-          }
-        }
-        if (done) break;
-      }
-
-      const trailing = parseSseEvent(buffer);
-      if (trailing?.done === true && typeof trailing.text === 'string') {
-        setResult(trailing.text);
-        const workflowResult = trailing.industryWorkflow as Record<string, unknown> | undefined;
-        if (typeof workflowResult?.status === 'string') setWorkflowStatus(workflowResult.status);
-      }
-    } catch (err: any) {
-      if (err?.name !== 'AbortError') {
-        setResult(`${m('errorPrefix')}${err?.message || err}`);
-        setWorkflowStatus('blocked');
-      }
-    } finally {
-      if (abortRef.current === controller) abortRef.current = null;
-      setLoading(false);
-      await onWorkflowChange?.();
-    }
-  };
-
-  return { input, setInput, result, loading, workflowTaskId, workflowStatus, send, stop };
 }
 
 function formatProjectContext(project: InteriorProject, locale: InteriorDesignLocale): string {
@@ -490,6 +366,8 @@ function formatProjectAssets(assets: InteriorProjectAsset[], locale: InteriorDes
 }
 
 interface DesignToolViewProps {
+  blocked?: boolean;
+  owner?: string;
   config: ToolConfig;
   entryId: DesignView;
   locale: InteriorDesignLocale;
@@ -553,11 +431,15 @@ function GenericDesignToolView({
   project,
   assets,
   onWorkflowChange,
+  blocked,
+  owner,
 }: DesignToolViewProps) {
   const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
-  const { input, setInput, result, loading, workflowTaskId, workflowStatus, send, stop } = useDesignChat(locale, onWorkflowChange);
+  const { input, setInput, result, resultInput, staleResult, loading, workflowTaskId, workflowStatus, error, send, stop } = useDesignChat(locale, onWorkflowChange, owner);
+  const copy = designerLifecycleCopy(locale);
 
   const run = () => {
+    if (blocked) return;
     const outputGuide = config.output.map(item => `- ${item}`).join('\n');
     const projectContext = project ? formatProjectContext(project, locale) : m('standaloneContext');
     const assetContext = project ? formatProjectAssets(assets, locale) : '';
@@ -605,6 +487,8 @@ function GenericDesignToolView({
         </div>
       )}
 
+      {error && <p role="alert" className="text-sm text-amber-200">{error}</p>}
+      {staleResult && <p role="status" className="text-sm text-amber-200">{copy.draftChanged}</p>}
       <section className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_260px]">
         <div className="space-y-4">
           <textarea
@@ -629,7 +513,7 @@ function GenericDesignToolView({
           <div className="flex flex-wrap items-center gap-2">
             <button
               onClick={run}
-              disabled={loading || !input.trim()}
+              disabled={loading || blocked || !input.trim()}
               className="lumi-button-primary border-cyan-400/25 bg-cyan-500/15 px-6 py-3 text-cyan-100 hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:opacity-40"
             >
               {loading ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
@@ -662,6 +546,7 @@ function GenericDesignToolView({
 
       {result && (
         <section className="lumi-design-result lumi-panel custom-scrollbar max-h-[560px] overflow-y-auto p-5 text-sm leading-relaxed whitespace-pre-wrap text-white/80">
+          <details className="mb-3 text-xs text-white/55"><summary>{copy.resultBrief}</summary><p>{resultInput}</p></details>
           {result}
         </section>
       )}
@@ -703,8 +588,9 @@ function ProjectWorkspace(props: DesignToolViewProps) {
 function useStageWorkflow(props: DesignToolViewProps) {
   const { config, entryId, locale, project, assets } = props;
   const m = (key: InteriorDesignMessageKey) => interiorDesignMessage(key, locale);
-  const chat = useDesignChat(locale, props.onWorkflowChange);
+  const chat = useDesignChat(locale, props.onWorkflowChange, props.owner);
   const run = (details: string) => {
+    if (props.blocked) return;
     const projectContext = project ? formatProjectContext(project, locale) : m('standaloneContext');
     const assetContext = project ? formatProjectAssets(assets, locale) : '';
     const outputGuide = config.output.map(item => `- ${item}`).join('\n');
@@ -743,8 +629,9 @@ function StageHeader({ config, project, eyebrow, accent }: {
   );
 }
 
-function StageRunBar({ chat, button, disabled, onRun, className, locale }: {
+function StageRunBar({ chat, button, disabled, onRun, className, locale, currentInput }: {
   chat: ReturnType<typeof useDesignChat>;
+  currentInput: string;
   button: string;
   disabled: boolean;
   onRun: () => void;
@@ -761,7 +648,9 @@ function StageRunBar({ chat, button, disabled, onRun, className, locale }: {
         {chat.loading && <button type="button" onClick={chat.stop} className="lumi-button px-4 py-3 text-white/65"><Square size={14} />{designerWorkspaceText(locale, 'Stop')}</button>}
         {chat.workflowTaskId && <span className="rounded-full border border-emerald-300/12 bg-emerald-400/[0.05] px-3 py-1.5 text-[11px] font-mono text-emerald-100/60">{chat.workflowStatus || 'in_progress'} · {chat.workflowTaskId.slice(0, 12)}</span>}
       </div>
-      {chat.result && <section className="lumi-panel custom-scrollbar max-h-[560px] overflow-y-auto whitespace-pre-wrap p-5 text-sm leading-relaxed text-white/80">{chat.result}</section>}
+      {chat.error && <p role="alert" className="text-sm text-amber-200">{chat.error}</p>}
+      {chat.resultInput !== null && currentInput !== chat.resultInput && <p role="status" className="text-sm text-amber-200">{designerLifecycleCopy(locale).draftChanged}</p>}
+      {chat.result && <section className="lumi-panel custom-scrollbar max-h-[560px] overflow-y-auto whitespace-pre-wrap p-5 text-sm leading-relaxed text-white/80"><details className="mb-3 text-xs text-white/55"><summary>{designerLifecycleCopy(locale).resultBrief}</summary><p>{chat.resultInput}</p></details>{chat.result}</section>}
     </>
   );
 }
@@ -793,7 +682,7 @@ function CadWorkspace(props: DesignToolViewProps) {
         </div>
         <aside className="rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4"><h3 className="text-xs font-black uppercase tracking-[0.14em] text-white/45">{designerWorkspaceText(locale, "Pre-drawing checks")}</h3><div className="mt-3 space-y-2">{checks.map((check, index) => <div key={check} className="flex gap-3 rounded-xl border border-white/[0.06] px-3 py-3 text-sm text-white/60"><span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-amber-300/20 text-[10px] font-black text-amber-200">{index + 1}</span><span>{check}</span></div>)}</div></aside>
       </section>
-      <StageRunBar locale={locale} chat={chat} button={config.button} disabled={!output.trim() && !dimensions.trim() && !constraints.trim()} onRun={() => run(`${designerWorkspaceText(locale, "Drawing type")}: ${drawingType}\n${designerWorkspaceText(locale, "Output")}: ${output}\n${designerWorkspaceText(locale, "Dimensions")}: ${dimensions}\n${designerWorkspaceText(locale, "Fixed conditions and conflicts")}: ${constraints}`)} className="border-amber-400/25 bg-amber-500/15 text-amber-100 hover:bg-amber-500/25" />
+      <StageRunBar locale={locale} chat={chat} button={config.button} disabled={Boolean(props.blocked) || (!output.trim() && !dimensions.trim() && !constraints.trim())} currentInput={`${designerWorkspaceText(locale, "Drawing type")}: ${drawingType}\n${designerWorkspaceText(locale, "Output")}: ${output}\n${designerWorkspaceText(locale, "Dimensions")}: ${dimensions}\n${designerWorkspaceText(locale, "Fixed conditions and conflicts")}: ${constraints}`} onRun={() => run(`${designerWorkspaceText(locale, "Drawing type")}: ${drawingType}\n${designerWorkspaceText(locale, "Output")}: ${output}\n${designerWorkspaceText(locale, "Dimensions")}: ${dimensions}\n${designerWorkspaceText(locale, "Fixed conditions and conflicts")}: ${constraints}`)} className="border-amber-400/25 bg-amber-500/15 text-amber-100 hover:bg-amber-500/25" />
     </div>
   );
 }
@@ -820,7 +709,7 @@ function VisualizationWorkspace(props: DesignToolViewProps) {
         </div><textarea value={brief} onChange={event => setBrief(event.target.value)} rows={6} placeholder={config.placeholder} className="lumi-field w-full resize-y" /></div>
         <aside className="overflow-hidden rounded-2xl border border-fuchsia-300/12 bg-gradient-to-br from-fuchsia-950/25 to-violet-950/20 p-4"><div className="flex items-center justify-between"><h3 className="text-xs font-black uppercase tracking-[0.14em] text-fuchsia-100/55">{designerWorkspaceText(locale, "Shot board")}</h3><span className="text-[11px] text-white/30">{references} refs</span></div><div className="mt-4 grid grid-cols-2 gap-3">{views.map((label, index) => <div key={label} className="flex aspect-[4/3] flex-col justify-between rounded-2xl border border-white/[0.08] bg-black/25 p-3"><span className="text-[10px] font-black uppercase tracking-[0.14em] text-fuchsia-100/35">VIEW {String(index + 1).padStart(2, '0')}</span><Sparkles size={20} className="self-center text-fuchsia-200/25" /><span className="text-xs font-bold text-white/55">{label}</span></div>)}</div></aside>
       </section>
-      <StageRunBar locale={locale} chat={chat} button={config.button} disabled={!space.trim() && !style.trim() && !brief.trim()} onRun={() => run(`${designerWorkspaceText(locale, "Space and camera")}: ${space}\n${designerWorkspaceText(locale, "Style")}: ${style}\n${designerWorkspaceText(locale, "Lighting")}: ${lighting}\n${designerWorkspaceText(locale, "Materials")}: ${materials}\n${designerWorkspaceText(locale, "Additional brief")}: ${brief}`)} className="border-fuchsia-400/25 bg-fuchsia-500/15 text-fuchsia-100 hover:bg-fuchsia-500/25" />
+      <StageRunBar locale={locale} chat={chat} button={config.button} disabled={Boolean(props.blocked) || (!space.trim() && !style.trim() && !brief.trim())} currentInput={`${designerWorkspaceText(locale, "Space and camera")}: ${space}\n${designerWorkspaceText(locale, "Style")}: ${style}\n${designerWorkspaceText(locale, "Lighting")}: ${lighting}\n${designerWorkspaceText(locale, "Materials")}: ${materials}\n${designerWorkspaceText(locale, "Additional brief")}: ${brief}`} onRun={() => run(`${designerWorkspaceText(locale, "Space and camera")}: ${space}\n${designerWorkspaceText(locale, "Style")}: ${style}\n${designerWorkspaceText(locale, "Lighting")}: ${lighting}\n${designerWorkspaceText(locale, "Materials")}: ${materials}\n${designerWorkspaceText(locale, "Additional brief")}: ${brief}`)} className="border-fuchsia-400/25 bg-fuchsia-500/15 text-fuchsia-100 hover:bg-fuchsia-500/25" />
     </div>
   );
 }
@@ -847,7 +736,7 @@ function PresentationWorkspace(props: DesignToolViewProps) {
           <label className="text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Required content")}</span><textarea value={required} onChange={event => setRequired(event.target.value)} rows={5} placeholder={config.placeholder} className="lumi-field mt-2 w-full resize-y" /></label>
         </div></div>
       </section>
-      <StageRunBar locale={locale} chat={chat} button={config.button} disabled={!audience.trim() && !goal.trim() && !required.trim()} onRun={() => run(`${designerWorkspaceText(locale, "Audience")}: ${audience}\n${designerWorkspaceText(locale, "Meeting goal")}: ${goal}\n${designerWorkspaceText(locale, "Slide count")}: ${slideCount}\n${designerWorkspaceText(locale, "Visual style")}: ${style}\n${designerWorkspaceText(locale, "Required content")}: ${required}`)} className="border-blue-400/25 bg-blue-500/15 text-blue-100 hover:bg-blue-500/25" />
+      <StageRunBar locale={locale} chat={chat} button={config.button} disabled={Boolean(props.blocked) || (!audience.trim() && !goal.trim() && !required.trim())} currentInput={`${designerWorkspaceText(locale, "Audience")}: ${audience}\n${designerWorkspaceText(locale, "Meeting goal")}: ${goal}\n${designerWorkspaceText(locale, "Slide count")}: ${slideCount}\n${designerWorkspaceText(locale, "Visual style")}: ${style}\n${designerWorkspaceText(locale, "Required content")}: ${required}`} onRun={() => run(`${designerWorkspaceText(locale, "Audience")}: ${audience}\n${designerWorkspaceText(locale, "Meeting goal")}: ${goal}\n${designerWorkspaceText(locale, "Slide count")}: ${slideCount}\n${designerWorkspaceText(locale, "Visual style")}: ${style}\n${designerWorkspaceText(locale, "Required content")}: ${required}`)} className="border-blue-400/25 bg-blue-500/15 text-blue-100 hover:bg-blue-500/25" />
     </div>
   );
 }
@@ -868,7 +757,7 @@ function HandoffWorkspace(props: DesignToolViewProps) {
         <div className="rounded-2xl border border-emerald-300/12 bg-emerald-400/[0.035] p-5"><div className="flex flex-wrap items-center justify-between gap-3"><h3 className="text-xs font-black uppercase tracking-[0.14em] text-emerald-100/55">{designerWorkspaceText(locale, "Delivery checklist")}</h3><span className="text-xs font-bold text-emerald-100/45">{checked.length}/{checklist.length} {designerWorkspaceText(locale, "verified")}</span></div><div className="mt-4 space-y-2">{checklist.map(item => <label key={item} className={`flex cursor-pointer items-center gap-3 rounded-xl border px-3 py-3 transition-colors ${checked.includes(item) ? 'border-emerald-300/25 bg-emerald-400/10 text-emerald-50' : 'border-white/[0.07] bg-black/15 text-white/55'}`}><input type="checkbox" checked={checked.includes(item)} onChange={() => toggle(item)} className="h-4 w-4 accent-emerald-400" /><span className="text-sm font-bold">{item}</span></label>)}</div></div>
         <aside className="rounded-2xl border border-white/[0.08] bg-black/20 p-5"><label className="block text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Recipient")}</span><input value={recipient} onChange={event => setRecipient(event.target.value)} placeholder={designerWorkspaceText(locale, "Client, contractor, supplier")} className="lumi-field mt-2 w-full py-2.5 text-sm" /></label><label className="mt-4 block text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Delivery version")}</span><input value={version} onChange={event => setVersion(event.target.value)} className="lumi-field mt-2 w-full py-2.5 text-sm" /></label><label className="mt-4 block text-xs font-bold text-white/45"><span>{designerWorkspaceText(locale, "Open items and verification focus")}</span><textarea value={notes} onChange={event => setNotes(event.target.value)} rows={7} placeholder={config.placeholder} className="lumi-field mt-2 w-full resize-y" /></label><div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-3 text-xs leading-relaxed text-white/40">{assets.length} {designerWorkspaceText(locale, "project files are available as evidence. Completion requires verified file receipts.")}</div></aside>
       </section>
-      <StageRunBar locale={locale} chat={chat} button={config.button} disabled={!recipient.trim() && !notes.trim() && checked.length === 0} onRun={() => run(`${designerWorkspaceText(locale, "Recipient")}: ${recipient}\n${designerWorkspaceText(locale, "Version")}: ${version}\n${designerWorkspaceText(locale, "Manually checked")}: ${checked.join('、')}\n${designerWorkspaceText(locale, "Open items")}: ${notes}`)} className="border-emerald-400/25 bg-emerald-500/15 text-emerald-100 hover:bg-emerald-500/25" />
+      <StageRunBar locale={locale} chat={chat} button={config.button} disabled={Boolean(props.blocked) || (!recipient.trim() && !notes.trim() && checked.length === 0)} currentInput={`${designerWorkspaceText(locale, "Recipient")}: ${recipient}\n${designerWorkspaceText(locale, "Version")}: ${version}\n${designerWorkspaceText(locale, "Manually checked")}: ${checked.join('、')}\n${designerWorkspaceText(locale, "Open items")}: ${notes}`} onRun={() => run(`${designerWorkspaceText(locale, "Recipient")}: ${recipient}\n${designerWorkspaceText(locale, "Version")}: ${version}\n${designerWorkspaceText(locale, "Manually checked")}: ${checked.join('、')}\n${designerWorkspaceText(locale, "Open items")}: ${notes}`)} className="border-emerald-400/25 bg-emerald-500/15 text-emerald-100 hover:bg-emerald-500/25" />
     </div>
   );
 }

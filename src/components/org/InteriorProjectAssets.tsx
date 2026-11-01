@@ -1,4 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { designerLifecycleCopy } from '../../i18n/locales/designerLifecycle';
+import { apiFetch } from '../../services/apiClient';
+import { withRequestDeadline } from '../../lib/requestDeadline';
 import {
   ChevronDown,
   ChevronUp,
@@ -63,6 +66,7 @@ export function InteriorProjectAssets({ domain, project, locale, onAssetsChange 
   const [uploading, setUploading] = useState(false);
   const [removingId, setRemovingId] = useState('');
   const [error, setError] = useState('');
+  const [reload, setReload] = useState(0);
 
   const categoryLabels: Record<InteriorAssetCategory, string> = {
     'floor-plan': m('floorPlanAsset'),
@@ -75,11 +79,10 @@ export function InteriorProjectAssets({ domain, project, locale, onAssetsChange 
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
     setLoading(true);
     setError('');
-    setAssets([]);
-    onAssetsChange([]);
-    listInteriorProjectAssets(domain, project.id)
+    listInteriorProjectAssets(domain, project.id, controller.signal)
       .then(items => {
         if (cancelled) return;
         setAssets(items);
@@ -91,10 +94,10 @@ export function InteriorProjectAssets({ domain, project, locale, onAssetsChange 
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
-    return () => { cancelled = true; };
+    return () => { cancelled = true; controller.abort(); };
   // Project identity is the load boundary; the parent setter is stable.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [domain, project.id, locale]);
+  }, [domain, project.id, locale, reload]);
 
   const publishAssets = (next: InteriorProjectAsset[]) => {
     setAssets(next);
@@ -112,11 +115,11 @@ export function InteriorProjectAssets({ domain, project, locale, onAssetsChange 
       formData.append('domain', domain);
       formData.append('interiorProjectId', project.id);
       formData.append('interiorAssetCategory', category);
-      const response = await fetch(`/api/files/upload?domain=${encodeURIComponent(domain)}`, {
+      const response = await withRequestDeadline(signal => apiFetch(`/api/files/upload?domain=${encodeURIComponent(domain)}`, {
         method: 'POST',
         body: formData,
-        credentials: 'include',
-      });
+        signal,
+      }), undefined, 60_000);
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || `Upload failed (${response.status})`);
       const next = await listInteriorProjectAssets(domain, project.id);
@@ -201,7 +204,7 @@ export function InteriorProjectAssets({ domain, project, locale, onAssetsChange 
           </button>
         </div>
 
-        {error && <p className="mt-3 text-xs text-rose-300/90">{error}</p>}
+        {error && <div role="alert" className="mt-3 text-xs text-rose-300/90"><p>{error}</p><button type="button" disabled={loading} onClick={() => setReload(value => value + 1)} className="lumi-button mt-2">{designerLifecycleCopy(locale).retry}</button><p>{designerLifecycleCopy(locale).refreshOnly}</p></div>}
 
         {expanded && (
           <div className="mt-4">

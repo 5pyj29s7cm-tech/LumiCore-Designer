@@ -1,9 +1,19 @@
 import { PERSONAL_CLIENT_SURFACES } from '../../shared/client_surfaces';
-import { isDesignProjectStatusRequest } from '../design/status_intent';
+import { hasExplicitNoToolInstruction } from './no_tool_instruction';
+import { designerStatusRequest } from './designer_instruction_projection';
+
+export const CLIENT_STATE_INSPECTION_REQUEST = /(?:(?:介绍|说明|讲讲|告诉我|读取|查看|检查).{0,24}(?:Lumi\s*)?客户端.{0,24}(?:每一?个|各个|所有|全部)?(?:页面|界面|模块|状态|分区)|(?:Lumi\s*)?客户端.{0,24}(?:每一?个|各个|所有|全部)(?:页面|界面|模块).{0,24}(?:干什么|作用|功能|用途|介绍|说明)|(?:检查|查看|告诉我|现在).{0,18}(?:你的|lumi\s*的)?(?:模式|模态|运行模式|模)状态|(?:你现在|当前).{0,12}(?:是什么|什么)?模式)/iu; // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
+
 import { classifySkillAuthoringIntent } from '../skills/authoring_intent';
 import { classifyExternalCliIntent, requestedCliProviders } from './external_cli_intent';
+import { classifyRuntimeWorkIntent } from './runtime_work_intent';
+import { directoryArtifactPath, withoutLocationLiterals } from './location_literals';
+import { explicitFile } from '../conversation/targets/instruction_targets';
+import { affirmativeActionClauses, affirmativeActionInstructionClauses, actionInstructionClauses, negatedActionInstructions } from './action_instruction_clauses';
+export { affirmativeActionClauses } from './action_instruction_clauses';
+import { matchesCnTaskReceiptQuestion } from "../regions/input/zh_action_continuation";
 
-/** Read/search verbs in an explicitly forbidden clause are not requests.
+/** Read/search/navigation verbs in an explicitly forbidden clause are not requests.
  * Keep the original user message for the model and side-effect authorization.
  * This projection is only for matching action-shaped lookup language.
  */
@@ -11,11 +21,11 @@ export function withoutNegatedLookupClauses(value: string): string {
   if (isExplicitArtifactCreationText(value)) return value;
   if (/(?:内容(?:是|为)?|正文|以下文字|with\s+(?:this|the|following)\s+content)\s*[:：]/iu.test(value)) return value; // i18n-allow: preserve explicit data payloads.
 
-  return String(value || '').split(/([，,。！？!?；;\n]|\.(?=\s|$))/u).map(clause => { // i18n-allow: multilingual clause boundaries.
+  return String(value || '').split(/([，。！？!?；;\n]|\.(?=\s|$))/u).map(clause => { // i18n-allow: multilingual clause boundaries.
     const parts = clause.split(/((?:但是|不过|但)|\b(?:but|instead)\b)/iu); // i18n-allow: preserve a following affirmative instruction.
     const head = parts[0];
-    if (/^\s*(?:(?:请|也|并且|并|且)\s*)?(?:不要|别|无需|不需要|不用|禁止|请勿)|^\s*(?:please\s+)?(?:do\s+not|don't|never|no\s+need\s+to)\b/iu.test(head) // i18n-allow: negated lookup clause recognition.
-      && /搜索|查找|查阅|读取|查看|浏览|查询|\b(?:search|look\s*up|read|browse|fetch|inspect)\b/iu.test(head)) { // i18n-allow: read-only lookup verbs.
+    if (/^\s*(?:(?:请|也|并且|并|且)\s*)?(?:不要|别|无需|不需要|不用|禁止|请勿|不(?=搜索|查找|查阅|读取|查看|浏览|查询|打开|切换|进入|关闭))|^\s*(?:please\s+)?(?:do\s+not|don't|never|no\s+need\s+to)\b/iu.test(head) // i18n-allow: negated lookup clause recognition.
+      && /搜索|查找|查阅|读取|查看|浏览|查询|打开|切换|进入|关闭|\b(?:search|look\s*up|read|browse|fetch|inspect|open|switch|enter|close)\b/iu.test(head)) { // i18n-allow: read-only lookup verbs.
       parts[0] = ' ';
     }
     return parts.join('');
@@ -32,6 +42,8 @@ export function isStoredMemoryRecallQuestion(value: string): boolean {
   return normalizeActionIntent(text).kind === 'none';
 }
 
+import { isAvatarAuthoringRequest, mediaCreationInstruction } from './media_creation_intent';
+
 export type NormalizedActionIntentKind =
   | 'none'
   | 'external_cli_status'
@@ -46,7 +58,6 @@ export type NormalizedActionIntentKind =
   | 'client_state'
   | 'desktop_operation'
   | 'media_generation'
-  | 'document_creation'
   | 'cad_drafting'
   | 'scheduled_task'
   | 'work_task'
@@ -79,6 +90,8 @@ export interface NormalizedActionIntent {
   clientAction?: string;
   /** Exact structured arguments needed by a deterministic native client action. */
   clientActionArguments?: Record<string, unknown>;
+  /** Explicit media operations belonging to one requested creative workflow. */
+  mediaTools?: Array<'generate_image' | 'ai_edit_image' | 'generate_video'>;
 }
 
 const EMPTY_INTENT: NormalizedActionIntent = {
@@ -141,7 +154,7 @@ const REGISTERED_CLIENT_SURFACE_RULES: ReadonlyArray<{ pattern: RegExp; target: 
     if (!action) return [];
     const aliases = Array.from(new Set([
       surface.id, surface.label, ...(surface.navigationAliases || []),
-    ].map(value => String(value || '').trim()).filter(Boolean)));
+    ].map(value => String(value || '').trim()).filter(Boolean))).sort((left, right) => right.length - left.length);
     if (!aliases.length) return [];
     return [{ pattern: new RegExp(`(?:${aliases.map(escapePattern).join('|')})`, 'iu'), target: surface.target, action }];
   });
@@ -155,7 +168,7 @@ const CLIENT_SURFACE_RULES: ReadonlyArray<{ pattern: RegExp; target: string; act
   { pattern: /(?:运行日志|runtime\s*log)/iu, target: 'runtime-log', action: 'open_computer_adaptation' }, // i18n-allow: Multilingual Lumi surface aliases.
   { pattern: /(?:通知中心|通知面板|notification\s*(?:center|panel))/iu, target: 'notifications', action: 'open_notifications' }, // i18n-allow: Multilingual Lumi surface aliases.
   { pattern: /(?:提醒面板|提醒中心|reminder\s*(?:center|panel))/iu, target: 'reminders', action: 'open_reminders' }, // i18n-allow: Multilingual Lumi surface aliases.
-  { pattern: /(?:设置界面|设置页面|客户端设置|settings)/iu, target: 'settings', action: 'open_settings' }, // i18n-allow: Multilingual Lumi surface aliases.
+  { pattern: /(?:设置界面|设置页面|客户端设置|Lumi\s*设置|settings)/iu, target: 'settings', action: 'open_settings' }, // i18n-allow: Multilingual Lumi surface aliases.
   { pattern: /(?:个人主页|个人主界面|个人桌面|主屏幕|主页面|主界面|首页|lumi\s*桌面|home)/iu, target: 'home', action: 'focus_home' }, // i18n-allow: Multilingual Lumi surface aliases.
   { pattern: /(?:壁纸(?:模式|状态)|wallpaper\s*(?:mode|state))/iu, target: 'wallpaper', action: 'set_wallpaper_mode' }, // i18n-allow: Speech alias for Lumi wallpaper mode.
   ...REGISTERED_CLIENT_SURFACE_RULES,
@@ -164,13 +177,6 @@ const CLIENT_SURFACE_RULES: ReadonlyArray<{ pattern: RegExp; target: string; act
 function currentTurnText(value: string): string {
   return String(value || '')
     .split(/\n## (?:Recent action continuation context|Exact Pending Action Confirmation)\b/i, 1)[0]
-    .trim();
-}
-
-function stripNegatedDesignActionClauses(value: string): string {
-  return String(value || '')
-    .replace(/(?:\u4e0d\u8981|\u4e0d\u7528|\u65e0\u9700|\u4e0d\u5fc5|\u7981\u6b62|\u4e0d\u5f97|\u5207\u52ff|\u8bf7\u52ff|\u522b)[^\uff0c\u3002\uff1b!?\uff01\uff1f]{0,160}/gu, ' ')
-    .replace(/\b(?:do\s+not|don't|dont|must\s+not|never|without)\b[^.!?;]{0,200}/gi, ' ')
     .trim();
 }
 
@@ -211,7 +217,7 @@ function relativeArtifactPath(text: string, includeJson = true): string {
     let start = extensionStart;
     while (
       start > lowerBound
-      && !/[\s\\/:*?"<>|\r\n]/u.test(text[start - 1] || '')
+      && !/[\s\\/:*?"`“”‘’「」『』<>|\r\n]/u.test(text[start - 1] || '')
     ) start -= 1;
     if (start === extensionStart) continue;
     const candidate = trimSlot(text.slice(start, extensionStart + match[0].length));
@@ -221,79 +227,102 @@ function relativeArtifactPath(text: string, includeJson = true): string {
 }
 
 function explicitArtifactPath(text: string): string {
-  // A directory followed by an explicit creation verb is not one filename.
-  // i18n-allow: directory plus newly named artifact grammar.
-  const inDirectory = text.match(/(?:^|[，,。；;\n])\s*(?:请\s*)?(?:在|in)\s+((?:[A-Za-z]:[\\/]|\/)[^\r\n"'<>|?*]+?)\s+(?:创建|新建|生成|create|write)\s+([^\s\\/:"'<>|?*]+\.(?:txt|md|csv|json|docx?|xlsx?|pptx?|pdf))(?=$|[\s，,。；;])/iu);
-  if (inDirectory) return `${inDirectory[1].replace(/[\\/]+$/u, '')}${inDirectory[1].includes('\\') ? '\\' : '/'}${inDirectory[2]}`;
+  const inDirectory = directoryArtifactPath(text);
+  if (inDirectory) return inDirectory;
   // Most turns do not contain a supported artifact suffix. This linear gate
   // keeps them away from the more specific absolute-path matcher entirely.
   if (!ARTIFACT_FILE_EXTENSION_RE.test(text)) return '';
   const absolute = text.match(
-    /([A-Za-z]:[\\/][^\r\n"'<>|?*]+?\.(?:txt|md|csv|json|docx?|xlsx?|pptx?|pdf))(?=$|[\s.,，。;；:：!！?？)）\]}'"])/iu,
+    /([A-Za-z]:[\\/][^\r\n"'<>|?*]+?\.(?:txt|md|csv|json|docx?|xlsx?|pptx?|pdf))(?=$|[\s.,，。;；:：!！?？)）\]}'"”’」』])/iu,
   )?.[1];
   if (absolute) return trimSlot(absolute);
   // POSIX paths use the same filename boundary as Windows paths. A slash in
   // a URL or a relative path must not become a local output authorization.
   const posix = text.match(
-    /(?<![\p{L}\p{N}_.:/\\~-])(\/[^\r\n"'<>|?*，,。；;！？]+?\.(?:txt|md|csv|json|docx?|xlsx?|pptx?|pdf))(?=$|[\s.,，。;；:：!！?？)）\]}'"])/iu,
+    /(?<![\p{L}\p{N}_.:/\\~-])(\/[^\r\n"'<>|?*，,。；;！？]+?\.(?:txt|md|csv|json|docx?|xlsx?|pptx?|pdf))(?=$|[\s.,，。;；:：!！?？)）\]}'"”’」』])/iu,
   )?.[1]; // i18n-allow: multilingual punctuation at a concrete filesystem path boundary.
   if (posix) return trimSlot(posix);
   return relativeArtifactPath(text);
 }
 
-function hasAffirmativeArtifactCreationAction(text: string): boolean {
-  // Remove only clauses that negate the file mutation itself. A boundary such
-  // as "Do not report task status" must not erase a preceding affirmative
-  // write instruction.
-  // i18n-allow: Reviewed Chinese artifact-action input recognition; not user-visible copy.
-  const positiveChinese = text
-    .replace(
-      // i18n-allow: Reviewed Chinese artifact-action input recognition; not user-visible copy.
-      /(?:不要|别|无需|不用|禁止|请勿|勿).{0,16}(?:创建|新建|生成|写入|保存)[^，,。！？!?；;\n]*/gu,
-      ' ',
-    )
-    // Status interrogatives mention the historical verb but do not authorize
-    // another write (for example, "是否写入后回读").
-    // i18n-allow: Reviewed Chinese artifact-status input recognition; not user-visible copy.
-    .replace(/(?:是否|有没有|有没|能否).{0,16}(?:已经)?(?:创建|新建|生成|写入|保存)[^，,。！？!?；;\n]*/gu, ' ')
-    // i18n-allow: Reviewed Chinese artifact-status input recognition; not user-visible copy.
-    .replace(/(?:创建|新建|生成|写入|保存)(?:了|过)?(?:吗|没有|没|了没)[^，,。！？!?；;\n]*/gu, ' ');
-  // i18n-allow: Reviewed Chinese artifact-action input recognition; not user-visible copy.
-  if (/(?:创建|新建|生成|写入)/u.test(positiveChinese)) return true;
+/** One affirmative predicate owner for artifact creation, edits, and tool routing. */
+function affirmativeArtifactAction(text: string, only?: 'create' | 'mutate'): boolean {
+  // i18n-allow: Existing mutation operations in imperative rather than noun/status position.
+  const create = /^(?:创建|新建|生成|写入|保存|另存|导出|起草|撰写|制作|整理成|做一份|给我一份)|^(?:creat(?:e|ing)|write|writ(?:e|ing)|generate|save|export|draft)\b/iu;
+  // i18n-allow: Editing a bound document or field is an operation, not a mention of a revised draft.
+  const mutate = /^(?:编辑|修改|修订|调整|更新|追加|替换|删除|重命名|移动|复制|覆盖|合并|改成|改为|换成)|^(?:edit|modify|revise|update|append|replace|delete|remove|rename|move|copy|overwrite|merge|combine)\b/iu;
+  // i18n-allow: A complete direct attachment handoff can bind an omitted object in its next clause.
+  const attachmentHandoff = (value: string) => /^(?:把|将)/u.test(value)
+    && /附件(?:返回|取回|提供|交付)(?:这里|当前聊天|本次聊天)?[，,。；;\s]*$/u.test(value);
+  let priorAttachmentEnd: number | null = null;
+  for (const { probe: clause, start, text: sourceClause } of affirmativeActionInstructionClauses(currentTurnText(text))) {
+    const followsPriorHandoff = priorAttachmentEnd === start;
+    priorAttachmentEnd = null;
+    const value = withoutLocationLiterals(clause).trim()
+      .replace(/^(?:\[[^\]\r\n]*\]\s*)+/u, '')
+      .replace(/^(?:\d+[.)、]\s*)/u, '');
+    // i18n-allow: Retrospective/capability questions have no affirmative mutation predicate.
+    if (/^(?:是否|有没有|有没|能否)|(?:创建|新建|生成|写入|保存|修改|修订)(?:了|过)?(?:吗|没有|没|了没)/u.test(value)) continue;
+    // i18n-allow: Multilingual imperative prefixes and object-before-predicate grammar.
+    const head = value
+      // i18n-allow: A continuation discourse prefix leaves the existing imperative predicate unchanged.
+      .replace(/^(?:(?:请你?|麻烦你?|帮我)\s*)?(?:继续|接着)(?:同一|这个|该|当前|原)?任务\s*[:：,，]\s*|^(?:please\s+)?(?:continue|resume)\s+(?:(?:the\s+)?same|this|that|current|original|the)?\s*task\s*[:：,]\s*/iu, '')
+      .replace(/^(?:(?:请你?|麻烦你?|帮我|给我(?!一份)|现在|直接|立即|务必|先|再|重新|继续|然后|接着|同时|并且|并|也|本次|这次|(?:我)?(?:需要|要求|希望)你?|我想让你|你必须|你需要)\s*)+/u, '')
+      .replace(/^(?:(?:please|now|then|next|you\s+must|you\s+should|must|should|need\s+to|required\s+to|i\s+(?:need|want)\s+you\s+to|(?:can|could|would)\s+you)\s+)+/iu, '');
+    // A replacement read predicate changes the selected action/target, not file contents.
+    if (mutate.test(head) && explicitLocalArtifactReadIntent(clause)) continue;
+    const predicates = head.split(/\s+(?:and\s+then|then|afterwards)\s+/iu);
+    // An explicit attachment handoff can coordinate a second edit without punctuation. Keep
+    // this under the affirmative/quote projection: mentions and prohibitions
+    // must not turn into edits merely because they contain a coordinator.
+    // i18n-allow: Existing delivery predicates followed by a coordinated edit.
+    for (const coordination of head.matchAll(/并且|并/gu)) {
+      const before = head.slice(0, coordination.index).trim();
+      const next = head.slice(coordination.index! + coordination[0].length).trim();
+      const followsHandoff = (attachmentHandoff(before) || followsPriorHandoff
+        && /^(?:返回|取回|提供|交付)$/u.test(before)) && !/[？?]/u.test(next); // i18n-allow: Direct Chinese handoff predicate and question boundary.
+      // A later relative-clause closure still belongs to the object being
+      // returned, rather than an edit following a completed handoff predicate.
+      // i18n-allow: Chinese object-relative and terminal handoff grammar.
+      const relativeObject = /的[^，,。；;\n]*(?:返回|取回|提供|交付)(?:这里|当前聊天|本次聊天)?[，,。；;\s]*$/u.test(next);
+      if (followsHandoff && !relativeObject && mutate.test(next)) predicates.push(next);
+    }
+    // Ellipsis binds only the immediately following comma-coordinated clause,
+    // not a later independent sentence containing the same delivery words.
+    priorAttachmentEnd = attachmentHandoff(head) && /[，,]\s*$/u.test(head) ? start + sourceClause.length : null;
+    // i18n-allow: Explicit object/location/tool prefixes retain their following operation.
+    if (/^(?:把|将|对|为|在|用|使用|通过|根据)/u.test(head)) {
+      for (let index = 1; index < Math.min(head.length, 180); index++) {
+    // i18n-allow: Chinese historical or attributive predicate input grammar.
+        if (/(?:的|之|已经|已|之前|先前|曾经)\s*$/u.test(head.slice(0, index))) continue;
+        const candidate = head.slice(index);
+        // A post-object edit needs a predicate complement or a terminal verb.
+        // This leaves an adjective inside the object (rather than an edit command) alone.
+        // i18n-allow: Disposal/object-predicate complements, not an artifact-name blacklist.
+        const boundEdit = /^(?:编辑|修改|修订|调整|更新|追加|替换|删除|重命名|移动|复制|覆盖|合并)(?=为|成|到|一下|一次|掉|好|完成|并|然后|再|[，,。；;！？!?\s]*$)/u.test(candidate);
+        if (create.test(candidate) || boundEdit) predicates.push(candidate);
+      }
+    }
+    if (only !== 'mutate' && (predicates.some(part => create.test(part))
+      || /^(?:start|begin)\b[^.!?;\n]{0,120}\bby\s+creat(?:e|ing)\b/iu.test(head)
+      || /^(?:(?:use|call|invoke|run)\s+(?:the\s+)?)?(?:desktop_write_text_file|write_file)\b[\s\S]{0,120}\b(?:to\s+)?(?:write|create|generate|save)\b/iu.test(head)
+      || /^(?:call|use)\s+write_file\b/iu.test(head))) return true;
+    if (only !== 'create' && predicates.some(part => mutate.test(part))) return true;
+  }
+  return false;
+}
 
-  // i18n-allow: English artifact-creation input recognition; not user-visible copy.
-  const clauseImperative =
-    /(?:^|[\[\]{}()!?.,;:\n]\s*)(?:(?:please|now|then|next|you\s+must|you\s+should|must|should)\s+)*(?:create|write|generate|save)\b/iu;
-  // "Start a separate task by creating <path>" is an action contract, not a
-  // request to launch an application named "a separate task".
-  const startByCreating =
-    /\b(?:start|begin)\b[^.!?;\n]{0,120}\bby\s+creat(?:e|ing)\b/iu;
-  const requiredWriteTool =
-    /\b(?:must|should|need\s+to|required\s+to)\s+(?:call|use)\s+write_file\b/iu;
-  // Tool-directed wording is still an explicit mutation when the user gives
-  // an imperative such as "Use desktop_write_text_file ... to write ...".
-  // Previously this fell through as `kind:none`; with an unfinished task in
-  // the conversation, the generic continuation classifier then attached the
-  // independent instruction to the old task. Keep questions and negations out
-  // of this lane by requiring an imperative tool verb and rejecting a nearby
-  // negative guard.
-  const toolBackedWrite =
-    /\b(?:use|call|invoke|run)\s+(?:the\s+)?(?:desktop_write_text_file|write_file)\b[\s\S]{0,120}\b(?:to\s+)?(?:write|create|generate|save)\b/iu;
-  const negatedToolWrite =
-    /\b(?:do\s+not|don't|never|without)\s+(?:use|using|call|calling|invoke|run)\b[\s\S]{0,80}\b(?:desktop_write_text_file|write_file)\b/iu;
-  return (
-    clauseImperative.test(text)
-    || startByCreating.test(text)
-    || requiredWriteTool.test(text)
-    || (toolBackedWrite.test(text) && !negatedToolWrite.test(text))
-  );
+export function hasAffirmativeArtifactMutationAction(text: string): boolean {
+  return affirmativeArtifactAction(text);
 }
 
 function explicitArtifactCreationIntent(text: string): NormalizedActionIntent | null {
-  const target = explicitArtifactPath(text);
-  if (!target || !ARTIFACT_FILE_EXTENSION_RE.test(target) || !hasAffirmativeArtifactCreationAction(text)) {
-    return null;
-  }
+  const instruction = affirmativeActionClauses(text).find(probe => {
+    const target = explicitArtifactPath(probe);
+    return target && ARTIFACT_FILE_EXTENSION_RE.test(target) && affirmativeArtifactAction(probe, 'create');
+  });
+  if (!instruction) return null;
+  const target = explicitArtifactPath(instruction);
   return {
     kind: 'desktop_operation',
     operation: 'create',
@@ -307,17 +336,47 @@ function explicitArtifactCreationIntent(text: string): NormalizedActionIntent | 
   };
 }
 
+function explicitArtifactEditIntent(text: string): NormalizedActionIntent | null {
+  const instruction = affirmativeActionClauses(text).find(probe => {
+    // i18n-allow: User-directed edits bind their object in the same affirmative instruction.
+    const refersToFile = Boolean(explicitArtifactPath(probe)) || /(?:刚才|刚刚|上一份|这份|该).{0,20}(?:表格|文件|文档|Excel|工作簿)/iu.test(probe);
+    return refersToFile && affirmativeArtifactAction(probe, 'mutate');
+  });
+  if (!instruction) return null;
+  const target = explicitArtifactPath(instruction);
+  return { kind: 'desktop_operation', operation: 'mutate', subject: 'user',
+    target: target || 'recent_artifact', payload: text, sideEffectClass: 'local_write',
+    relation: 'new', confidence: 0.96, rule: 'explicit-artifact-edit' };
+}
+
 function explicitLocalArtifactReadIntent(text: string): NormalizedActionIntent | null {
-  const target = explicitArtifactPath(text);
-  if (!target) return null;
-  const targetIndex = text.indexOf(target);
-  const actionPrefix = targetIndex >= 0 ? text.slice(0, targetIndex).trim() : '';
-  // This owns only an explicit fresh command. “继续分析” and a path supplied
-  // by itself remain eligible to fill the target slot of an unfinished task.
-  // i18n-allow: Multilingual local-artifact read recognition; not user-visible copy.
-  if (!/^(?:(?:请|麻烦你|现在|直接)\s*)*(?:分析|读取|查看|审查|检查|总结)(?:一下)?\s*$|^(?:(?:please|now|directly)\s+)*(?:analy[sz]e|read|inspect|review|check|summari[sz]e)(?:\s+the)?\s*$/iu.test(actionPrefix)) {
-    return null;
+  const clauses = affirmativeActionClauses(text);
+  let instruction = clauses.find(probe => {
+    const target = explicitArtifactPath(probe);
+    if (!target) return false;
+    const targetIndex = probe.indexOf(target);
+    const actionPrefix = targetIndex >= 0 ? probe.slice(0, targetIndex).replace(/["'“”‘’`「」『』]+$/gu, '').trim() : '';
+    // This owns only an explicit fresh command. A path supplied by itself
+    // remains eligible to fill the target slot of an unfinished task.
+    // i18n-allow: Existing read predicate with explicit read-only/completeness and file operands.
+    return /^(?:(?:请|麻烦你|现在|直接)\s*)*(?:(?:只|完整)\s*)*(?:(?:改成|改为|换成)\s*)?(?:分析|补读|读取|读|查看|审查|检查|总结)(?:一下)?\s*(?:(?:桌面|下载(?:目录|文件夹)?|文档(?:目录|文件夹))(?:上|中|里|内|下|的)*\s*)?(?:(?:本地)?(?:文件|文档)\s*)?$|^(?:(?:please|now|directly)\s+)*(?:analy[sz]e|read|inspect|review|check|summari[sz]e)(?:\s+the)?\s*$/iu.test(actionPrefix);
+  });
+  let target = instruction ? explicitArtifactPath(instruction) : '';
+  if (!instruction) {
+    // A corrected filename and its affirmative referential read can occupy
+    // different clauses of this same user turn. Quoted payloads, negatives,
+    // hypothetical examples and unrelated named files are not target grants.
+    // i18n-allow: Direct referential read and explicit filename-correction grammar.
+    instruction = clauses.find(probe => /^(?:(?:请|麻烦你?|现在|直接|先|再|然后|接着)\s*)*(?:(?:只|完整)\s*)*(?:补读|读取|读)(?:一下)?\s*(?:这份(?:文件|文档|材料)?|该份(?:文件|文档)?|该文件|该文档|这个(?:文件|文档))(?=$|[，,。；;！!\s])/u.test(probe));
+    if (!instruction) return null;
+    // i18n-allow: Existing correction, recipient and messaging input grammar; no new authority.
+    const corrected = clauses.filter(probe => /^(?:实际(?:上)?(?:是|为|应为)|正确(?:的)?文件名(?:是|为)|文件名(?:应为|应该是|是|为)|应(?:该)?(?:是|为))/u.test(probe))
+      .map(probe => explicitFile(probe)).filter(Boolean);
+    const unique = [...new Set(corrected)];
+    if (unique.length !== 1) return null;
+    target = unique[0];
   }
+  if (!target) return null;
   return {
     kind: 'desktop_operation',
     operation: 'read',
@@ -380,6 +439,7 @@ function correctionOrExplanation(text: string): NormalizedActionIntent | null {
   // i18n-allow: Chinese correction/authorization input recognition; not user-visible copy.
   const negativeAuthorization = // i18n-allow: Chinese correction/authorization input recognition; not user-visible copy.
     /(?:我|我们)?(?:没有|没|并没有|从没)(?:让|叫|要求|授权|同意)你.{0,80}(?:打开|发送|执行|操作|创建|删除)|(?:不是|并不是)(?:让|叫|要)你.{0,80}(?:打开|发送|执行|操作|创建|删除)/u;
+  if (/^(?:你|lumi)?[，,\s]*(?:能不能|不要|别|以后不要|别再|不准再)[^。！？!?\n]{0,80}(?:动不动|总是|老是|每次|随便|擅自)[^。！？!?\n]{0,80}(?:进入|打开|切换|跳到|回复|回答|说|讲)/iu.test(text)) return { kind: 'correction_explanation', operation: 'explain', subject: 'lumi', target: 'previous_action', payload: text, sideEffectClass: 'none', relation: 'correction', confidence: 0.98, rule: 'product-behaviour-correction' }; // i18n-allow: Product behaviour feedback, not navigation authorization.
   // i18n-allow: Multilingual authorization objections and retrospective challenges; not user-visible copy.
   const authorizationOrExecutionObjection =
     /(?:谁|哪个人|是谁)(?:让|叫|允许|授权|批准)你|未经(?:我|我们)?(?:的)?(?:允许|授权|同意|批准)|(?:你)?(?:没有|无|没)(?:这个)?权限|(?:我|我们)?什么时候(?:允许|授权|同意|让)你|凭什么(?:打开|发送|执行|操作|创建|删除)?|为什么不(?:先)?(?:问|确认|征得)|(?:你|lumi).{0,24}(?:刚才|刚刚|之前|上一轮)[^。！？!?\n]{0,48}(?:打开|发送|执行|操作|创建|删除)[^。！？!?\n]{0,36}(?:干什么|为什么|凭什么|怎么回事)|\bwho\s+(?:asked|told|authorized|allowed|gave)\s+you\b|\bwithout\s+(?:my|our)\s+(?:permission|authorization|approval)\b|\byou\s+(?:(?:do|did)\s+not|don['\u2019]?t|didn['\u2019]?t)\s+have\s+(?:my\s+)?permission\b|\bwhy\s+(?:didn['\u2019]?t\s+you|did\s+you\s+not)\s+(?:ask|confirm)\b|\bwhy\s+did\s+(?:you|lumi)\s+(?:just\s+)?(?:open|send|run|execute|create|delete)\b/iu;
@@ -389,10 +449,6 @@ function correctionOrExplanation(text: string): NormalizedActionIntent | null {
   // i18n-allow: Chinese terse-complaint input recognition; not user-visible copy.
   const terseComplaint = // i18n-allow: Chinese terse-complaint input recognition; not user-visible copy.
     /^(?:(?:我操|卧槽|靠|妈的|搞什么|什么鬼)[，,\s]*)?(?:你|lumi)[^。！？!?\n]{0,20}(?:打开|发送|执行|操作|做|画)了[^。！？!?\n]{0,28}(?:什么|啥|为什么|怎么回事)[^。！？!?\n]*[啊呀呢吧。！？!?]*$/iu;
-  // i18n-allow: A correction to the completeness of the preceding answer is
-  // conversational. Negative mentions of tools must never turn it into work.
-  const answerCompletenessCorrection =
-    /(?:你)?(?:漏了|少了|没(?:有)?回答|未回答|没说|没有说|没讲|没有讲|回答不完整).{0,100}(?:只(?:补充|回答|说)|补充一句|不要调用工具|不用工具)|(?:只补充一句|补充一句).{0,100}(?:不要调用工具|不用工具)/u; // i18n-allow: Answer-correction input recognition; not user-visible copy.
   // A user can correct task identity while quoting the wrongly selected old
   // action. Quoted verbs remain evidence about the previous turn and must not
   // become a fresh command.
@@ -412,7 +468,6 @@ function correctionOrExplanation(text: string): NormalizedActionIntent | null {
     && !authorizationOrExecutionObjection.test(text)
     && !actionComplaint.test(text)
     && !terseComplaint.test(text)
-    && !answerCompletenessCorrection.test(text)
     && !taskIdentityCorrection.test(text)
   ) return null;
   return {
@@ -428,35 +483,11 @@ function correctionOrExplanation(text: string): NormalizedActionIntent | null {
   };
 }
 
-export type NormalizedIntentRuntimeRole = 'advisory' | 'native_client_event';
-export type NormalizedIntentOrigin =
-  | 'natural_language'
-  | 'structured_client_event'
-  | 'model_selected_capability';
-
-/**
- * Normalized intent is a planning hint, not a natural-language executor.
- * Merely recognizing a registered client surface in user text never upgrades
- * the text into a native event. Deterministic ownership is reserved for a
- * structured client event; model-selected capabilities execute through the
- * shared tool loop and therefore remain advisory here.
- */
-export function getNormalizedIntentRuntimeRole(
-  intent: NormalizedActionIntent,
-  origin: NormalizedIntentOrigin = 'natural_language',
-): NormalizedIntentRuntimeRole {
-  return origin === 'structured_client_event'
-    && intent.kind === 'client_navigation'
-    && Boolean(intent.clientAction)
-    ? 'native_client_event'
-    : 'advisory';
-}
-
 const MIXED_STATUS_SIGNAL_RE =
   /(?:\u72b6\u6001|\u8fdb\u5ea6|\u7ed3\u679c|(?:\u5b8c\u6210|\u505a\u5b8c|\u6267\u884c\u5b8c|\u597d)(?:\u4e86)?(?:\u5417|\u6ca1|\u4e86\u6ca1)|\u662f\u5426.{0,16}(?:\u5b8c\u6210|\u505a\u5b8c|\u6267\u884c\u5b8c)|(?:\u6ca1\u6709|\u6ca1|\u672a|\u5c1a\u672a)(?:\u5b8c\u6210|\u505a\u5b8c|\u6267\u884c\u5b8c)|\b(?:status|progress|result)\b|\b(?:is|was|has)\b.{0,24}\b(?:done|complete|completed|finished|successful)\b|\bwhether\b.{0,24}\b(?:done|complete|completed|finished)\b)/iu;
 
 const CN_MIXED_STATUS_EXECUTION_RE =
-  /(?:\u5982\u679c|\u82e5|\u8981\u662f|\u5047\u5982).{0,18}(?:\u6ca1\u6709|\u6ca1|\u672a|\u5c1a\u672a)(?:\u5b8c\u6210|\u505a\u5b8c|\u6267\u884c\u5b8c|\u6210\u529f)[^\u3002\uff01\uff1f.!?\n]{0,18}(?:(?:\u5c31|\u5219|\u90a3\u5c31|\u8bf7|\u9a6c\u4e0a|\u7acb\u5373|\u73b0\u5728)\s*)?(?:\u7ee7\u7eed|\u63a5\u7740|\u6062\u590d|\u91cd\u8bd5|\u518d\u8bd5|\u91cd\u65b0\u6267\u884c|\u6267\u884c|\u5904\u7406|\u63a8\u8fdb|\u5b8c\u6210|\u505a\u5b8c)|(?:\u6ca1\u6709|\u6ca1|\u672a|\u5c1a\u672a)(?:\u5b8c\u6210|\u505a\u5b8c|\u6267\u884c\u5b8c|\u6210\u529f)[^\u3002\uff01\uff1f.!?\n]{0,12}(?:\u5c31|\u5219|\u90a3\u5c31|\u8bf7|\u9a6c\u4e0a|\u7acb\u5373|\u73b0\u5728)\s*(?:\u7ee7\u7eed|\u63a5\u7740|\u6062\u590d|\u91cd\u8bd5|\u518d\u8bd5|\u91cd\u65b0\u6267\u884c|\u6267\u884c|\u5904\u7406|\u63a8\u8fdb|\u5b8c\u6210|\u505a\u5b8c)|[\uff1f?\uff1b;\u3002]\s*(?:(?:\u8bf7|\u73b0\u5728|\u9a6c\u4e0a|\u7acb\u5373|\u7136\u540e|\u90a3\u5c31|\u5c31)\s*)?(?:\u7ee7\u7eed|\u63a5\u7740|\u6062\u590d|\u91cd\u8bd5|\u518d\u8bd5|\u91cd\u65b0\u6267\u884c|\u6267\u884c|\u5904\u7406|\u63a8\u8fdb)(?:\u5b83|\u8fd9\u4e2a|\u90a3\u4e2a|\u4efb\u52a1)?/u;
+  /(?:\u5982\u679c|\u82e5|\u8981\u662f|\u5047\u5982).{0,18}(?:\u6ca1\u6709|\u6ca1|\u672a|\u5c1a\u672a)(?:\u5b8c\u6210|\u505a\u5b8c|\u6267\u884c\u5b8c|\u6210\u529f)[^\u3002\uff01\uff1f.!?\n]{0,18}(?:(?:\u5c31|\u5219|\u90a3\u5c31|\u8bf7|\u9a6c\u4e0a|\u7acb\u5373|\u73b0\u5728)\s*)?(?:\u7ee7\u7eed|\u63a5\u7740|\u6062\u590d|\u91cd\u8bd5|\u518d\u8bd5|\u91cd\u65b0\u6267\u884c|\u6267\u884c|\u5904\u7406|\u63a8\u8fdb|\u5b8c\u6210|\u505a\u5b8c)|(?:\u6ca1\u6709|\u6ca1|\u672a|\u5c1a\u672a)(?:\u5b8c\u6210|\u505a\u5b8c|\u6267\u884c\u5b8c|\u6210\u529f)[^\u3002\uff01\uff1f.!?\n]{0,12}(?:\u5c31|\u5219|\u90a3\u5c31|\u8bf7|\u9a6c\u4e0a|\u7acb\u5373|\u73b0\u5728)\s*(?:\u7ee7\u7eed|\u63a5\u7740|\u6062\u590d|\u91cd\u8bd5|\u518d\u8bd5|\u91cd\u65b0\u6267\u884c|\u6267\u884c|\u5904\u7406|\u63a8\u8fdb|\u5b8c\u6210|\u505a\u5b8c)|[\uff1f?\uff1b;\u3002]\s*(?:(?:\u8bf7|\u73b0\u5728|\u9a6c\u4e0a|\u7acb\u5373|\u7136\u540e|\u90a3\u5c31|\u5c31)\s*)?(?:\u7ee7\u7eed|\u63a5\u7740|\u6062\u590d|\u91cd\u8bd5|\u518d\u8bd5|\u91cd\u65b0\u6267\u884c|\u6267\u884c|\u5904\u7406|\u63a8\u8fdb|\u5b8c\u6210|\u505a\u5b8c)(?:\u5b83|\u8fd9\u4e2a|\u90a3\u4e2a|\u4efb\u52a1)?/u;
 
 const EN_MIXED_STATUS_EXECUTION_RE =
   /\bif\s+(?:(?:not|unfinished|incomplete)\b|(?:(?:it|this|that|the\s+task)\s+)?(?:is|was|has\s+been)?\s*(?:not|isn['\u2019]?t|wasn['\u2019]?t|hasn['\u2019]?t)\s+(?:done|complete|completed|finished|successful)\b)[^.!?;\n]{0,28}\b(?:continue|resume|retry|re-?try|execute|run|finish|complete|proceed)\b|[?;.!]\s*(?:(?:if\s+(?:not|unfinished|incomplete)|then|please|now)\s*[,;:]?\s*)*(?:continue|resume|retry|re-?try|execute|run|finish|complete|proceed)\b/iu;
@@ -502,16 +533,32 @@ export function isTerseExecutionStatusQuestion(text: string): boolean {
     || /^(?:你发了吗[，,]\s*)?(?:为什么|你为什么|没发为什么|你发了吗).{0,60}(?:没去|没有|没发|没调用|没执行|没发起|说.*再发|说.*发起)/u.test(text);
 }
 
+export function isPriorArtifactDeliveryQuestion(text: string): boolean {
+  const value = withoutLocationLiterals(currentTurnText(text));
+  // i18n-allow: A question about an already requested change, not a fresh edit.
+  return /(?:刚才|刚刚|之前|上次|上一轮)[^。！？!?\n]{0,50}(?:改好|改完|做好|做完|完成|处理好|生成好|保存好)(?:了)?(?:吗|没有|没|了没)/u.test(value);
+}
+
+export function isPriorWorkDeliveryFactQuestion(text: string): boolean {
+  const value = withoutLocationLiterals(currentTurnText(text));
+  // i18n-allow: Detailed proof questions use the exact action-status projection.
+  if (/(?:什么|哪些|哪项|何种).{0,8}(?:证据|凭证)|(?:证据|凭证).{0,16}(?:证明|验证|成功)|\bwhat\s+(?:evidence|proof)\b|\b(?:evidence|proof)\b.{0,24}\b(?:prov\w*|succeed\w*|verif\w*)\b/iu.test(value)) return false;
+  // i18n-allow: Read-only questions about previous work and file changes.
+  return /(?:刚才|刚刚|之前|这次|本次|上一轮)[^。！？!?\n]{0,20}(?:实际|已经|已|都)?(?:完成|做|处理)[^。！？!?\n]{0,14}(?:什么|哪些|哪一步)|(?:原|源)文件[^。！？!?\n]{0,12}(?:改过|修改过|写过|变过)(?:吗|没有|没)|\bwhat\s+(?:did|have)\s+you\s+(?:actually\s+)?(?:complete|finish|do|done)|\b(?:was|did)\b[^.!?\n]{0,30}\b(?:original|source)\s+file\b[^.!?\n]{0,20}\b(?:change|modif)/iu.test(value);
+}
+
 export function isRecentActionReceiptQuery(text: string): boolean {
-  const value = currentTurnText(String(text || '')).replace(/\s+/gu, ' ').trim();
+  const value = withoutLocationLiterals(currentTurnText(String(text || ''))).replace(/\s+/gu, ' ').trim();
   return isTerseExecutionStatusQuestion(value)
+    || isPriorArtifactDeliveryQuestion(value)
+    || isPriorWorkDeliveryFactQuestion(value)
     || isPriorTurnToolReceiptQuestion(value)
     || RECENT_ACTION_RECEIPT_QUERY_RE.test(value)
     || RECORDED_RECEIPT_STATUS_QUERY_RE.test(value);
 }
 
 const CN_INDEPENDENT_ACTION_AFTER_STATUS_RE =
-  /(?:[\uff1f?\uff1b;\uff0c,\u3002.!\u2026\n]\s*(?:(?:\u7136\u540e|\u73b0\u5728|\u63a5\u7740|\u4e0b\u4e00\u6b65|\u53e6\u5916|\u5e76(?:\u4e14)?|\u518d)\s*)?|(?:\u7136\u540e|\u73b0\u5728|\u63a5\u7740|\u4e0b\u4e00\u6b65|\u53e6\u5916|\u5e76(?:\u4e14)?|\u518d)\s*)(?!(?:\u4e0d\u8981|\u522b|\u65e0\u9700|\u4e0d\u5fc5|\u53ea|\u4ec5))(?:(?:\u8bf7|\u9a6c\u4e0a|\u7acb\u5373)\s*)?(?:\u6253\u5f00|\u542f\u52a8|\u65b0\u5efa|\u521b\u5efa|\u4fdd\u5b58|\u5199\u5165|\u53d1\u9001|\u5173\u95ed|\u5220\u9664|\u4fee\u6539|\u5bfc\u51fa|\u4e0a\u4f20|\u4e0b\u8f7d|\u5b89\u88c5|\u7ee7\u7eed|\u6062\u590d|\u91cd\u8bd5|\u6267\u884c|\u5904\u7406|\u8c03\u7528|\u4f7f\u7528|\u68c0\u67e5|\u6838\u5b9e|\u6838\u9a8c)/u;
+  /(?:[\uff1f?\uff1b;\uff0c,\u3002.!\u2026\n]\s*(?:(?:\u7136\u540e|\u73b0\u5728|\u63a5\u7740|\u4e0b\u4e00\u6b65|\u53e6\u5916|\u5e76(?:\u4e14)?|\u518d)\s*)?|(?:\u7136\u540e|\u73b0\u5728|\u63a5\u7740|\u4e0b\u4e00\u6b65|\u53e6\u5916|\u5e76(?:\u4e14)?|\u518d)\s*)(?!(?:\u4e0d\u8981|\u522b|\u65e0\u9700|\u4e0d\u5fc5|\u53ea|\u4ec5))(?:(?:\u8bf7|\u9a6c\u4e0a|\u7acb\u5373)\s*)?(?:\u6253\u5f00|\u542f\u52a8|\u65b0\u5efa|\u521b\u5efa|\u4fdd\u5b58|\u5199\u5165|\u53d1\u9001|\u5173\u95ed|\u5220\u9664|\u4fee\u6539|\u5bfc\u51fa|\u4e0a\u4f20|\u4e0b\u8f7d|\u5b89\u88c5|\u7ee7\u7eed|\u7eed\u63a5|\u5b8c\u6210|\u505a\u5b8c|\u6062\u590d|\u91cd\u8bd5|\u6267\u884c|\u5904\u7406|\u8c03\u7528|\u4f7f\u7528|\u68c0\u67e5|\u6838\u5b9e|\u6838\u9a8c)|[:\uff1a]\s*(?:(?:\u8bf7|\u73b0\u5728)\s*)?(?:\u5b8c\u6210|\u6267\u884c|\u505a\u5b8c)(?:\u7b2c[\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\d]+\u6b65|\u6b65\u9aa4)(?!\s*(?:\u4e86(?:\u5417|\u6ca1)|(?:\u8fc7)?\u5417|\u6ca1\u6709?|\u5462|[\uff1f?]))/u;
 
 const EN_INDEPENDENT_ACTION_AFTER_STATUS_RE =
   /(?:[?;.!,\u2026\n]\s*(?:(?:then|now|next|also|and|please)\s*[,;:]?\s*)*|\b(?:(?:and\s+)?(?:then|now|next|also)|and)\b\s*)(?!(?:do\s+not|don['\u2019]?t|never|only|just\s+(?:answer|report))\b)(?:open|launch|start|create|save|write|send|close|delete|modify|update|export|upload|download|install|continue|resume|retry|re-?try|execute|run|finish|complete|proceed|call|use|check|verify|inspect)\b/iu;
@@ -520,7 +567,7 @@ const EN_TRAILING_ACTION_QUESTION_RE =
   /\b(?:open|launch|start|create|save|write|send|close|delete|modify|update|export|upload|download|install|continue|resume|retry|re-?try|execute|run|finish|complete|proceed|call|use|check|verify|inspect)\b[^.!?;\n]{0,64}\?\s*$/iu;
 
 const CN_TRAILING_ACTION_QUESTION_RE =
-  /(?:\u6253\u5f00|\u542f\u52a8|\u65b0\u5efa|\u521b\u5efa|\u4fdd\u5b58|\u5199\u5165|\u53d1\u9001|\u5173\u95ed|\u5220\u9664|\u4fee\u6539|\u5bfc\u51fa|\u4e0a\u4f20|\u4e0b\u8f7d|\u5b89\u88c5|\u7ee7\u7eed|\u6062\u590d|\u91cd\u8bd5|\u6267\u884c|\u5904\u7406|\u8c03\u7528|\u4f7f\u7528|\u68c0\u67e5|\u6838\u5b9e|\u6838\u9a8c)[^\u3002\uff01!\uff1b;\n]{0,64}(?:(?:\u4e86|\u8fc7)?\u5417|\u4e86\u6ca1|\u6ca1\u6709?|\u5462|\u662f\u5426|\u662f\u4e0d\u662f)[\uff1f?]?\s*$/u;
+  /(?:\u6253\u5f00|\u542f\u52a8|\u65b0\u5efa|\u521b\u5efa|\u4fdd\u5b58|\u5199\u5165|\u53d1\u9001|\u5173\u95ed|\u5220\u9664|\u4fee\u6539|\u5bfc\u51fa|\u4e0a\u4f20|\u4e0b\u8f7d|\u5b89\u88c5|\u7ee7\u7eed|\u7eed\u63a5|\u5b8c\u6210|\u505a\u5b8c|\u6062\u590d|\u91cd\u8bd5|\u6267\u884c|\u5904\u7406|\u8c03\u7528|\u4f7f\u7528|\u68c0\u67e5|\u6838\u5b9e|\u6838\u9a8c)[^\u3002\uff01!\uff1b;\n]{0,64}(?:(?:\u4e86|\u8fc7)?\u5417|\u4e86\u6ca1|\u6ca1\u6709?|\u5462|\u662f\u5426|\u662f\u4e0d\u662f)[\uff1f?]?\s*$/u;
 
 /**
  * A status question is not status-only when the same turn also contains an
@@ -534,7 +581,8 @@ export function hasMixedStatusExecutionIntent(value: string): boolean {
   const hasTaskStatusSignal = MIXED_STATUS_SIGNAL_RE.test(text);
   const hasRecentActionStatusSignal = isRecentActionReceiptQuery(text);
   if (!hasTaskStatusSignal && !hasRecentActionStatusSignal) return false;
-  const chineseExecutionQuestion = /(?:\u7ee7\u7eed(?:\u6267\u884c|\u5904\u7406|\u63a8\u8fdb|\u5b8c\u6210)?|\u63a5\u7740(?:\u6267\u884c|\u5904\u7406|\u63a8\u8fdb|\u505a)?|\u6062\u590d(?:\u6267\u884c|\u4efb\u52a1)?|\u91cd\u8bd5|\u518d\u8bd5|\u91cd\u65b0\u6267\u884c|\u6267\u884c|\u5904\u7406|\u63a8\u8fdb)(?:\u5b83|\u8fd9\u4e2a|\u90a3\u4e2a|\u4efb\u52a1)?(?:\u4e86)?(?:(?:\u5417|\u6ca1|\u6ca1\u6709|\u5462)[\uff1f?]?|[\uff1f?])\s*$/u.test(text);
+  const chineseExecutionQuestion = /(?:\u7ee7\u7eed(?:\u6267\u884c|\u5904\u7406|\u63a8\u8fdb|\u5b8c\u6210)?|\u63a5\u7740(?:\u6267\u884c|\u5904\u7406|\u63a8\u8fdb|\u505a)?|\u6062\u590d(?:\u6267\u884c|\u4efb\u52a1)?|\u91cd\u8bd5|\u518d\u8bd5|\u91cd\u65b0\u6267\u884c|\u6267\u884c|\u5904\u7406|\u63a8\u8fdb)(?:\u5b83|\u8fd9\u4e2a|\u90a3\u4e2a|\u4efb\u52a1)?(?:\u4e86)?(?:(?:\u5417|\u6ca1|\u6ca1\u6709|\u5462)[\uff1f?]?|[\uff1f?])\s*$/u.test(text)
+    || CN_TRAILING_ACTION_QUESTION_RE.test(text);
   const englishExecutionQuestion = /\b(?:continue|resume|retry|re-?try|execute|run|finish|complete|proceed)(?:\s+(?:executing|execution|running|working\s+on|with)(?:\s+(?:it|this|that|the\s+task))?)?\s*\?\s*$/iu.test(text)
     || EN_TRAILING_ACTION_QUESTION_RE.test(text);
   const chineseIndependentAction = CN_INDEPENDENT_ACTION_AFTER_STATUS_RE.test(text)
@@ -543,54 +591,129 @@ export function hasMixedStatusExecutionIntent(value: string): boolean {
     && !EN_TRAILING_ACTION_QUESTION_RE.test(text);
   return (CN_MIXED_STATUS_EXECUTION_RE.test(text) && !chineseExecutionQuestion)
     || (EN_MIXED_STATUS_EXECUTION_RE.test(text) && !englishExecutionQuestion)
-    || (hasRecentActionStatusSignal && chineseIndependentAction)
+    || ((hasRecentActionStatusSignal || hasTaskStatusSignal) && chineseIndependentAction)
     || (hasRecentActionStatusSignal && englishIndependentAction);
 }
 
+function isConversationExecutionFactCandidate(text: string): boolean {
+  const normalized = String(text || '').trim();
+  if (!normalized) return false;
+  if (classifySkillAuthoringIntent(normalized) !== 'none') return false;
+  if (isPriorArtifactDeliveryQuestion(normalized) && !hasMixedStatusExecutionIntent(normalized)) return true;
+  if (isPriorWorkDeliveryFactQuestion(normalized)) return true;
+  if (isPriorFailureExplanationQuestion(normalized)) return true;
+  if (isPriorTurnToolReceiptQuestion(normalized)) return true;
+  if (isPriorSingleFileReadFactQuestion(normalized)) return true;
+  // i18n-allow -- Chinese prior-open fact-question recognition; not user-visible copy.
+  const asksAboutPriorOpen = /(?:你)?(?:不是|不都|难道没)?(?:已经|刚才|刚刚|之前).{0,16}(?:打开|启动|运行).{0,24}(?:吗|没有|没|不知道|忘了)|(?:你)?(?:已经|刚才|刚刚).{0,16}(?:打开|启动|运行)了[，,。！？!?\s]*(?:你)?(?:自己)?(?:不知道|忘了)|\b(?:didn'?t|did\s+you\s+not|you\s+already).{0,40}\b(?:open|launch|start)(?:ed)?\b/iu.test(normalized);
+  if (asksAboutPriorOpen) return true;
+  const conversationScope = /(?:这|本|当前|刚才|刚刚|整个).{0,10}(?:轮|段|次)?(?:对话|会话|聊天)|\b(?:this|current|that)\s+(?:conversation|chat|session)\b/iu.test(normalized); // i18n-allow: Multilingual execution-fact question recognition; not user-visible copy.
+  const asksWhether = /(?:有没有|有没|是否|究竟|到底|真的)|\b(?:did|have|was|were)\b/iu.test(normalized); // i18n-allow: Multilingual execution-fact question recognition; not user-visible copy.
+  const executionSubject = /(?:(?:调用|执行|使用|跑).{0,10}(?:工具|插件|技能)|(?:创建|新建|建立).{0,10}(?:任务|计划))|\b(?:call|use|run|execute)(?:d|ing)?\s+(?:any\s+)?tools?\b|\bcreat(?:e|ed|ing)\s+(?:any\s+)?tasks?\b/iu.test(normalized); // i18n-allow: Multilingual execution-fact question recognition; not user-visible copy.
+  const asksVerifiedClientNavigation = /(?:成功|实际|真实|回执).{0,24}(?:客户端)?(?:导航|界面动作|页面动作)|(?:哪一个|哪个|什么).{0,24}(?:客户端)?(?:导航动作|界面动作)/u.test(normalized); // i18n-allow: Multilingual execution-fact question recognition; not user-visible copy.
+  return (conversationScope && asksWhether && executionSubject) || asksVerifiedClientNavigation;
+}
+
+export function isConversationExecutionFactQuestion(text: string): boolean {
+  if (!isConversationExecutionFactCandidate(text)) return false;
+  const intent = normalizeActionIntent(text);
+  return intent.kind === 'status_query' && intent.sideEffectClass === 'none';
+}
+
+export function isPriorSingleFileReadFactQuestion(text: string): boolean {
+  const normalized = String(text || '').replace(/\s+/gu, ' ').trim();
+  if (!normalized) return false;
+  // A correction that names a concrete file is executable work even when it
+  // also says "previous task" or contains the word "path".  Let the normal
+  // task-continuation path bind it to the server-owned task; never consume it
+  // as a read-only history lookup before the tool loop runs.
+  // i18n-allow: multilingual action/target recognition; not user-visible copy.
+  const hasExplicitFileTarget = /(?:[A-Za-z]:[\\/]|\\\\)[^\r\n“”"'<>|?*，,；;。！？!?]{1,440}\.[A-Za-z0-9]{1,16}(?=$|[\s，,；;。！？!?)）\]}'"])/u.test(normalized)
+    || /\/(?:Users|home|tmp|var|opt|Volumes)\/[^\r\n“”"'<>]{1,440}\.[A-Za-z0-9]{1,16}(?=$|[\s，,；;。！？!?)）\]}'"])/u.test(normalized);
+  // i18n-allow: multilingual correction/continuation recognition; not user-visible copy.
+  const explicitTargetAction = /(?:不是|不对|纠正|改成|改为|换成|而是|应该是)|(?:继续|接着|重试).{0,32}(?:任务|读取|读|打开|分析)|(?:请|帮我|现在|然后|继续|接着|重新|再次|再|改成|改为|换成)\s*(?:读取|读一下|打开|分析)|\b(?:instead|correct|change|replace|continue|resume|retry|re-?read|read\s+again)\b/iu.test(normalized);
+  if (hasExplicitFileTarget && explicitTargetAction) return false;
+  // A request to re-read is executable work. This fast path is only for
+  // recalling the immediately preceding, already verified read receipt.
+  // i18n-allow: multilingual previous-file fact recognition; not user-visible copy.
+  const freshReadMarkers = Array.from(normalized.matchAll(
+    /(?:重新\s*读取|再次\s*读取|再\s*读(?:取)?|重读)|\b(?:re-?read(?:ing)?|read\s+again)\b/giu,
+  ));
+  const asksForFreshRead = freshReadMarkers.some(marker => {
+    const markerIndex = marker.index ?? 0;
+    const prefix = normalized.slice(Math.max(0, markerIndex - 48), markerIndex);
+    const clausePrefix = prefix.slice(Math.max(
+      prefix.lastIndexOf('，'),
+      prefix.lastIndexOf(','),
+      prefix.lastIndexOf('。'),
+      prefix.lastIndexOf('.'),
+      prefix.lastIndexOf('！'),
+      prefix.lastIndexOf('!'),
+      prefix.lastIndexOf('？'),
+      prefix.lastIndexOf('?'),
+      prefix.lastIndexOf('；'),
+      prefix.lastIndexOf(';'),
+    ) + 1);
+    // "不要重新读取" and "without re-reading" explicitly forbid a new
+    // tool call. They must not be mistaken for an executable re-read request.
+    // Keep the negation close to the marker so a separate clause such as
+    // "不要猜，重新读取" still requests fresh work.
+    // i18n-allow: multilingual negated re-read recognition; not user-visible copy.
+    const negated = /(?:不要|别|无需|无须|不用|不必|不需要|请勿|禁止|不是(?:要|让你)?|并非(?:要|让你)?)[^，,。.!！？?；;\n]{0,6}$/u.test(clausePrefix)
+      || /(?:do\s+not|don't|dont|never|without|no\s+need\s+to|need\s+not|needn't|must\s+not)(?:\s+(?:actually|really|ever|please|the\s+file|it)){0,3}\s*$/iu.test(clausePrefix);
+    return !negated;
+  });
+  if (asksForFreshRead) return false;
+  // i18n-allow: multilingual previous-file fact recognition; not user-visible copy.
+  const prior = /(?:刚才|刚刚|上一轮|上次|前一轮|此前)|\b(?:just\s+now|previous(?:ly)?|last\s+turn|prior\s+turn|earlier)\b/iu.test(normalized);
+  // i18n-allow: multilingual previous-file fact recognition; not user-visible copy.
+  const read = /(?:读取|读过|读的|所读)|\b(?:read|file)\b/iu.test(normalized);
+  // i18n-allow: multilingual previous-file fact recognition; not user-visible copy.
+  const asksFact = /(?:哪个|哪一个|什么|精确|路径|字段|值|名称|版本)|\b(?:which|what|exact|path|field|value|name|version)\b/iu.test(normalized);
+  // A fact lookup must actually ask for, recall, or request presentation of a
+  // stored value. Merely mentioning "previous", "read", and "path" is not a
+  // question and must not steal an executable correction from the task lane.
+  // i18n-allow: multilingual fact-query recognition; not user-visible copy.
+  const asksForRecall = /[？?]/u.test(normalized)
+    || /(?:告诉我|列出|给我|回答|说(?:一)?下|回忆|根据.{0,20}回执|分.{0,8}(?:行|列))/u.test(normalized)
+    || /\b(?:tell|report|list|give|recall|show|based\s+(?:only\s+)?on)\b/iu.test(normalized);
+  return prior && read && asksFact && asksForRecall;
+}
+
+export function isPriorFailureExplanationQuestion(text: string): boolean {
+  // i18n-allow: Chinese previous-turn failure question recognition; not user-visible copy.
+  return /^(?:(?:这次|刚才|刚刚|上次|前面|那个任务)\s*)?(?:为什么|怎么(?:会)?|为何)\s*(?:失败|没(?:有)?(?:做成|完成|成功)|没做成|出错|报错|受阻|卡住)(?:了|的)?[啊呀呢，,。！？?!\s]*$/u.test(text)
+    || /^why\s+(?:did\s+)?(?:it|that|the\s+(?:task|request))?\s*(?:fail|failed|not\s+(?:finish|complete|succeed))[?!.\s]*$/iu.test(text);
+}
+
 function statusQuery(text: string): NormalizedActionIntent | null {
-  // Only invoke the richer edition matcher when the turn names a design
-  // ledger concept. This preserves linear behavior for long unrelated turns.
-  if (
-    /(?:设计项目|CAD|效果图|提案\s*PPT|交付中心|design\s+project|visualization|handoff)/iu.test(text) // i18n-allow: Designer status input recognition; not user-visible copy.
-    && isDesignProjectStatusRequest(text)
-  ) {
-    return {
-      kind: 'status_query',
-      operation: 'status',
-      subject: 'lumi',
-      target: 'interior_design_project',
-      payload: '',
-      sideEffectClass: 'none',
-      relation: 'status',
-      confidence: 0.99,
-      rule: 'designer-project-ledger-status',
-    };
-  }
+  const namedArtifact = relativeArtifactPath(text, false);
   // A concrete new write owns the turn even when a separate scope fence uses
   // a status noun. Retrospective/status-only forms are excluded by the strict
   // affirmative artifact-action recognizer.
   if (explicitArtifactCreationIntent(text)) return null;
+  if (designerStatusRequest(text)) return {
+    kind: 'status_query', operation: 'status', subject: 'lumi', target: 'design_project',
+    payload: '', sideEffectClass: 'none', relation: 'status', confidence: 0.99,
+    rule: 'designer-persisted-ledger-status',
+  };
   if (hasMixedStatusExecutionIntent(text)) return null;
+  if (matchesCnTaskReceiptQuestion(text)) return {
+    kind: 'status_query', operation: 'status', subject: 'lumi', target: 'recent_task',
+    payload: '', sideEffectClass: 'none', relation: 'status', confidence: 0.99,
+    rule: 'saved-task-receipt-question',
+  };
   if (WALLPAPER_STATE_MUTATION_RE.test(text)) return null;
   // Reporting the id/status after creating a specifically described new task
   // is part of that creation contract, not a query about an older task.
   if (persistentWorkTaskCreation(text)) return null;
-  // Explicit current-runtime questions must be read-only status intents even
-  // when they do not contain the narrow "task status/progress" wording. This
-  // covers the production utterance "你现在有在执行的任务吗" and keeps it out
-  // of the generic desktop-operation fallback.
-  if (/^(?:\u4f60|lumi)?\s*(?:\u73b0\u5728|\u5f53\u524d)?\s*(?:\u6709\s*)?(?:\u5728|\u6b63\u5728)?\s*(?:\u6267\u884c|\u5904\u7406|\u8fd0\u884c|\u505a)\s*(?:\u7684)?\s*(?:\u4efb\u52a1|\u5de5\u4f5c)(?:\u5417|\u5462|\u6ca1\u6709)?[\u3002\uff01\uff1f.!?\s]*$/iu.test(text)) {
-    return {
-      kind: 'status_query',
-      operation: 'status',
-      subject: 'lumi',
-      target: 'runtime_work',
-      payload: '',
-      sideEffectClass: 'none',
-      relation: 'status',
-      confidence: 0.99,
-      rule: 'current-runtime-work-status',
-    };
+  // File/folder names such as chat/repair/progress are data. Keep the original
+  // artifact target above, then classify only the surrounding instruction.
+  text = withoutLocationLiterals(text);
+  if (classifyRuntimeWorkIntent(text) === 'status') {
+    return { kind: 'status_query', operation: 'status', subject: 'lumi',
+      target: 'runtime_work', payload: '', sideEffectClass: 'none', relation: 'status',
+      confidence: 0.99, rule: 'current-runtime-work-status' };
   }
   // Terse questions immediately after an operation ask for its persisted
   // outcome. Treat them as receipt reads; task relation resolution decides
@@ -622,7 +745,6 @@ function statusQuery(text: string): NormalizedActionIntent | null {
       rule: 'active-task-status-control',
     };
   }
-  const namedArtifact = relativeArtifactPath(text, false);
   const asksNamedArtifactStatus = Boolean(
     namedArtifact
     && /(?:\u6587\u4ef6|\u4ea7\u7269|\u4efb\u52a1).{0,24}(?:\u73b0\u5728)?(?:\u662f\u4ec0\u4e48|\u4ec0\u4e48|\u5565)\u72b6\u6001|\u662f\u5426(?:\u5df2\u7ecf)?(?:\u5199\u5165|\u56de\u8bfb).{0,12}[\uff1f?]|\u6700\u7ec8\u72b6\u6001|\b(?:what\s+is|final)\b.{0,24}\bstatus\b|\bwas\b.{0,32}\b(?:written|read\s*back)\b/iu.test(text)
@@ -655,23 +777,16 @@ function statusQuery(text: string): NormalizedActionIntent | null {
     };
   }
 
-  // A status question can name an exact desktop target while still containing
-  // an action verb, for example "打开 Windows 计算器的任务最终状态是什么".
-  // Preserve that target so the persistent ledger does not fall back to the
-  // most recently updated (and possibly unrelated) task.
-  const namedDesktopStatus = text.match(
-    /(?:\u6253\u5f00|\u542f\u52a8)\s*([^\u3002\uff01\uff1f?\n]{1,80}?)(?:\u7684)?(?:\u4efb\u52a1)?(?:\u6700\u7ec8)?(?:\u72b6\u6001|\u7ed3\u679c)(?:\u662f\u4ec0\u4e48|\u5982\u4f55|\u600e\u4e48\u6837|\u4e3a)?/iu,
-  )?.[1]?.trim();
-  if (namedDesktopStatus) {
+  // Bind a standalone named status question, not an action-shaped fragment
+  // inside a fresh instruction such as reporting the result after opening.
+  const namedDesktopStatus = actionInstructionClauses(text).map(({ probe }) => probe.match(
+    // i18n-allow: Existing named desktop receipt question, scoped to its clause.
+    /(?:^|[：:])\s*(?:请你?\s*)?(?:(?:告诉我|说明|报告|问)\s*)?(?:(?:我)?(?:刚才|刚刚|上次|上一轮)\s*(?:(?:让|叫|要求)你)?\s*)?(?:打开|启动)\s*([^。！？，；,;?\n]{1,80}?)(?:的)?(?:任务)?(?:最终)?(?:状态|结果)(?:是什么|如何|怎么样|为)?[。！？!?\s]*$/iu,
+  )?.[1]?.trim()).find(Boolean);
+  if (namedDesktopStatus && !/(?:检查|查看|登录)/u.test(namedDesktopStatus)) { // i18n-allow: Existing observation predicates are not saved launch targets.
     return {
-      kind: 'status_query',
-      operation: 'status',
-      subject: 'lumi',
-      target: namedDesktopStatus,
-      payload: '',
-      sideEffectClass: 'none',
-      relation: 'status',
-      confidence: 0.99,
+      kind: 'status_query', operation: 'status', subject: 'lumi', target: namedDesktopStatus,
+      payload: '', sideEffectClass: 'none', relation: 'status', confidence: 0.99,
       rule: 'named-desktop-status-before-action',
     };
   }
@@ -694,9 +809,7 @@ function statusQuery(text: string): NormalizedActionIntent | null {
     };
   }
 
-  // i18n-allow: Chinese client-state input recognition; not user-visible copy.
-  const clientState = /(?:检查|查看|告诉我|现在).{0,18}(?:你的|lumi\s*的)?(?:模式|模态|运行模式|模)状态|(?:你现在|当前).{0,12}(?:是什么|什么)?模式/iu;
-  if (clientState.test(text)) {
+  if (CLIENT_STATE_INSPECTION_REQUEST.test(text)) {
     return {
       kind: 'client_state',
       operation: 'read',
@@ -704,7 +817,7 @@ function statusQuery(text: string): NormalizedActionIntent | null {
       target: 'client_state',
       payload: '',
       sideEffectClass: 'none',
-      relation: 'status',
+      relation: 'new',
       confidence: 0.96,
       rule: 'client-state-query',
     };
@@ -716,8 +829,8 @@ function statusQuery(text: string): NormalizedActionIntent | null {
   if (isExplicitArtifactCreationText(text)) return null;
 
   const registeredSurfaceStatus =
-    /(?:进度|状态|结果呢|做到哪|到哪了|怎么样|做完了吗|完成了吗|好了吗)/u.test(text) // i18n-allow: Reviewed Chinese status-follow-up input recognition.
-      ? CLIENT_SURFACE_RULES.find(candidate => candidate.pattern.test(text))
+    /(?:进度(?:怎么样|如何|呢)|状态(?:是什么|怎么样|如何|呢)|结果呢|做到哪|到哪了|做完了吗|完成了吗|好了吗)/u.test(text) // i18n-allow: Reviewed Chinese status-follow-up input recognition.
+      ? CLIENT_SURFACE_RULES.find(candidate => candidate.pattern.test(text.replace(/https?:\/\/\S+/giu, '')))
       : undefined;
   if (registeredSurfaceStatus) {
     return {
@@ -745,9 +858,10 @@ function statusQuery(text: string): NormalizedActionIntent | null {
 
   // i18n-allow: Chinese task-status input recognition; not user-visible copy.
   const explicitTaskStatus = // i18n-allow: Chinese task-status input recognition; not user-visible copy.
-    /(?:(?:Auto\s*CAD|CAD|图|图纸|平面图|任务|这个|那个).{0,30}(?:画完|做完|完成|执行完|结束)(?:了)?(?:吗|没有|没|了没)|(?:Auto\s*CAD|CAD|任务).{0,30}(?:进度|状态|到哪|怎么样|什么情况)|(?:画|做|执行).{0,12}(?:完了吗|好了没|到哪了))/iu;
-  if (!explicitTaskStatus.test(text)) return null;
-  const target = /Auto\s*CAD|\bCAD\b/iu.test(text) ? 'AutoCAD' : /(?:图纸|平面图|图)/u.test(text) ? 'drawing' : 'recent_task'; // i18n-allow: Chinese task target input recognition.
+    /^(?:(?:Auto\s*CAD|CAD|图|图纸|平面图|这个|那个).{0,30}(?:画完|做完|完成|执行完|结束)(?:了)?(?:吗|没有|没|了没)|(?:Auto\s*CAD|CAD|这个任务|那个任务|刚才的任务|刚才任务|当前任务|当前的任务).{0,30}(?:进度|状态|到哪|怎么样|什么情况)|(?:画|做|执行).{0,12}(?:完了吗|好了没|到哪了))/iu;
+  const statusInstruction = explicitTaskStatus.exec(text)?.[0];
+  if (!statusInstruction) return null;
+  const target = /Auto\s*CAD|\bCAD\b/iu.test(statusInstruction) ? 'AutoCAD' : /(?:图纸|平面图|图)/u.test(statusInstruction) ? 'drawing' : 'recent_task'; // i18n-allow: Chinese task target input recognition.
   return {
     kind: 'status_query',
     operation: 'status',
@@ -762,17 +876,23 @@ function statusQuery(text: string): NormalizedActionIntent | null {
 }
 
 function clientNavigation(text: string): NormalizedActionIntent | null {
-  if (!CLIENT_NAVIGATION_VERB_RE.test(text)) return null;
-  const surface = CLIENT_SURFACE_RULES.find(candidate => {
-    const match = text.match(candidate.pattern);
+  text = withoutLocationLiterals(text);
+  const clauses = affirmativeActionInstructionClauses(text);
+  // i18n-allow: A client surface is the direct navigation operand, with only client/determiner qualifiers between them.
+  const directPrefix = new RegExp('^(?:(?:请你?|帮我|麻烦你?|现在|直接|先|再|然后|接着|也|并|只|仅)\\s*|(?:please|now|directly|first|then|next|also|just)\\s+)*(?:' + CLIENT_NAVIGATION_VERB_RE.source + ')\\s*(?:(?:到|(?:Lumi|露米|当前客户端)(?:的)?|当前|我的)\\s*|\\b(?:to|the|current|my|personal|lumi|client)(?:\\s+|$))*$', 'iu');
+  const surface = CLIENT_SURFACE_RULES.find(candidate => clauses.some(({ text: clauseText, probe }) => {
+    if (!CLIENT_NAVIGATION_VERB_RE.test(probe)) return false;
+    const match = clauseText.match(candidate.pattern);
     if (!match || match.index == null) return false;
-    // The navigation verb must govern the client-surface noun. A capability
-    // phrase such as "use desktop tools to open Notepad" contains both words,
-    // but `open` comes after `tools` and targets Notepad, not Lumi's tools page.
-    const prefix = text.slice(Math.max(0, match.index - 48), match.index);
-    const sameClausePrefix = prefix.split(/[\uff0c,\u3002\uff01\uff1f!?\uff1b;\n]/u).pop() || '';
-    return CLIENT_NAVIGATION_VERB_RE.test(sameClausePrefix);
-  });
+    // A registered English surface name must be a complete UI target, not a segment of another identifier.
+    if (/^[a-z0-9]/iu.test(match[0]) && /[a-z0-9_-]/iu.test(clauseText[match.index - 1] || '')
+      || /[a-z0-9]$/iu.test(match[0]) && /[a-z0-9_-]/iu.test(clauseText[match.index + match[0].length] || '')) return false;
+    const prefix = clauseText.slice(0, match.index).replace(/[“”‘’「」『』"'\x60]/gu, '').trim();
+    const suffix = clauseText.slice(match.index + match[0].length).replace(/^[”’」』"'\x60]+/u, '').trim();
+    // i18n-allow: The operand ends at its UI noun/command boundary, not an external page's owner or location.
+    return directPrefix.test(prefix)
+      && /^(?:(?:页面|界面|面板|窗口)|(?:page|screen|panel|window)\b)?\s*(?:(?:一下|吧|即可)\s*)?(?:[，,。.!?！？；;\n]|$|(?:后|之后|然后|并|并且)|\b(?:and|then|afterwards)\b)/iu.test(suffix);
+  }));
   if (!surface) return null;
   // i18n-allow: Multilingual wallpaper close-action recognition; not user-visible copy.
   const clientActionArguments = surface.action === 'set_wallpaper_mode'
@@ -833,6 +953,9 @@ export function withoutChatReplyDestination(text: string): string {
 function inboundMessageRead(text: string): NormalizedActionIntent | null {
   text = withoutChatReplyDestination(text);
   if (isExplicitArtifactCreationText(text)) return null;
+  text = text.replace(/https?:\/\/[^\s，。；;！？!?]+/giu, ' ')
+    .replace(/(?:不要|别|不用|无需|不)\s*(?:发|发送|读取|查看|回复)[^，。！？!?；;、\n]{0,24}(?:消息|对话|聊天|评论)/giu, ' ') // i18n-allow: a prohibited communication is not a reading request.
+    .replace(/\b(?:do not|don't|never)\s+(?:send|read|reply|post)[^,.;!?\n]{0,40}\b(?:messages?|chat|comments?)\b/giu, ' ');
   const inboundPatterns = [ // i18n-allow: Chinese inbound-message semantic-role recognition; not user-visible copy.
     /^(?!(?:看|查|读|告诉我))([^\s，。！？!?]{1,24}?)\s*(?:最近|刚刚|刚才)?\s*给我发(?:了)?(?:的)?(?:什么|哪些)?\s*(?:消息|内容|微信)/u, // i18n-allow: Chinese inbound-message semantic-role recognition.
     /(?:看(?:一下|看)?|查(?:一下|看)?|读(?:一下|取)?|告诉我)?\s*([^\s，。！？!?]{1,24}?)(?:最近|刚刚|刚才)?\s*给我发(?:了)?(?:的)?(?:什么|哪些)?\s*(?:消息|内容|微信)?/u, // i18n-allow: Chinese inbound-message semantic-role recognition.
@@ -858,13 +981,20 @@ function inboundMessageRead(text: string): NormalizedActionIntent | null {
 
   // i18n-allow: Chinese messaging-read input recognition; not user-visible copy.
   const generalRead = // i18n-allow: Chinese messaging-read input recognition; not user-visible copy.
-    /(?:微信|wechat|weixin|聊天记录|聊天内容|消息).{0,40}(?:看看|查看|看一下|读取|读|最近|记录|总结)|(?:看看|查看|看一下|读取|读|最近|总结).{0,40}(?:微信|wechat|weixin|聊天记录|聊天内容|消息)/iu;
+    /(?:微信|wechat|weixin|聊天记录|聊天内容|消息).{0,40}(?:看看|查看|看一下|读取|读|最近|记录|总结)|(?:看看|查看|看一下|读取|读|最近|总结).{0,40}(?:微信|wechat|weixin|聊天记录|聊天内容|消息)|\b(?:read|view|inspect|summari[sz]e)\b.{0,40}\b(?:wechat|weixin|messages?|chat)\b/iu;
   if (!generalRead.test(text) || /(?:发给|发送给|帮我发|替我发|直接发|send\s+to)/iu.test(text)) return null; // i18n-allow: Chinese outbound-message exclusion.
+  // Resolve contact slots here so all channels share the accepted read target.
+  const contact = trimSlot(
+    text.match(/(?:我和|和|跟|与)\s*([^\s,，。！？!?:：;；、]{1,32}?)\s*(?:的)?(?:最近)?(?:的)?(?:聊天|消息|对话)/u)?.[1] // i18n-allow: Chinese messaging contact recognition.
+    || text.match(/(?:看看|查看|读取|总结)\s*([^\s,，。！？!?:：;；、]{1,32}?)\s*(?:的)?(?:最近)?(?:的)?(?:聊天|消息|对话)/u)?.[1] // i18n-allow: Chinese messaging contact recognition.
+    || '',
+  );
+  const target = /^(?:我|我们|你|微信|wechat|weixin|lumi)$/iu.test(contact) ? '' : contact; // i18n-allow: Pronouns and platform names are not contact identities.
   return {
     kind: 'messaging_read',
     operation: 'read',
-    subject: '',
-    target: '',
+    subject: target,
+    target,
     payload: '',
     sideEffectClass: 'none',
     relation: 'new',
@@ -873,35 +1003,88 @@ function inboundMessageRead(text: string): NormalizedActionIntent | null {
   };
 }
 
+export function hasNegatedMessagingSendIntent(text: string): boolean {
+  const negative = negatedActionInstructions(text);
+  // i18n-allow: The owned negated predicate must be a send, including a coordinated send.
+  const sends = (instruction: string) => /^(?:(?:再|继续|对外|真正|实际|现在|立即)\s*)*(?:发送|发消息|回复|发出|(?:给|向)\s*[^\s，,。！？!?：:；;、]{1,32}\s*(?:发送|发消息|回复|发出|发))|^(?:(?:actually|really|ever|again|continue\s+to|to)\s+)*(?:send|sending|message|messaging|reply|replying)\b/iu.test(instruction);
+  // i18n-allow: A retrospective denial owns only its own clause and actual denied predicate.
+  if (actionInstructionClauses(text).some(({ probe }) => {
+    const denial = /^(?:我)?(?:没有|没|并未|从未|不是|并不是)\s*/u.exec(probe.trim());
+    if (!denial) return false;
+    // i18n-allow: Existing correction, recipient and messaging input grammar; no new authority.
+    return sends(probe.trim().slice(denial[0].length).replace(/^(?:让|叫|要求|授权|同意)你\s*/u, ''));
+  })) return true;
+  if (negative.some(({ instruction }) => instruction.split(/\b(?:and|or|nor)\b/iu).some(part => sends(part.trim())))) return true;
+  let coordinatedProhibition = false;
+  for (const { probe } of actionInstructionClauses(text)) {
+    // i18n-allow: Explicit contrast/sequencing starts a new instruction; sentence endings close a list.
+    if (/^(?:但是|不过|而是|但|然后|接着|随后|之后)|^(?:but|instead|then|next)\b/iu.test(probe.trim())) coordinatedProhibition = false;
+    if (negative.some(clause => probe.includes(clause.text))) coordinatedProhibition = true;
+    if (coordinatedProhibition && /^(?:and|or|nor)\s+/iu.test(probe.trim())
+      && sends(probe.trim().replace(/^(?:and|or|nor)\s+/iu, ''))) return true;
+    if (/[。！？!?；;\n]\s*$|\.\s*$/u.test(probe)) coordinatedProhibition = false;
+  }
+  return false;
+}
+
 function outgoingMessageSend(text: string): NormalizedActionIntent | null {
   if (isExplicitArtifactCreationText(text)) return null;
   const confirmationOnly = isExternalCommitConfirmationOnlyRequest(text);
   // i18n-allow: Chinese negative-send input recognition; not user-visible copy.
-  if (!confirmationOnly && /(?:不要|别|无需|不用).{0,12}(?:发|发送|回复)|(?:没有|没|并未).{0,30}(?:让我|叫我|让你).{0,20}(?:发|发送|回复)/u.test(text)) return null;
-  const patterns = [ // i18n-allow: Chinese outbound-message semantic-role recognition; not user-visible copy.
-    /(?:请)?(?:准备)?给(?:测试联系人)?\s*[「『“"']([^」』”"']{1,32})[」』”"']\s*(?:发送消息|发消息|发)\s*[「『“"']([\s\S]{1,1000}?)[」』”"']/u, // i18n-allow: confirmation-only outbound-message semantic-role recognition.
-    /(?:发|发送|回复)给\s*([^\s，。！？!?：:；;、「」『』“”"']{1,32})\s*[「『“"']([\s\S]{1,1000}?)[」』”"']/u, // i18n-allow: Chinese outbound-message semantic-role recognition.
-    /(?:我|帮我|替我|麻烦你|请你|你)?\s*给\s*([^\s，。！？!?：:；;、]{1,32})\s*(?:发|发送|回复|说|告诉)\s*([\s\S]{1,1000})/u, // i18n-allow: Chinese outbound-message semantic-role recognition.
-    /(?:我|帮我|替我|麻烦你|请你|你)?\s*(?:发|发送|回复)给\s*([^\s，。！？!?：:；;、]{1,32})\s*([\s\S]{1,1000})/u, // i18n-allow: Chinese outbound-message semantic-role recognition.
-    /(?:微信\s*)?(?:问一下|问问|询问)\s*([^\s，。！？!?：:；;、]{1,32})\s*([\s\S]{1,1000})/u, // i18n-allow: Chinese outbound-message semantic-role recognition.
-    /(?:send\s+(?:a\s+message\s+)?(?:to\s+)?|message\s+|reply\s+to\s+)(?!(?:has|have|had|is|was|were|contains?|includes?|with|body|content|attachment|file|text)\b)([\p{L}\p{N}_.'-]{1,40})\s*:?\s*([\s\S]{1,1000})/iu,
+  if (!confirmationOnly && hasNegatedMessagingSendIntent(text)) return null;
+  // The outer affirmative predicate owns delivery. An embedded send inside
+  // a request to write a draft is content, while sending that draft is work.
+  // i18n-allow: Shared Chinese imperative modifiers and foreground preparation.
+  const modifiers = String.raw`(?:(?:我|帮我|替我|麻烦你?|请你?|你|现在|先|再|然后|接着|随后|并且|另外|准备)\s*)*`;
+  // i18n-allow: Chinese channel/instrument grammar and imperative-role boundaries; not user-visible copy.
+  const prefix = String.raw`^${modifiers}(?:(?:用|使用|通过)\s*(?<instrument>[^，,。！？!?；;\n]{1,80}?)\s*|[^\s，,。！？!?；;\n]{1,32}?(?=帮我|替我|请你))?${modifiers}`;
+  const foreground = String.raw`(?:(?:打开|启动|切换到)\s*[^，,。！？!?；;\n]{1,80}?\s*(?:然后|并|再)?\s*)?`;
+  const patterns: Array<{ pattern: RegExp; payloadFirst?: boolean; recipientOnly?: boolean; allowPronoun?: boolean }> = [
+    // i18n-allow: Disposal/object-before-send and send-object-to-recipient roles.
+    { pattern: new RegExp(prefix + String.raw`(?:把|将)\s*([\s\S]{1,1000}?)\s*(?:发送|回复|发)给\s*([^\s，。！？!?：:；;、「」『』“”"']{1,32})[。！？!?\s]*$`, 'u'), payloadFirst: true, allowPronoun: true },
+    { pattern: new RegExp(prefix + String.raw`(?:发送|回复)\s*(?!给)([\s\S]{1,1000}?)\s*给\s*([^\s，。！？!?：:；;、「」『』“”"']{1,32})[。！？!?\s]*$`, 'u'), payloadFirst: true, allowPronoun: true },
+    // i18n-allow: Existing correction, recipient and messaging input grammar; no new authority.
+    { pattern: new RegExp(prefix + String.raw`给(?:测试联系人)?\s*[「『“"']([^」』”"']{1,32})[」』”"']\s*(?:发送消息|发消息|发)\s*[「『“"']([\s\S]{1,1000}?)[」』”"']`, 'u') },
+    // i18n-allow: Existing correction, recipient and messaging input grammar; no new authority.
+    { pattern: new RegExp(prefix + String.raw`(?:发送|回复|发)给\s*([^\s，。！？!?：:；;、「」『』“”"']{1,32})\s*[「『“"']([\s\S]{1,1000}?)[」』”"']`, 'u'), allowPronoun: true },
+    // i18n-allow: Existing correction, recipient and messaging input grammar; no new authority.
+    { pattern: new RegExp(prefix + foreground + String.raw`给\s*([^\s，。！？!?：:；;、]{1,32})\s*(?:发送|回复|告诉|发|说(?!明))\s*([\s\S]{1,1000})`, 'u') },
+    // i18n-allow: Existing correction, recipient and messaging input grammar; no new authority.
+    { pattern: new RegExp(prefix + String.raw`(?:发送|回复|发)给\s*([^\s，。！？!?：:；;、]{1,32})(?:\s+|[：:])([\s\S]{1,1000})`, 'u'), allowPronoun: true },
+    // i18n-allow: Existing correction, recipient and messaging input grammar; no new authority.
+    { pattern: new RegExp(prefix + String.raw`(?:微信\s*)?(?:问一下|问问|询问)\s*([^\s，。！？!?：:；;、]{1,32})\s*([\s\S]{1,1000})`, 'u') },
+    { pattern: /^(?:(?:please|now|then|next|also)\s+|(?:can|could|would|will)\s+you\s+)*(?:send\s+(?:a\s+message\s+)?(?:to\s+)?|message\s+|reply\s+to\s+)(?!(?:has|have|had|is|was|were|contains?|includes?|with|body|content|attachment|file|text)\b)([\p{L}\p{N}_.'-]{1,40})\s*:?\s*([\s\S]{1,1000})/iu },
+    // i18n-allow: Existing correction, recipient and messaging input grammar; no new authority.
+    { pattern: new RegExp(prefix + String.raw`(?:发送|回复|发)给\s*([^\s，。！？!?：:；;、「」『』“”"']{1,32})[。！？!?\s]*$`, 'u'), recipientOnly: true, allowPronoun: true },
   ];
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    const target = trimSlot(match?.[1] || '');
-    const payload = trimSlot(match?.[2] || '');
-    if (!target || !payload || /^(?:我|我们)$/u.test(target)) continue; // i18n-allow: Chinese pronoun input recognition.
-    return {
-      kind: 'messaging_send',
-      operation: 'mutate',
-      subject: 'user',
-      target,
-      payload,
-      sideEffectClass: 'external_commit',
-      relation: 'new',
-      confidence: 0.97,
-      rule: 'messaging-outbound-role',
-    };
+  for (const { text: clauseText, probe: rawProbe } of affirmativeActionInstructionClauses(text)) {
+    const probe = withoutLocationLiterals(rawProbe);
+    // Quoted recipients and location operands are masked; only an outer delivery predicate may restore them.
+    if (!patterns.some(({ pattern }) => pattern.test(probe))
+      // i18n-allow: Existing correction, recipient and messaging input grammar; no new authority.
+      && !new RegExp(prefix + foreground + String.raw`(?:给\s*(?:[^\s，。！？!?：:；;、「」『』“”"']{1,32}\s*)?(?:发送消息|发消息|发送|回复|告诉|发|说)|(?:发送|回复|发)给)`, 'u').test(probe)) continue;
+    for (const { pattern, payloadFirst, recipientOnly, allowPronoun } of patterns) {
+      const match = clauseText.match(pattern);
+      // An instrument ends before the foreground predicate. A method request
+      // such as explain/how-to before the delivery verb is not a channel name.
+      // Inspect only the prefix role, never words in the actual message payload.
+      const roleOffset = match?.groups && 'instrument' in match.groups ? 1 : 0;
+      const target = trimSlot(match?.[(payloadFirst ? 2 : 1) + roleOffset] || '');
+      const payload = recipientOnly ? '' : trimSlot(match?.[(payloadFirst ? 1 : 2) + roleOffset] || '');
+      // i18n-allow: Method-question operators and foreground explanation predicates.
+      if (match?.groups?.instrument && /(?:怎么|如何|怎样|(?:演示|了解|说明|解释|告诉我|教我)(?:一下|具体)?)\s*$/u.test(match.groups.instrument)) continue;
+      // A question explicitly introduced as message content belongs to the
+      // payload. A trailing question without that boundary is not a send grant.
+      // i18n-allow: Explicit message/content boundary versus outer interrogative punctuation.
+      const explicitMessageContent = !payloadFirst && /^(?:消息\s*[:：]?|[:：]|[「『“"'])/u.test(payload);
+      if (match?.groups?.instrument && /[？?]\s*$/u.test(probe) && !explicitMessageContent) continue;
+      if (!target || !recipientOnly && !payload || !allowPronoun && /^(?:我|我们|你|你们)$/u.test(target)) continue; // i18n-allow: Conversational pronouns alone are not an addressed message.
+      return {
+        kind: 'messaging_send', operation: 'mutate', subject: 'user', target, payload,
+        sideEffectClass: 'external_commit', relation: 'new', confidence: 0.97,
+        rule: 'messaging-outbound-role',
+      };
+    }
   }
   return null;
 }
@@ -915,7 +1098,13 @@ function localWorkflowIntent(text: string): NormalizedActionIntent | null {
     confidence: 0.95, rule: `local-workflow-${intent}` };
 }
 
-function genericExternalCommit(text: string): NormalizedActionIntent | null {
+export function genericExternalCommit(text: string, independentInstruction = false): NormalizedActionIntent | null {
+  text = withoutNegatedLookupClauses(currentTurnText(text));
+  if (independentInstruction) {
+    text = text.replace(/^(?:(?:现在|请你?|帮我|替我|麻烦你)\s*|(?:please|now|then|next|you\s+must|you\s+should|must|should)\s+)*/iu, ''); // i18n-allow: Existing imperative modifiers, not action vocabulary.
+  }
+  const eligible = (match: RegExpMatchArray | null): match is RegExpMatchArray => Boolean(match && (!independentInstruction
+    || match.index === 0 && (!/^[a-z]/iu.test(match[1]) || new RegExp(`^${match[1]}\\b`, 'iu').test(text))));
   // Explicit negation and retrospective/explanatory language must never be
   // promoted into an external mutation merely because it contains an action
   // verb.
@@ -923,52 +1112,52 @@ function genericExternalCommit(text: string): NormalizedActionIntent | null {
   if (/(?:不要|别|无需|不用|取消|没有|并未|没让你|为什么|怎么会|刚才|之前).{0,30}(?:发布|提交|付款|支付|签署|签字|上传|post|publish|submit|pay|sign)/iu.test(text)) return null;
 
   // i18n-allow: Chinese payment semantic-role input recognition.
-  const payment = text.match(/(?:付款|支付|转账|打款|pay|transfer)\s*(?:给|to)?\s*([^，。！？!?\n]{1,80})/iu);
-  if (payment) {
+  const payment = text.match(/(?:^|[，。！？!?；;\n])\s*(?:现在\s*)?(?:请(?:你)?|帮我|替我|麻烦你|please)?\s*(付款|支付|转账|打款|pay|transfer)\s*(?:给|to)?\s*([^，。！？!?\n]{1,80})/iu);
+  if (eligible(payment)) {
     return {
       kind: 'payment', operation: 'mutate', subject: 'user',
-      target: trimSlot(payment[1]), payload: text,
+      target: trimSlot(payment[2]), payload: text,
       sideEffectClass: 'external_commit', relation: 'new', confidence: 0.94,
       rule: 'explicit-payment-commit',
     };
   }
 
   // i18n-allow: Chinese signature semantic-role input recognition.
-  const signature = text.match(/(?:签署|签字|盖章|sign)\s*(?:这份|这个|the)?\s*([^，。！？!?\n]{1,120})/iu);
-  if (signature) {
+  const signature = text.match(/(签署|签字|盖章|sign)\s*(?:这份|这个|the)?\s*([^，。！？!?\n]{1,120})/iu);
+  if (eligible(signature)) {
     return {
       kind: 'signature', operation: 'mutate', subject: 'user',
-      target: trimSlot(signature[1]), payload: text,
+      target: trimSlot(signature[2]), payload: text,
       sideEffectClass: 'external_commit', relation: 'new', confidence: 0.93,
       rule: 'explicit-signature-commit',
     };
   }
 
   // i18n-allow: Chinese publication semantic-role input recognition.
-  const publish = text.match(/(?:发布|发帖|公开发表|上线|publish|post)\s*(?:到|至|on|to)?\s*([^，。！？!?\n]{1,160})/iu);
+  const publish = text.match(/(发布|发帖|公开发表|上线|publish|post)\s*(?:到|至|on|to)?\s*([^，。！？!?\n]{1,160})/iu);
   // "Publish the local workflow" and "run the published workflow" refer to
   // a version in the local registry, not a public post. Real destinations
   // still belong to the external-commit boundary and keep payload redaction.
   const localPublication = publish && localWorkflowIntent(text)
     // i18n-allow: local workflow target qualifiers, including published adjective.
-    && /^(?:(?:的|这个|已审核的|本地的?|已有的|已经|已|the\b|a\b|reviewed\b|local\b|ed\b)\s*)*(?:工作流|\bworkflow\b)/iu.test(publish[1])
+    && /^(?:(?:的|这个|已审核的|本地的?|已有的|已经|已|the\b|a\b|reviewed\b|local\b|ed\b)\s*)*(?:工作流|\bworkflow\b)/iu.test(publish[2])
     // i18n-allow: a publication destination remains an external request.
-    && !/(?:到|至|\b(?:to|on|onto)\b)/iu.test(publish[1]);
-  if (publish && !localPublication) {
+    && !/(?:到|至|\b(?:to|on|onto)\b)/iu.test(publish[2]);
+  if (eligible(publish) && !localPublication) {
     return {
       kind: 'public_publish', operation: 'mutate', subject: 'user',
-      target: trimSlot(publish[1]), payload: text,
+      target: trimSlot(publish[2]), payload: text,
       sideEffectClass: 'external_commit', relation: 'new', confidence: 0.9,
       rule: 'explicit-publication-commit',
     };
   }
 
   // i18n-allow: Chinese submission semantic-role input recognition.
-  const submission = text.match(/(?:提交|上传|递交|submit|upload)\s*(?:到|至|给|to)?\s*([^，。！？!?\n]{1,160})/iu);
-  if (submission) {
+  const submission = text.match(/(提交|上传|递交|submit|upload)\s*(?:到|至|给|to)?\s*([^，。！？!?\n]{1,160})/iu);
+  if (eligible(submission)) {
     return {
       kind: 'external_submit', operation: 'mutate', subject: 'user',
-      target: trimSlot(submission[1]), payload: text,
+      target: trimSlot(submission[2]), payload: text,
       sideEffectClass: 'external_commit', relation: 'new', confidence: 0.88,
       rule: 'explicit-submission-commit',
     };
@@ -976,61 +1165,41 @@ function genericExternalCommit(text: string): NormalizedActionIntent | null {
   return null;
 }
 
-function mediaGeneration(text: string): NormalizedActionIntent | null {
-  // Only the explicit design visualization workflow supplements core media intent.
-  // i18n-allow: design stage action recognition, not displayed text.
-  if (!/(?:执行|开始|继续).{0,100}(?:效果图|可视化).{0,12}阶段/u.test(text)) return null;
-  const image = /(?:\u751f\u6210|\u5236\u4f5c|\u505a|\u51fa|\u6e32\u67d3).{0,24}(?:\u56fe\u7247|\u56fe\u50cf|\u6548\u679c\u56fe|\u6e32\u67d3\u56fe|\u6d77\u62a5)|\b(?:generate|create|make|render)\b.{0,32}\b(?:image|visual|render|poster)\b/iu.test(text);
-  const video = /(?:\u751f\u6210|\u5236\u4f5c|\u505a|\u51fa).{0,24}(?:\u89c6\u9891|\u52a8\u753b)|\b(?:generate|create|make)\b.{0,32}\b(?:video|animation)\b/iu.test(text);
-  if (!image && !video) return null;
-  return {
-    kind: 'media_generation',
-    operation: 'create',
-    subject: 'user',
-    target: image ? 'generate_image' : 'generate_video',
-    payload: text,
-    sideEffectClass: 'external_commit',
-    relation: /(?:\u7ee7\u7eed|\u63a5\u7740|\u4e0b\u4e00\u6b65)|\b(?:continue|next)\b/iu.test(text) ? 'continue' : 'new',
-    confidence: 0.95,
-    rule: image ? 'explicit-image-generation' : 'explicit-video-generation',
-  };
-}
-
-function documentCreation(text: string): NormalizedActionIntent | null {
-  const presentation = /(?:\u6267\u884c|\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u8f93\u51fa|\u5bfc\u51fa|\u5b8c\u6210).{0,32}(?:\u63d0\u6848\s*PPT|PPT|\u6f14\u793a\u6587\u7a3f|presentation)|(?:\u63d0\u6848\s*PPT|PPT|\u6f14\u793a\u6587\u7a3f).{0,24}(?:\u9636\u6bb5|\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u8f93\u51fa|\u5bfc\u51fa)/iu.test(text);
-  const document = /(?:\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u8f93\u51fa|\u5bfc\u51fa).{0,28}(?:PDF|DOCX|Word\s*\u6587\u6863|\u62a5\u544a\u6587\u4ef6)|\b(?:generate|create|export)\b.{0,32}\b(?:pdf|docx|document|report)\b/iu.test(text);
-  if (!presentation && !document) return null;
-  return {
-    kind: 'document_creation',
-    operation: 'create',
-    subject: 'user',
-    target: presentation ? 'presentation' : 'document',
-    payload: text,
-    sideEffectClass: 'local_write',
-    relation: /(?:\u7ee7\u7eed|\u63a5\u7740|\u4e0b\u4e00\u6b65|\u9636\u6bb5)|\b(?:continue|next|stage)\b/iu.test(text) ? 'continue' : 'new',
-    confidence: 0.95,
-    rule: presentation ? 'explicit-presentation-creation' : 'explicit-document-creation',
-  };
-}
-
 function localDesktopOperation(text: string): NormalizedActionIntent | null {
+  // i18n-allow: Quoted commands, examples and prohibitions do not supply desktop action predicates.
+  text = affirmativeActionInstructionClauses(text.replace(/^(?:你)?(?:能不能|能否|可否|是否可以)(?=\s*(?:用|使用|调用))/u, ''))
+    .filter(({ probe }) => /打开|启动|运行|切换到|聚焦|最大化|最小化|还原|关闭|\b(?:open|launch|start|focus|maximi[sz]e|minimi[sz]e|restore|close)\b/iu.test(probe))
+    .map(clause => {
+      const originalProbe = actionInstructionClauses(clause.text).map(part => part.probe).join('').trim();
+      // Preserve literal targets only when polarity left the whole instruction intact.
+      return originalProbe === clause.probe.trim() ? clause.text : clause.probe;
+    }).join('\n');
   // Client surfaces and external commits have already won the priority race.
   // This rule requires an explicit local action plus a concrete target; a lone
   // action-shaped word is never enough to create executable work.
   const forbidsInstrumentedAction = /(?:\u4e0d\u8981|\u522b|\u65e0\u9700|\u4e0d\u7528).{0,20}(?:\u4f7f\u7528|\u8c03\u7528)|\b(?:do\s+not|don['\u2019]?t|without)\s+(?:use|using|call(?:ing)?)\b/iu.test(text);
   const instrumented = forbidsInstrumentedAction ? null : text.match(
-    // i18n-allow: Tool-as-instrument phrasing; the target belongs to the action after the tool noun.
-    /(?:\u4f7f\u7528|\u8c03\u7528).{0,24}?(?:\u5de5\u5177|\u6280\u80fd).{0,8}?(\u6253\u5f00|\u542f\u52a8|\u8fd0\u884c|\u5207\u6362\u5230|\u805a\u7126|\u6700\u5927\u5316|\u6700\u5c0f\u5316|\u8fd8\u539f|\u5173\u95ed)\s*(?:\u7a0b\u5e8f|\u5e94\u7528|\u8f6f\u4ef6|\u7a97\u53e3)?\s*([^\uff0c,\u3002\uff01\uff1f!?\uff1b;\n]{1,120})|\b(?:use|using|call(?:ing)?)\b.{0,30}?\b(?:tools?|skills?)\b\s+(?:to\s+)?\b(open|launch|start|focus|maximi[sz]e|minimi[sz]e|restore|close)\b\s*(?:app|application)?\s*([^,.!?;\n]{1,120})/iu,
+    // i18n-allow: An explicitly named instrument/application governs the following desktop action and its operand.
+    /(?:^|[，,。！？!?；;\n])\s*(?:(?:现在|请你?|帮我|麻烦你?|先|首先)\s*)*(?:用|使用|调用)\s*[^，,。！？!?；;\n]{1,80}?\s*(?:来|去)?(打开|启动|运行|切换到|聚焦|最大化|最小化|还原|关闭)\s*(?:程序|应用|软件|窗口)?\s*([^，,。！？!?；;\n]{1,120})|(?:^|[,.;!?\n])\s*(?:(?:please|now|first)\s+)*(?:use|using|call(?:ing)?)\s+[^,!?;\n]{1,80}?\s+to\s+(open|launch|start|focus|maximi[sz]e|minimi[sz]e|restore|close)\b(?!-)\s*(?:app|application)?\s*([^,!?;\n]{1,120})/iu,
   );
-  const direct = text.match(
+  const direct = [...text.matchAll(
     // i18n-allow: Chinese local desktop semantic-role input recognition.
-    /(?:^|[，。！？!?：:；;\s])(?:现在\s*)?(?:请|请你|帮我|麻烦你|给我)?\s*(?:先|首先)?\s*(打开|启动|运行|切换到|聚焦|最大化|最小化|还原|关闭|\b(?:open|launch|start|focus|maximi[sz]e|minimi[sz]e|restore|close)\b)\s*(?:程序|应用|软件|窗口|app|application)?\s*([^，。！？!?；;\n]{1,120})/iu,
-  );
+    /(?:^|[，。！？!?：:；;\s])(?:现在\s*)?(?:请|请你|帮我|麻烦你|给我)?\s*(?:先|首先)?\s*(打开|启动|运行|切换到|聚焦|最大化|最小化|还原|关闭|\b(?:open|launch|start|focus|maximi[sz]e|minimi[sz]e|restore|close)\b(?!-))\s*(?:程序|应用|软件|窗口|app|application)?\s*([^，。！？!?；;\n]{1,120})/giu,
+  )].find(match => {
+    const operand = match[2].trim();
+    // i18n-allow: A time/dependency suffix belongs to the preceding predicate, not to an application name.
+    return /^[“‘「『"\x27\x60]/u.test(operand)
+      || !/^(?:之后|以后|之前|以前|的时候|后|前)|^(?:after|before|when|once)\b/iu.test(operand);
+  });
   const objectFirst = text.match(/^(?:请|请你|帮我)?\s*(?:先)?(?:把|将|用)\s*([^，。！？!?；;\n]{1,80}?)\s*(?:先)?(打开|启动|运行|最大化|最小化|还原|关闭)(?:一下|吧)?[。！!]*$/u); // i18n-allow: Object-before-verb desktop instructions.
   if (!instrumented && !direct && !objectFirst) return null;
   const verb = trimSlot(instrumented?.[1] || instrumented?.[3] || objectFirst?.[2] || direct?.[1] || '');
-  const target = trimSlot(instrumented?.[2] || instrumented?.[4] || objectFirst?.[1] || direct?.[2] || '');
-  if (!target || /^(?:什么|啥|哪个|why|what|which)$/iu.test(target)) return null; // i18n-allow: Chinese interrogative input recognition.
+  const rawTarget = trimSlot(instrumented?.[2] || instrumented?.[4] || objectFirst?.[1] || direct?.[2] || '')
+    // i18n-allow: existing-window qualifiers are not part of the application name.
+    .replace(/^(?:正在运行|当前运行|已经打开|已打开|现有)(?:着)?(?:的)?/u, '').trim();
+  const locations = rawTarget.match(/https?:\/\/[^\s\u3002\uff0c\uff1b,;]+/giu) || [];
+  const target = locations.length === 1 ? locations[0].replace(/[.!?]+$/u, '') : rawTarget;
+  if (!target || /^(?:什么|啥|哪个|了|好了|完成了|why|what|which)$/iu.test(target)) return null; // i18n-allow: interrogatives and completion feedback are not app names.
   return {
     kind: 'desktop_operation',
     operation: /^(?:打开|启动|运行|切换到|聚焦|open|launch|start|focus)$/iu.test(verb) // i18n-allow: Chinese desktop navigation verb recognition.
@@ -1068,32 +1237,53 @@ function persistentWorkTaskCreation(text: string): NormalizedActionIntent | null
 /** Media creation spends provider capacity; it is an explicit external action. */
 export function mediaGenerationIntent(value: string): NormalizedActionIntent | null {
   const text = currentTurnText(value).trim();
-  const head = text.split(/[：:，,。；;\n]/u)[0]; // i18n-allow: instruction/creative-brief boundary.
+  const head = (mediaCreationInstruction(text) || text).split(/[：:，,。；;\n]/u)[0]; // i18n-allow: instruction/creative-brief boundary.
   // Only an affirmative creation/edit imperative owns a new generation. A
   // prompt, script, configuration question or historical result does not.
-  if (!/^(?:(?:请|帮我|给我|现在|直接)\s*)*(?:生成|创建|制作|绘制|渲染|画|编辑|修改|重绘|替换).{0,50}(?:图片|图像|照片|插画|海报|效果图|渲染图|视频|短片)|^(?:please\s+)?(?:generate|create|make|draw|render|edit|modify|redraw)\b.{0,60}\b(?:image|images|picture|photo|poster|video|clip)\b/iu.test(head)) return null; // i18n-allow: affirmative media operations.
+  if (!/^(?:(?:请|帮我|给我|现在|直接)\s*)*(?:生成|创建|制作|绘制|画|做(?:成)?|合成|转成|转换为|变成|编辑|修改|重绘|替换).{0,100}(?:图片|图像|照片|插画|海报|视频|短片|人像)|^(?:please\s+)?(?:generate|create|make|draw|render|edit|modify|redraw)\b.{0,60}\b(?:image|images|picture|photo|poster|video|clip)\b/iu.test(head)) return null; // i18n-allow: affirmative media operations.
   if (/(?:提示词|脚本|文案|方案|大纲|字幕|标题|配置|模型|代码|网页|组件|是否|了吗|了没|吗[？?]?|不要生成|不要创建)|\b(?:prompt|script|copy|plan|outline|caption|configuration|model|code|webpage)\b|\?/iu.test(head)) return null; // i18n-allow: non-media deliverables and questions.
-  const target = /^(?:(?:请|帮我|给我|现在|直接)\s*)*(?:编辑|修改|重绘|替换)|^(?:please\s+)?(?:edit|modify|redraw)\b/iu.test(head) // i18n-allow: media editing.
-    ? 'ai_edit_image' : /视频|短片|\b(?:video|clip)\b/iu.test(head) ? 'generate_video' : 'generate_image'; // i18n-allow: media kind.
-  return { kind: 'media_generation', operation: 'create', subject: 'user', target,
+  const editing = /^(?:(?:请|帮我|给我|现在|直接)\s*)*(?:编辑|修改|重绘|替换)|^(?:please\s+)?(?:edit|modify|redraw)\b/iu.test(head); // i18n-allow: media editing.
+  const target = /视频|短片|\b(?:video|clip)\b/iu.test(head)
+    && !/(?:视频|\b(?:video|clip)\b)\s*(?:封面|缩略图|cover|thumbnail|poster)/iu.test(head) ? 'generate_video' : editing ? 'ai_edit_image' : 'generate_image'; // i18n-allow: media kind.
+  const expressionWorkflow = target === 'generate_image' && isAvatarAuthoringRequest(text)
+    && /闭眼|开口|表情变体|expression\s*variants/iu.test(text); // i18n-allow: requested expression variants use the same source image.
+  return { kind: 'media_generation', operation: editing && target === 'generate_video' ? 'mutate' : 'create', subject: 'user', target,
+    ...(expressionWorkflow ? { mediaTools: ['generate_image', 'ai_edit_image'] as const as Array<'generate_image' | 'ai_edit_image'> } : {}),
     payload: text, sideEffectClass: 'external_commit', relation: 'new', confidence: 0.98, rule: 'explicit-media-generation' };
+}
+
+/** Independent affirmative clauses shared by navigation and completion evidence. */
+export function independentActionClauses(value: string, sentenceScoped = false): string[] {
+  const text = currentTurnText(value);
+  if (isExplicitArtifactCreationText(text)) return [];
+  const affirmative = (part: string) => !/(?:不要|别|如果|假设|例如|说|为什么|怎么)|\b(?:don't|do not|if|said|why|how)\b/iu.test(part); // i18n-allow: No authority from negative or hypothetical clauses.
+  const clauses = sentenceScoped
+    ? text.split(/[；;。\n]|\.(?=\s|$)/u).filter(affirmative).flatMap(part => part.split(/[，,]/u))
+    : text.split(/[，,；;。\n]/u); // i18n-allow: Existing navigation boundaries remain unchanged.
+  return clauses.map(part => part.trim().replace(/^(?:然后|接着|随后|之后|同时|并且|再)\s*/u, '')).filter(Boolean) // i18n-allow: Independent instruction boundaries.
+    .filter(affirmative);
 }
 
 /** Independent client + application navigation must retain both obligations. */
 export function compositeNavigationInstructions(value: string): Array<{ text: string; intent: NormalizedActionIntent }> {
   const text = currentTurnText(value);
-  if (text.length > 1200 || isExplicitArtifactCreationText(text)) return [];
-  const instructions = text.split(/[，,；;。\n]/u).map(part => part.trim().replace(/^(?:然后|接着|同时|并且|再)\s*/u, '')).filter(Boolean) // i18n-allow: Independent instruction boundaries.
-    .filter(part => !/(?:不要|别|如果|假设|例如|说|为什么|怎么)|\b(?:don't|do not|if|said|why|how)\b/iu.test(part)) // i18n-allow: No authority from negative or hypothetical clauses.
+  if (text.length > 1200) return [];
+  const instructions = independentActionClauses(text)
     .map(part => ({ text: part, intent: clientNavigation(part) || localDesktopOperation(part) }))
     .filter((item): item is { text: string; intent: NormalizedActionIntent } => Boolean(item.intent));
   return instructions.length > 1 && instructions.some(item => item.intent.kind === 'client_navigation')
     && instructions.some(item => item.intent.kind === 'desktop_operation') ? instructions : [];
 }
 
-export function normalizeActionIntent(value: string): NormalizedActionIntent {
+export interface ActionIntentAnalysis { intent(value: string): NormalizedActionIntent }
+
+export function normalizeActionIntent(value: string, analysis?: ActionIntentAnalysis): NormalizedActionIntent {
+  if (analysis) return analysis.intent(value);
   const text = withoutNegatedLookupClauses(currentTurnText(value));
   if (!text) return { ...EMPTY_INTENT };
+  if (hasExplicitNoToolInstruction(text)) {
+    return correctionOrExplanation(text) || statusQuery(text) || { ...EMPTY_INTENT, operation: 'explain' };
+  }
   // A fresh local observation is work. `status_query` means explaining saved
   // task evidence and intentionally disables new tools on follow-up turns.
   if (classifyExternalCliIntent(text) === 'inspect') return {
@@ -1117,32 +1307,30 @@ export function normalizeActionIntent(value: string): NormalizedActionIntent {
       };
     }
   }
-  const artifactCreation = explicitArtifactCreationIntent(text);
-  const artifactRead = explicitLocalArtifactReadIntent(text);
+  const artifactInput = currentTurnText(value);
+  const artifactCreation = explicitArtifactCreationIntent(artifactInput);
+  const artifactRead = explicitLocalArtifactReadIntent(artifactInput);
   const currentAuthoringDocumentRead = currentAuthoringDocumentReadIntent(text);
   const explicitArtifactCreation = Boolean(artifactCreation);
-  const affirmativeDesignActionText = stripNegatedDesignActionClauses(text);
   const compositeNavigation = !artifactCreation && !artifactRead ? compositeNavigationInstructions(text) : [];
 
-  // Order is a safety invariant. Later action-shaped words cannot override a
-  // correction, status query, client-native route, external-AI read, or
-  // inbound message read.
+  // Exact affirmative file operations own their supplied source/target before
+  // retrospective status shortcuts. Quoted and negated operations were already
+  // excluded by those owners; a status noun cannot replace a fresh read.
   const priority = [
     correctionOrExplanation(text),
-    statusQuery(text),
     mediaGenerationIntent(text),
     persistentWorkTaskCreation(text),
     artifactCreation,
+    explicitArtifactEditIntent(artifactInput),
     artifactRead,
     currentAuthoringDocumentRead,
+    statusQuery(text),
     compositeNavigation.find(item => item.intent.kind === 'desktop_operation')?.intent,
     explicitArtifactCreation ? null : clientNavigation(text),
     explicitArtifactCreation ? null : externalAiHistoryRead(text),
     explicitArtifactCreation ? null : inboundMessageRead(text),
     explicitArtifactCreation ? null : outgoingMessageSend(text),
-    explicitArtifactCreation ? null : mediaGeneration(affirmativeDesignActionText),
-    explicitArtifactCreation ? null : documentCreation(affirmativeDesignActionText),
-    explicitArtifactCreation ? null : genericExternalCommit(text),
     explicitArtifactCreation ? null : localWorkflowIntent(text),
     explicitArtifactCreation ? null : localDesktopOperation(text),
   ].find(Boolean);
@@ -1175,9 +1363,9 @@ export function normalizeActionIntent(value: string): NormalizedActionIntent {
     };
   }
 
+  if ((hasExplicitNoToolInstruction(text) || !hasMixedStatusExecutionIntent(text)) && isConversationExecutionFactCandidate(text)) return {
+    kind: 'status_query', operation: 'status', subject: 'lumi', target: 'previous_action',
+    payload: '', sideEffectClass: 'none', relation: 'status', confidence: 0.99, rule: 'conversation-execution-facts',
+  };
   return { ...EMPTY_INTENT };
-}
-
-export function isNonExecutingNormalizedIntent(intent: NormalizedActionIntent): boolean {
-  return intent.kind === 'correction_explanation' || intent.kind === 'status_query';
 }

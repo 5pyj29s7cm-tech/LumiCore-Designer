@@ -1,42 +1,30 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { MessagesSquare, Save, Key, ExternalLink, CheckCircle, AlertCircle, Copy, Unlink, Loader2, Radio, Webhook } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { toast } from 'sonner';
-import { appConfirm } from '../lib/appConfirm';
+import { useAppConfirm } from '../lib/appConfirm';
 import { formatUiMessage, uiMessage } from '../i18n/uiMessages';
 import { formatMessagingBindingCommand } from '../i18n/locales/messaging';
+import type { MessagingBinding } from '../../server/messaging/bindings';
+import type { MessagingConfig } from '../../server/messaging/config';
+import type { MessagingConnectionStatus } from '../../server/messaging/connections';
+import { useMessagingReads } from '../hooks/useMessagingReads';
+import { organizationRemediationCopy } from '../i18n/locales/organizationRemediation';
 
-interface FeishuBinding {
-  id: string;
-  platformUserId: string;
-  chatId?: string;
-  chatType?: 'private' | 'group';
-  orgId: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-type FeishuTransport = 'long_connection' | 'webhook';
-
-interface ConnectionStatus {
-  state?: 'disabled' | 'connecting' | 'connected' | 'reconnecting' | 'error';
-  lastConnectedAt?: string;
-  lastMessageAt?: string;
-  lastError?: string;
-  reconnectAttempts?: number;
-}
+type FeishuBinding = Pick<MessagingBinding, 'id' | 'platformUserId' | 'chatId' | 'chatType' | 'orgId' | 'createdAt' | 'updatedAt'>;
 
 export function FeishuSettings({ t }: { t?: any }) {
+  const appConfirm = useAppConfirm();
   const isZh = t?.langCode !== 'en';
   const locale = isZh ? 'zh' : 'en';
-  const ui = (zh: string, en: string) => isZh ? zh : en;
+  const reads = useMessagingReads();
   const [appId, setAppId] = useState('');
   const [appSecret, setAppSecret] = useState('');
   const [verificationToken, setVerificationToken] = useState('');
   const [hasVerificationToken, setHasVerificationToken] = useState(false);
-  const [transport, setTransport] = useState<FeishuTransport>('long_connection');
-  const [connection, setConnection] = useState<ConnectionStatus | null>(null);
+  const [transport, setTransport] = useState<MessagingConfig['feishu']['transport']>('long_connection');
+  const [connection, setConnection] = useState<Partial<MessagingConnectionStatus> | null>(null);
   const [configured, setConfigured] = useState(false);
   const [appIdMasked, setAppIdMasked] = useState('');
   const [loading, setLoading] = useState(true);
@@ -49,18 +37,13 @@ export function FeishuSettings({ t }: { t?: any }) {
 
   const loadStatus = async () => {
     try {
-      const res = await fetch('/api/feishu/status', { credentials: 'include' });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) {
+      const data = await reads.read('/api/feishu/status');
         setConfigured(Boolean(data.configured));
         setConnection(data.connection || null);
-      }
     } catch {}
   };
 
-  useEffect(() => {
-    fetch('/api/feishu/config', { credentials: 'include' })
-      .then(r => r.json())
+  const loadConfig = () => reads.read('/api/feishu/config')
       .then(d => {
         setAppId(d.appId || '');
         setAppIdMasked(d.appIdMasked || '');
@@ -71,6 +54,8 @@ export function FeishuSettings({ t }: { t?: any }) {
       })
       .catch(() => toast.error(t?.failedToLoadConfig || 'Failed to load config'))
       .finally(() => setLoading(false));
+  useEffect(() => {
+    void loadConfig();
     void loadBindings();
     const timer = window.setInterval(() => void loadStatus(), 5000);
     return () => window.clearInterval(timer);
@@ -78,13 +63,13 @@ export function FeishuSettings({ t }: { t?: any }) {
 
   async function loadBindings() {
     try {
-      const res = await fetch('/api/feishu/bindings', { credentials: 'include' });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) setBindings(Array.isArray(data.bindings) ? data.bindings : []);
+      const data = await reads.read('/api/feishu/bindings');
+      setBindings(data.bindings);
     } catch {}
   }
 
   const save = async () => {
+    if (reads.configFailed) return;
     if (!appId.trim()) {
       toast.error(uiMessage('feishu-settings.app-id-is-required.cb6e433919'));
       return;
@@ -204,6 +189,7 @@ export function FeishuSettings({ t }: { t?: any }) {
 
   return (
     <div className="space-y-6">
+      {reads.error && <div role="alert">{organizationRemediationCopy(locale).configError} {reads.error}<button type="button" onClick={() => { void loadConfig(); void loadBindings(); void loadStatus(); }}>{organizationRemediationCopy(locale).retry}</button></div>}
       {/* Status Bar */}
       <div className="flex items-center gap-3 rounded-lg border border-white/10 bg-white/5 p-4">
         <div className={`h-3 w-3 rounded-full ${online ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : connectionState === 'error' ? 'bg-red-400' : configured ? 'bg-amber-400' : 'bg-white/20'}`} />

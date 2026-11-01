@@ -108,9 +108,13 @@ export function formatVerifiedDesignProjectStatus(
 
   const selected = requestedStage(taskText);
   const nextStage = String(workflow.nextStage || '').trim() as DesignStageId;
+  const allStagesVerified = (Object.keys(STAGE_LABELS) as DesignStageId[]).every(entryId => {
+    const stage = parseObject(stages[entryId]);
+    return stage.status === 'completed' && stage.verificationStatus === 'passed';
+  });
   const nextLabel = nextStage && STAGE_LABELS[nextStage]
     ? `${STAGE_LABELS[nextStage]}\uff08${statusLabel(parseObject(stages[nextStage]).status)}\uff09`
-    : '\u5168\u90e8\u9636\u6bb5\u5df2\u5b8c\u6210';
+    : allStagesVerified ? '\u5168\u90e8\u9636\u6bb5\u5df2\u5b8c\u6210' : '\u4e0b\u4e00\u9636\u6bb5\u5c1a\u672a\u8bb0\u5f55';
   const header = `\u201c${String(project.name || project.id)}\u201d\u9879\u76ee\u8d26\u672c\uff1a`;
 
   if (selected && stages[selected]) {

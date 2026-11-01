@@ -1,41 +1,43 @@
+import { getIndustryWorkflowPrerequisiteStatus } from '../industry/workflow_service';
+import { getIndustryWorkflowContract } from '../industry/workflow_contracts';
+export { bindIndustryWorkflowToolPolicy } from '../industry/execution_policy';
+import * as LegalCases from '../org/legal_cases';
+import { meetingMinutesToCaseHandler } from '../regions/packs/cn/legal_tools/meetings';
+import { withLegalExecution } from '../legal/execution';
+import { decodeToolResult } from '../tools/result_envelope';
+import { assertOrganizationResourceAccess, OrganizationResourceAuthorizationError } from '../org/resource_acl';
+import { legalToolDefinitions } from '../regions/packs/cn/legal_tools';
+import { bindIndustryWorkspaceContext, getActiveIndustryWorkspaceContext, listIndustryWorkspaceContexts } from '../industry/workspace_context';
+import { legalToolCaseIdentity, legalToolEntryId } from '../../shared/legal_tool_entry';
+import { CN_PUBLIC_AGENT_EVENT_MESSAGES } from '../regions/messages/public_agent_event_messages';
+import { runLumiEntryTurn } from "../cognition/turn_execution";
+import { captureRequestAuthorization, captureConversationAuthorization, combineRequestAuthorizations } from "../conversation/lifecycle";
+import { resolveConversationForEntry } from "../conversation/entry_conversation";
+
+import { type ProviderGetters as SharedProviderGetters, providerGetterArguments } from "../llm/provider_getters";
+import { randomUUID } from 'node:crypto';
+import { getConversationActionTurn } from '../conversation/action_turn_ledger';
+import { getIndustryWorkflowTask, interruptIndustryWorkflow, observeIndustryWorkflowTool, recordIndustryWorkflowExecution, validateIndustryWorkflowSourceInput } from '../industry/workflow_service';
 import { Router } from "express";
 import { requireNotStrict } from '../config/privacy';
-import OpenAI from "openai";
-import Anthropic from "@anthropic-ai/sdk";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import { runWithTools } from "../llm/adapter";
+import { createCallerKeyProvider } from '../llm/caller_key_provider';
+
 import { createRequestAbortController } from '../http/request_abort';
+import { runtimeShutdownCancellation } from '../runtime/shutdown_work';
 import { makeLLMCall } from "../llm/providers";
-import { toolRegistry } from "../tools/registry";
-import { executeToolCallOrThrow } from "../tools/execution_engine";
+import { ToolRegistry, toolRegistry } from "../tools/registry";
+import { executeToolCall, executeToolCallOrThrow } from "../tools/execution_engine";
+import { createToolReceiptObserver } from '../tools/receipt_observer';
+import { flushDBOrThrow } from '../../db_layer';
+import { captureOrganizationMembershipAuthorization, watchOrganizationMembershipAuthorization } from '../org/membership_authorization';
 import { recordLatency } from "../monitor/latency_store";
-import { optionalAuth, requireAuth, resolveDomain } from "../middleware/auth";
+import { optionalAuth, requireAuth, requireLocalRequest, resolveDomain } from "../middleware/auth";
 import { getUserPreferredLLMConfig } from "../llm/user_preferences";
 import { recordTokenUsage } from "../llm/token_tracker";
-import { buildUnifiedLegalEntryPrompt } from "../cognition/legal_entry";
-import { finalizeLumiResponse } from "../cognition/result_finalizer";
-import {
-  finalizeExecutionForOutboundDelivery,
-  type ExecutionGuardRecoveryRunInput,
-} from "../cognition/execution_guard_recovery";
-import { buildLumiTurnDispatch } from "../cognition/turn_dispatch";
-import { buildLumiExecutionPipeline } from "../cognition/execution_pipeline";
 import {
   createPreFinalizationTextGate,
   shouldDeferModelOutputUntilFinalized,
 } from "../cognition/response_delivery";
-import type { LumiTurnFlow } from "../cognition/turn_flow";
-import type { ToolExecutionRecord } from "../tools/types";
-import { getIndustryWorkflowTask, recordIndustryWorkflowExecution } from "../industry/workflow_service";
-import { getIndustryWorkflowContract } from "../industry/workflow_contracts";
-import { bindIndustryWorkflowToolPolicy } from "../industry/execution_policy";
-export { bindIndustryWorkflowToolPolicy } from "../industry/execution_policy";
-import {
-  formatIndustryCapabilityProfilePrompt,
-  formatIndustryWorkflowRoutingPrompt,
-  getCurrentIndustryCapabilityProfile,
-} from '../regions/packs/cn/industry_capability_profile';
-import { restrictToolPolicyForExecutionBoundary } from "../tools/remote_policy";
 import { isLoopbackAddress } from "../config/local_identity";
 import {
   DESKTOP_SESSION_HEADER,
@@ -50,22 +52,17 @@ import {
 const REST_CHAT_BASE_SYSTEM_INSTRUCTION =
   'You are Lumi, the local core intelligence. Be professional, thoughtful, forward-looking, concise, and useful. Follow the user-facing response-language instruction while keeping internal protocols, tool names, state fields, and execution policy in canonical English.';
 
-function buildRestChatRouteText(messages: unknown, prompt: unknown): string {
-  if (Array.isArray(messages)) {
-    return messages
-      .map((item: any) => String(item?.content || item?.message || item?.text || '').trim())
-      .filter(Boolean)
-      .join('\n')
-      .slice(-12000);
-  }
-  return String(prompt || '').trim().slice(-12000);
+function buildRestConversationMessages(messages: unknown, prompt: unknown) {
+  const history = Array.isArray(messages) ? messages.filter(item => item
+    && (item.role === 'user' || item.role === 'assistant' || item.role == null)) : [];
+  return (history.length ? history : [{ role: 'user', content: prompt }]).map(item => ({
+    role: item.role === 'assistant' ? 'assistant' as const : 'user' as const,
+    content: String(item.content ?? item.message ?? item.text ?? ''),
+  }));
 }
 
 function buildRestProviderMessages(messages: unknown, prompt: unknown, systemInstruction: string): any[] {
-  const rawMessages = Array.isArray(messages) && messages.length > 0
-    ? messages
-    : [{ role: 'user', content: String(prompt || '') }];
-  const existingSystem = rawMessages
+  const existingSystem = (Array.isArray(messages) ? messages : [])
     .filter((item: any) => item?.role === 'system')
     .map((item: any) => String(item?.content || '').trim())
     .filter(Boolean)
@@ -73,178 +70,13 @@ function buildRestProviderMessages(messages: unknown, prompt: unknown, systemIns
   const systemContent = [systemInstruction, existingSystem].filter(Boolean).join('\n\n');
   return [
     { role: 'system', content: systemContent },
-    ...rawMessages
-      .filter((item: any) => item?.role !== 'system')
-      .map((item: any) => ({
-        role: item?.role === 'assistant' ? 'assistant' : 'user',
-        content: String(item?.content || item?.message || item?.text || ''),
-      })),
+    ...buildRestConversationMessages(messages, prompt),
   ];
-}
-
-function buildRestAnthropicMessages(messages: unknown, prompt: unknown): any[] {
-  const rawMessages = Array.isArray(messages) && messages.length > 0
-    ? messages
-    : [{ role: 'user', content: String(prompt || '') }];
-  return rawMessages
-    .filter((item: any) => item?.role !== 'system')
-    .map((item: any) => ({
-      role: item?.role === 'assistant' ? 'assistant' : 'user',
-      content: String(item?.content || item?.message || item?.text || ''),
-    }));
-}
-
-function buildRestChatSystemInstruction(input: {
-  routeText: string;
-  domain: 'personal' | 'work';
-  orgId: string;
-  source: string;
-}): string {
-  const legalOverlay = buildUnifiedLegalEntryPrompt({
-    text: input.routeText,
-    domain: input.domain,
-    orgId: input.orgId,
-    channel: 'chat',
-    source: input.source,
-  });
-  return [
-    REST_CHAT_BASE_SYSTEM_INSTRUCTION,
-    formatIndustryCapabilityProfilePrompt(),
-    formatIndustryWorkflowRoutingPrompt(input.routeText),
-    legalOverlay,
-  ].filter(Boolean).join('\n\n');
-}
-
-type RestChatFinalization = ReturnType<typeof finalizeLumiResponse>;
-
-async function finalizeRestChatResponse(input: {
-  taskText: string;
-  responseText: string;
-  toolRecords?: ToolExecutionRecord[];
-  source: string;
-  flow?: LumiTurnFlow;
-  allowToolUse?: boolean;
-  attempt?: ExecutionGuardRecoveryRunInput<RestChatFinalization>['attempt'];
-}) {
-  const toolRecords = input.toolRecords || [];
-  const finalization = finalizeLumiResponse({
-    taskText: input.taskText,
-    responseText: input.responseText,
-    toolRecords,
-    source: input.source,
-    flow: input.flow,
-  });
-  return finalizeExecutionForOutboundDelivery({
-    task: input.taskText,
-    responseText: input.responseText,
-    finalization,
-    allowToolUse: input.allowToolUse === true,
-    toolRecords,
-    attempt: input.attempt,
-    finalize: (candidateText, records) => finalizeLumiResponse({
-      taskText: input.taskText,
-      responseText: candidateText,
-      toolRecords: records,
-      source: `${input.source}_guard_recovery`,
-      flow: input.flow,
-    }),
-  });
-}
-
-export function buildBoundIndustryWorkflowRouteText(input: {
-  entryId: string;
-  requestedRouteText: unknown;
-  fallbackRouteText: string;
-}): string {
-  const profile = getCurrentIndustryCapabilityProfile();
-  const entry = profile?.entries.find(candidate => candidate.entryId === input.entryId);
-  const requested = String(input.requestedRouteText || '').trim().slice(-12000);
-  const fallback = String(input.fallbackRouteText || '').trim().slice(-12000);
-  return [entry?.displayName || input.entryId, requested || fallback]
-    .filter(Boolean)
-    .join('\n')
-    .slice(-12000);
-}
-
-function bindIndustryToolRecords(records: ToolExecutionRecord[], input: {
-  workTakeoverTaskId: string;
-  conversationTaskId: string;
-  requestId: string;
-}): ToolExecutionRecord[] {
-  return records.map(record => ({
-    ...record,
-    taskId: record.taskId || input.conversationTaskId,
-    requestId: record.requestId || input.requestId,
-    idempotencyKey: record.idempotencyKey || `industry:${input.workTakeoverTaskId}:${record.id || record.name}`,
-  }));
-}
-
-export function resolveRestDesktopExecutionBoundary(input: {
-  authenticated: boolean;
-  userId: string;
-  remoteAddress?: string | null;
-  proofHeaderPresent: boolean;
-  presentedProof: unknown;
-}): {
-  trustedLocalExecution: boolean;
-  executionBoundary: 'trusted_local' | 'remote_restricted';
-  rejectPresentedProof: boolean;
-} {
-  const trustedLocalExecution = Boolean(
-    input.authenticated
-    && isLoopbackAddress(input.remoteAddress)
-    && verifyDesktopSessionProof(input.presentedProof, input.userId),
-  );
-  return {
-    trustedLocalExecution,
-    executionBoundary: trustedLocalExecution ? 'trusted_local' : 'remote_restricted',
-    rejectPresentedProof: input.proofHeaderPresent && !trustedLocalExecution,
-  };
-}
-
-function settleBoundIndustryWorkflow(input: {
-  userId: string;
-  domain: 'personal' | 'work';
-  orgId: string;
-  taskId: string;
-  resultText: string;
-  toolRecords: ToolExecutionRecord[];
-  source: string;
-}) {
-  const persistedCompletion = [...input.toolRecords].reverse().map(record => {
-    if (record.name !== 'industry_workflow_complete' || record.error || !String(record.result || '').trim()) return null;
-    let payload: any = record.receipt || record.result;
-    for (let depth = 0; depth < 3 && typeof payload === 'string'; depth += 1) {
-      try { payload = JSON.parse(payload); } catch { return null; }
-    }
-    return payload?.persisted === true
-      && String(payload?.task?.id || '') === input.taskId
-      && payload?.verification
-      ? payload
-      : null;
-  }).find(Boolean);
-  if (persistedCompletion) {
-    const persistedTask = getIndustryWorkflowTask(input, input.taskId);
-    if (!persistedTask) {
-      throw new Error('The industry completion receipt was not persisted to the bound workflow task.');
-    }
-    const persistedVerification = persistedTask.metadata?.workTakeoverVerification;
-    if (!persistedVerification) {
-      throw new Error('The bound workflow task is missing its persisted verification record.');
-    }
-    return { task: persistedTask, verification: persistedVerification };
-  }
-  return recordIndustryWorkflowExecution(input);
 }
 
 function dateLikeToIso(value: unknown, fallback = Date.now()): string {
   const date = value ? new Date(value as any) : new Date(fallback);
   return Number.isNaN(date.getTime()) ? new Date(fallback).toISOString() : date.toISOString();
-}
-
-function shouldArchiveLegalMeeting(purpose: unknown, legalCase: unknown, domain: string, orgId: string): boolean {
-  const isLegalMeeting = purpose === 'legal_consultation' || Boolean(legalCase && typeof legalCase === 'object');
-  return isLegalMeeting && domain === 'work' && Boolean(orgId);
 }
 
 function safeLegalScopeSegment(value: unknown, fallback = 'anonymous'): string {
@@ -264,13 +96,15 @@ function resolveLegalCaseworkOrgId(input: {
   if (input.domain === 'work') {
     return String(input.explicitOrgId || input.userOrgId || 'default').trim() || 'default';
   }
-  return `personal:${safeLegalScopeSegment(input.userId)}`;
+  return LegalCases.legalWorkspaceNamespace(input.userId);
 }
 
 function buildLegalMeetingMinutesArgs(input: {
   transcript: string;
+  report: string;
   startedAt?: unknown;
   endedAt?: unknown;
+  meetingId: string;
   legalCase?: any;
   orgId: string;
   userId: string;
@@ -284,7 +118,9 @@ function buildLegalMeetingMinutesArgs(input: {
   ).trim();
   return {
     transcript: input.transcript,
-    meetingTime: dateLikeToIso(input.startedAt || input.endedAt),
+    report: input.report,
+    meetingTime: input.startedAt || input.endedAt ? dateLikeToIso(input.startedAt || input.endedAt) : '',
+    meetingId: input.meetingId,
     orgId: input.orgId || 'default',
     userId: input.userId,
     caseId: String(legalCase.id || '').trim(),
@@ -297,35 +133,7 @@ function buildLegalMeetingMinutesArgs(input: {
   };
 }
 
-const DIRECT_LEGAL_TOOL_ALLOWLIST = new Set([
-  'legal_search_case',
-  'legal_search_statute',
-  'legal_case_workspace',
-  'legal_case_workflow_status',
-  'legal_message_intake_to_case',
-  'legal_meeting_minutes_to_case',
-  'legal_case_reasoning_matrix',
-  'legal_generate_litigation_packet',
-  'legal_prepare_filing_handoff',
-  'legal_extract_dispute_focus',
-  'legal_generate_argument_or_opinion',
-  'legal_generate_bid',
-  'legal_review_contract',
-  'legal_draft_contract',
-  'legal_process_notice_link',
-  'legal_download_and_extract_document',
-  'legal_trace_assets',
-  'legal_equity_penetration',
-  'legal_external_research_plan',
-  'legal_search_external_authorities',
-  'legal_company_database_lookup',
-  'legal_generate_citation_verification_report',
-  'legal_finalize_delivery_package',
-  'legal_refresh_authoritative_sources',
-  'legal_authority_source_status',
-  'legal_verify_citation',
-  'legal_import_judgment',
-]);
+const DIRECT_LEGAL_TOOL_ALLOWLIST = new Set(legalToolDefinitions().map(tool => tool.name));
 
 /**
  * Organization viewers are limited to tools whose contract is read-only.
@@ -369,14 +177,14 @@ export function formatMeetingTranscriptForAnalysis(notes: unknown[]): string {
     .join('\n');
 }
 
-export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
-  getDeepSeek: any; getGemini: any; getOpenAI: any; getAnthropic: any; getQwen: any;
-  getOllama?: any; getLmStudio?: any; getArk?: any; getXiaomi?: any;
-  getKimi?: any; getGlm?: any; getRelay?: any;
-}) {
-  const asyncHandler = (fn: (req: any, res: any, next?: any) => Promise<any>) =>
-    (req: any, res: any, next: any) => Promise.resolve(fn(req, res, next)).catch(next);
+export function mountChatRoutes(router: Router, _jwtSecret: string, llm: SharedProviderGetters & Required<Pick<SharedProviderGetters, 'getOpenAI' | 'getAnthropic' | 'getQwen'>>) {
+  const asyncHandler = chatRouteAsyncHandler;
+  mountConversationCompletionRoutes(router, llm, asyncHandler);
+  mountLegalCompletionRoutes(router, llm, asyncHandler);
+  mountMeetingCompletionRoutes(router, llm, asyncHandler);
+}
 
+function mountConversationCompletionRoutes(router: Router, llm: SharedProviderGetters & Required<Pick<SharedProviderGetters, 'getOpenAI' | 'getAnthropic' | 'getQwen'>>, asyncHandler: typeof chatRouteAsyncHandler) {
   const handleChat = asyncHandler(async (req, res) => {
     const { provider: reqProvider = "gemini", model: reqModel, messages, prompt: rawPrompt, message } = req.body;
     const prompt = rawPrompt ?? message;
@@ -389,173 +197,46 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
     }
     const userId = req.user?.uid || 'anonymous';
     const presentedDesktopSession = req.headers[DESKTOP_SESSION_HEADER];
-    const desktopExecution = resolveRestDesktopExecutionBoundary({
-      authenticated: Boolean(req.user),
-      userId,
-      remoteAddress: req.socket?.remoteAddress,
-      proofHeaderPresent: Object.prototype.hasOwnProperty.call(req.headers, DESKTOP_SESSION_HEADER),
-      presentedProof: presentedDesktopSession,
-    });
-    if (desktopExecution.rejectPresentedProof) {
+    const desktopSessionPresented = Object.prototype.hasOwnProperty.call(req.headers, DESKTOP_SESSION_HEADER);
+    const trustedLocalExecution = Boolean(
+      req.user
+      && isLoopbackAddress(req.socket?.remoteAddress)
+      && verifyDesktopSessionProof(presentedDesktopSession, userId),
+    );
+    if (desktopSessionPresented && !trustedLocalExecution) {
       return res.status(403).json({
         error: 'Native desktop session proof expired or is invalid',
         code: 'DESKTOP_SESSION_PROOF_REQUIRED',
       });
     }
-    const { trustedLocalExecution, executionBoundary } = desktopExecution;
+    const executionBoundary = trustedLocalExecution ? 'trusted_local' as const : 'remote_restricted' as const;
     const requestScope = req.user ? resolveDomain(req.user) : { domain: 'personal' as const, orgId: '' };
     const domain = requestScope.domain;
     const orgId = requestScope.orgId;
-    const industryWorkflowTaskId = String(req.body?.industryWorkflowTaskId || '').trim();
-    const industryWorkflowTask = industryWorkflowTaskId
-      ? getIndustryWorkflowTask({ userId, domain, orgId }, industryWorkflowTaskId)
-      : null;
-    if (industryWorkflowTaskId && !industryWorkflowTask) {
-      return res.status(404).json({ error: 'Industry workflow task not found in the current user scope.' });
+    const businessTaskId = String(req.body?.industryWorkflowTaskId || '').trim();
+    const businessTask = businessTaskId ? getIndustryWorkflowTask({ userId, domain, orgId }, businessTaskId) : null;
+    if (businessTaskId && (!businessTask || !trustedLocalExecution || isBYOK)) return res.status(403).json({ error: 'A scoped native business task is required' });
+    const prerequisite = businessTask ? getIndustryWorkflowPrerequisiteStatus(businessTask) : null;
+    if (prerequisite) return res.status(409).json({ error: prerequisite.blocker, prerequisite });
+    let businessAuthority: ReturnType<typeof captureOrganizationMembershipAuthorization> | undefined;
+    if (businessTask && domain === 'work') {
+      try { businessAuthority = captureOrganizationMembershipAuthorization(orgId, userId); }
+      catch { return res.status(403).json({ error: 'Active organization authority is required for business execution' }); }
     }
-    const industryWorkflow = industryWorkflowTask?.metadata?.industryWorkflow || {};
-    const industryWorkflowContract = industryWorkflowTask
-      ? getIndustryWorkflowContract(industryWorkflow.productLine, industryWorkflow.entryId)
-      : null;
-    if (industryWorkflowTask && !industryWorkflowContract) {
-      return res.status(409).json({ error: 'Industry workflow contract is unavailable for the bound task.' });
+    let businessSource = '';
+    if (businessTask) {
+      try { businessSource = validateIndustryWorkflowSourceInput(businessTask, req.body.industryWorkflowSourceInput); }
+      catch (error) { return res.status(409).json({ error: (error as Error).message }); }
+      if (!businessSource) return res.status(400).json({ error: 'The original business source is required' });
     }
-    const fallbackRouteText = buildRestChatRouteText(messages, prompt);
-    const routeText = industryWorkflowTask
-      ? buildBoundIndustryWorkflowRouteText({
-          entryId: String(industryWorkflow.entryId || ''),
-          requestedRouteText: req.body?.industryWorkflowRouteText,
-          fallbackRouteText,
-        })
-      : fallbackRouteText;
-    const restTurnDispatch = buildLumiTurnDispatch({
-      userId,
-      text: routeText,
-      channel: 'chat',
-      source: 'rest_chat',
-      category: 'command',
-      domain,
-      orgId,
-      operationMode: 'assistant',
-      targetIsLumi: true,
-    });
-    const restBoundaryToolPolicy = restrictToolPolicyForExecutionBoundary({
-      allowedTools: ['*'],
-      requireConfirmation: [],
-      forbiddenTools: [],
-      maxIterations: 80,
-    }, executionBoundary);
-    const restBoundaryAllowedToolNames = new Set(restBoundaryToolPolicy.allowedTools || []);
-    const restBoundaryForbiddenTools = executionBoundary === 'remote_restricted'
-      ? toolRegistry.getToolDeclarations({
-          context: {
-            userId,
-            domain,
-            orgId,
-            source: 'rest_chat',
-            autonomous: false,
-          },
-        })
-          .map(declaration => declaration.function.name)
-          .filter(name => !restBoundaryAllowedToolNames.has('*') && !restBoundaryAllowedToolNames.has(name))
-      : [];
-    const restPersonalityToolPolicy = industryWorkflowTask
-      ? restrictToolPolicyForExecutionBoundary(
-          bindIndustryWorkflowToolPolicy(
-            restBoundaryToolPolicy,
-            industryWorkflowTask,
-            toolRegistry.getToolDeclarations({
-              context: {
-                userId,
-                domain,
-                orgId,
-                source: 'rest_chat',
-                autonomous: false,
-              },
-            }).map(declaration => declaration.function.name),
-          ),
-          executionBoundary,
-        )
-      : restBoundaryToolPolicy;
-    const restExecutionPipeline = buildLumiExecutionPipeline({
-      dispatch: {
-        userId,
-        text: routeText,
-        channel: 'chat',
-        source: 'rest_chat',
-        category: 'command',
-        domain,
-        orgId,
-        operationMode: 'assistant',
-        targetIsLumi: true,
-      },
-      prebuiltDispatch: restTurnDispatch,
-      registry: toolRegistry,
-      personalityToolPolicy: restPersonalityToolPolicy,
-      additionalForbiddenTools: restBoundaryForbiddenTools,
-      isSanctuary: !req.user,
-    });
-    const restModelToolPolicy = restExecutionPipeline.authorizationPolicy;
-    const restModelToolProjection = restExecutionPipeline.modelToolProjection;
-    const restToolSessionActive = restExecutionPipeline.executionRequested;
-    const deferRestStream =
-      restToolSessionActive
-      || shouldDeferModelOutputUntilFinalized({
-        taskText: routeText,
-        flow: restTurnDispatch.flow,
-      });
-    const toolContext = {
-      currentTurnExecutionRequested: restExecutionPipeline.executionRequested,
-      trustedActionContinuation: restExecutionPipeline.trustedActionContinuation,
-      userId,
-      authenticated: Boolean(req.user),
-      authRole: req.user?.role,
-      orgRole: req.user?.orgRole,
-      localExecution: trustedLocalExecution,
-      executionBoundary,
-      domain,
-      orgId,
-      llmGetters: llm,
-      source: trustedLocalExecution ? 'rest_chat_local' : 'rest_chat',
-      actionIntent: routeText,
-      routedTaskText: restTurnDispatch.flow.routeText,
-      toolPolicy: restModelToolPolicy,
-      modelToolProjection: restModelToolProjection,
-      allowLocalFileWrites: Boolean(industryWorkflowTask && trustedLocalExecution),
-      localWriteIntentReason: industryWorkflowTask && trustedLocalExecution
-        ? 'The bound industry workflow explicitly authorizes reviewable local drafts and files; external side effects remain prohibited or confirmation-gated.'
-        : undefined,
-      ...(industryWorkflowTask
-        ? {
-            taskId: String(industryWorkflow.conversationTaskId || ''),
-            conversationId: String(industryWorkflow.conversationId || ''),
-            requestId: String(industryWorkflow.requestId || ''),
-            industryWorkflowTaskId: industryWorkflowTask.id,
-            industryWorkflowEntryId: String(industryWorkflow.entryId || ''),
-            industryWorkflowProductLine: String(industryWorkflow.productLine || ''),
-            industryWorkflowRequiredToolReceipts: industryWorkflowContract?.requiredToolReceipts || [],
-          }
-        : {}),
-    };
-    const systemInstruction = [
-      buildRestChatSystemInstruction({
-        routeText,
-        domain,
-        orgId,
-        source: 'rest_chat',
-      }),
-      restExecutionPipeline.execution.promptOverlay,
-      industryWorkflowTask
-        ? [
-            '## Bound Industry Workflow Execution',
-            `This request is already bound to ${industryWorkflowTask.id}; never create a duplicate workflow task.`,
-            'Treat the workflow brief as an execution request, not as a conceptual question about tools or modes.',
-            'When the brief already provides the exact business identity and required fields, bind that local workspace and continue instead of asking for the same information again.',
-            `Run every required current-turn domain capability (${(industryWorkflowContract?.requiredToolReceipts || []).join(', ')}), then call industry_workflow_complete exactly once with taskId=${industryWorkflowTask.id}.`,
-            'Use the narrow domain capabilities selected for this workflow. Respect every explicit prohibition on login, upload, send, submit, payment, filing, or other external side effects.',
-          ].join('\n')
-        : '',
-    ].filter(Boolean).join('\n\n');
+    const businessMetadata = businessTask?.metadata?.industryWorkflow;
+    const requestId = businessMetadata?.requestId || randomUUID();
+    const persistedTurn = businessMetadata?.conversationId ? getConversationActionTurn({
+      conversationId: businessMetadata.conversationId, userId, requestId,
+    }) : null;
+    const conversationMessages = buildRestConversationMessages(messages, prompt);
+    // History informs interpretation; only the latest user message authorizes work.
+    const routeText = businessSource || (conversationMessages.slice().reverse().find(item => item.role === 'user')?.content || '').trim().slice(-12000);
 
     const preferred = getUserPreferredLLMConfig(userId, { domain, orgId });
     const provider = isBYOK ? reqProvider : preferred.provider;
@@ -565,270 +246,104 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
     }
 
     const request = createRequestAbortController(req, res);
+    const membershipWatcher = businessAuthority
+      ? watchOrganizationMembershipAuthorization(businessAuthority, orgId, userId, request.abort)
+      : undefined;
+    const businessAuthorization = captureRequestAuthorization(() => !membershipWatcher || membershipWatcher.isAuthorized(), 'Business execution authorization was revoked');
+    const conversationAuthorization = businessMetadata?.conversationId ? captureConversationAuthorization({ userId, domain, orgId }, () => businessMetadata.conversationId) : undefined;
+    const authorization = conversationAuthorization ? combineRequestAuthorizations(businessAuthorization, conversationAuthorization) : businessAuthorization;
+    const isBusinessAuthorized = authorization.isCurrent;
+    const receiptObserver = businessTask ? createToolReceiptObserver(async record => {
+      if (isBusinessAuthorized()) await observeIndustryWorkflowTool({ userId, domain, orgId }, businessTask.id, record);
+    }) : undefined;
+    const unregisterShutdownCancellation = runtimeShutdownCancellation.register(request.controller);
     try {
-      request.signal.throwIfAborted();
-      let responseText = '';
-
-      if (isBYOK) {
-        requireNotStrict('Chat with a supplied cloud API key');
-        const llmStart = Date.now();
-        if (provider === "gemini") {
-          const client = new GoogleGenerativeAI(userKey);
-          const modelInstance = client.getGenerativeModel({ model: model || "gemini-2.0-flash", systemInstruction });
-          const contents = messages
-            ? messages.map((m: any) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }))
-            : [{ role: 'user', parts: [{ text: prompt }] }];
-          responseText = (await modelInstance.generateContent({ contents }, { signal: request.signal })).response.text();
-        } else if (provider === "anthropic") {
-          const client = new Anthropic({ apiKey: userKey });
-          const response = await client.messages.create({
-            model: model || "claude-sonnet-4-6",
-            max_tokens: 1024,
-            system: systemInstruction,
-            messages: buildRestAnthropicMessages(messages, prompt),
-          }, { signal: request.signal });
-          responseText = response.content[0].type === 'text' ? response.content[0].text : '';
-        } else {
-          const client = new OpenAI({ apiKey: userKey, baseURL: provider === "deepseek" ? "https://api.deepseek.com/v1" : provider === "qwen" ? "https://dashscope.aliyuncs.com/compatible-mode/v1" : undefined });
-          const response = await client.chat.completions.create({
-            model: model || (provider === "deepseek" ? "deepseek-v4-flash" : provider === "qwen" ? "qwen-plus" : "gpt-4o"),
-            messages: buildRestProviderMessages(messages, prompt, systemInstruction),
-          }, { signal: request.signal });
-          responseText = response.choices[0].message.content || '';
-        }
-        request.signal.throwIfAborted();
-        const outbound = await finalizeRestChatResponse({
-          taskText: routeText,
-          responseText,
-          source: 'rest_chat',
-          flow: restTurnDispatch.flow,
-        });
-        request.signal.throwIfAborted();
-        const finalized = outbound.finalization;
-        responseText = finalized.text;
-        recordLatency('llm', Date.now() - llmStart);
-        return res.json({
-          text: responseText,
-          finalized: true,
-          blocked: finalized.blocked,
-          reason: finalized.reason,
-          notification: finalized.notification,
-        });
-      } else {
-        const normalizedMessages: any[] = [
-          { role: 'system', content: systemInstruction },
-          ...(messages || [{ role: 'user', content: prompt }]).map((m: any) => ({
-            role: m.role === 'assistant' ? 'assistant' : 'user',
-            content: m.content || ''
-          }))
-        ];
-
-        const runRestToolTurn = (
-          turnMessages: any[],
-          onToolRecord?: (record: ToolExecutionRecord) => void,
-          onChunk?: (chunk: string) => void,
-          source = toolContext.source,
-        ) => runWithTools(
-          turnMessages,
-          toolRegistry,
-          { provider, model, userId, domain, orgId, signal: request.signal },
-          onToolRecord,
-          restModelToolPolicy.maxIterations || 3,
-          llm.getDeepSeek,
-          llm.getGemini,
-          llm.getOpenAI,
-          llm.getAnthropic,
-          llm.getQwen,
-          onChunk,
-          { ...toolContext, source, executionSignal: request.signal, isCancelled: () => request.signal.aborted },
-          llm.getOllama,
-          llm.getLmStudio,
-          llm.getArk,
-          llm.getXiaomi,
-          llm.getKimi,
-          llm.getGlm,
-          llm.getRelay,
-        );
-
-        const bindRestIndustryToolRecords = (records: ToolExecutionRecord[] = []) => (
-          industryWorkflowTask
-            ? bindIndustryToolRecords(records, {
-                workTakeoverTaskId: industryWorkflowTask.id,
-                conversationTaskId: String(industryWorkflow.conversationTaskId || ''),
-                requestId: String(industryWorkflow.requestId || ''),
-              })
-            : records
-        );
-
-        const finalizeRestToolResult = async (
-          candidateText: string,
-          result: Awaited<ReturnType<typeof runRestToolTurn>>,
-          source: string,
-        ) => {
-          request.signal.throwIfAborted();
-          const usageRecords = [...(result.usageRecords || [])];
-          const initialToolRecords = bindRestIndustryToolRecords(result.toolCalls);
-          const outbound = await finalizeRestChatResponse({
-            taskText: routeText,
-            responseText: candidateText,
-            toolRecords: initialToolRecords,
-            source,
-            flow: restTurnDispatch.flow,
-            allowToolUse: restToolSessionActive,
-            attempt: async ({ instruction, recordTool }) => {
-              const recovery = await runRestToolTurn(
-                [
-                  ...normalizedMessages,
-                  ...(candidateText.trim()
-                    ? [{ role: 'assistant', content: candidateText }]
-                    : []),
-                  { role: 'user', content: instruction },
-                ],
-                record => recordTool(bindRestIndustryToolRecords([record])[0]),
-                undefined,
-                'rest_chat_guard_recovery',
-              );
-              usageRecords.push(...(recovery.usageRecords || []));
-              return {
-                text: recovery.text,
-                toolRecords: bindRestIndustryToolRecords(recovery.toolCalls),
-              };
-            },
-          });
-          request.signal.throwIfAborted();
-          return {
-            outbound: {
-              ...outbound,
-              // Re-bind the complete outbound ledger after guard recovery as
-              // an idempotent final fence. Both the initial and recovery
-              // receipts must settle against the same finance workflow task.
-              toolRecords: bindRestIndustryToolRecords(outbound.toolRecords),
-            },
-            usageRecords,
-          };
-        };
-
-        const stream = req.query.stream === 'true';
-
-        if (stream) {
-          res.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-          });
-          const restTextGate = createPreFinalizationTextGate();
-
-          const result = await runRestToolTurn(
-            normalizedMessages,
-            undefined,
-            (chunk) => {
-              if (request.signal.aborted) return;
-              if (!deferRestStream) {
+      const anchored = businessMetadata?.conversationId ? resolveConversationForEntry(userId, { domain, orgId }, { kind: 'rest' }, businessMetadata.conversationId) : null;
+      if (businessMetadata?.conversationId && !anchored) throw Object.assign(new Error('The bound business conversation is unavailable'), { code: 'CONVERSATION_ENTRY_UNAVAILABLE' });
+      if (isBYOK) requireNotStrict('Chat with a supplied cloud API key');
+      const caller = isBYOK ? createCallerKeyProvider(provider, model, userKey) : undefined;
+      const llmStart = Date.now();
+      const stream = !isBYOK && req.query.stream === 'true';
+      const restTextGate = createPreFinalizationTextGate();
+      let industryWorkflow: ReturnType<typeof recordIndustryWorkflowExecution> | undefined;
+      const executionSource = trustedLocalExecution ? 'rest_chat_local' : 'rest_chat';
+      return await runLumiEntryTurn({
+        entry: { source: executionSource, queueSource: 'rest', channel: 'chat', historyLimit: 0,
+          failureText: 'The request could not finish.', failureReason: 'rest_chat_failed' },
+        identity: { userId, domain, orgId, agentId: anchored?.agentId || 'lumi', conversationId: anchored?.id || '', requestId },
+        userText: routeText, persistence: 'external', authorization, controller: request.controller,
+        externalTask: { taskId: businessMetadata?.conversationTaskId,
+          turnRowId: persistedTurn && persistedTurn.domain === domain && persistedTurn.orgId === orgId && persistedTurn.taskId === businessMetadata?.conversationTaskId ? persistedTurn.id : undefined },
+        planning: { dispatch: { userId, text: routeText, channel: 'chat', source: 'rest_chat', category: 'command', domain, orgId, operationMode: 'assistant', targetIsLumi: true },
+          registry: caller ? new ToolRegistry() : toolRegistry,
+          personalityToolPolicy: { allowedTools: ['*'], requireConfirmation: [], forbiddenTools: [], maxIterations: 80 },
+          executionBoundary, isSanctuary: !req.user, taskId: businessMetadata?.conversationTaskId },
+        assemble: execution => {
+          const systemInstruction = REST_CHAT_BASE_SYSTEM_INSTRUCTION;
+          if (caller) return { systemPrompt: systemInstruction,
+            messages: caller.provider === 'gemini' || caller.provider === 'anthropic'
+              ? [{ role: 'system', content: systemInstruction }, ...conversationMessages]
+              : buildRestProviderMessages(messages, prompt, systemInstruction),
+            model: { config: { provider: caller.provider, model: caller.model, selectionMode: 'pinned', noImplicitFailover: true, allowCloudFallback: false,
+              fallbackCandidates: [], source: 'rest_chat', requestId, ...(caller.provider === 'anthropic' ? { maxTokens: 1024 } : {}) },
+              getters: caller.getters, streaming: false, taskText: routeText } };
+          const deferRestStream = execution.executionRequested || shouldDeferModelOutputUntilFinalized({ taskText: routeText, flow: execution.turnIntent.flow });
+          if (stream) res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+          return { systemPrompt: systemInstruction, messages: [{ role: 'system', content: systemInstruction }, ...conversationMessages],
+            model: { registry: toolRegistry, config: { provider, model, userId, domain, orgId, source: executionSource, workflowSource: businessTask?.source || executionSource }, streaming: stream,
+              maxIterations: execution.authorizationPolicy.maxIterations || 3,
+              onToolCall: async record => { authorization.assertCurrent(); await receiptObserver?.persist(record); },
+              onStreamChunk: stream ? chunk => {
+                if (request.signal.aborted || deferRestStream) return;
                 const safeText = restTextGate.push(chunk);
-                if (safeText) {
-                  res.write(`data: ${JSON.stringify({ chunk: safeText })}\n\n`);
-                }
-              }
-            },
-          );
+                if (safeText) res.write('data: ' + JSON.stringify({ chunk: safeText }) + '\n\n');
+              } : undefined,
+              context: { userId, authenticated: Boolean(req.user), authRole: req.user?.role, orgRole: req.user?.orgRole, localExecution: trustedLocalExecution,
+                executionBoundary, domain, orgId, llmGetters: llm, actionIntent: routeText, routedTaskText: execution.turnIntent.flow.routeText,
+                ...(businessTask ? { industryWorkflowTaskId: businessTask.id, industryWorkflowEntryId: businessMetadata.entryId,
+                  industryWorkflowProductLine: businessMetadata.productLine, industryWorkflowSourceInput: businessSource,
+                  industryWorkflowRequiredToolReceipts: getIndustryWorkflowContract(businessMetadata.productLine, businessMetadata.entryId)?.requiredToolReceipts || [] } : {}),
+                onToolRecord: receiptObserver?.onToolRecord }, getters: llm } };
+        },
+        beforeCommit: ({ finalized, toolRecords }) => {
           restTextGate.finish();
-
-          responseText = result.text || '';
-          const delivery = await finalizeRestToolResult(responseText, result, 'rest_chat_stream');
-          const finalized = delivery.outbound.finalization;
-          responseText = finalized.text;
-          for (const u of delivery.usageRecords) {
-            recordTokenUsage(userId, u.provider, u.model, {
-              promptTokens: u.promptTokens,
-              completionTokens: u.completionTokens,
-              totalTokens: u.totalTokens,
-            }, `rest_chat_${Date.now()}`, 'chat');
+          if (businessTask) industryWorkflow = recordIndustryWorkflowExecution({ userId, domain, orgId, taskId: businessTask.id,
+            resultText: finalized.text, toolRecords, source: stream ? 'rest_chat_stream' : 'rest_chat' });
+        },
+        deliverySource: () => stream ? 'rest_chat_stream' : 'rest_chat',
+        deliver: ({ finalized, toolRecords, usageRecords }) => {
+          if (caller) {
+            recordLatency('llm', Date.now() - llmStart);
+            return res.json({ text: finalized.text, finalized: true, blocked: finalized.blocked, reason: finalized.reason, notification: finalized.notification });
           }
-          const workflowRecord = industryWorkflowTask
-            ? settleBoundIndustryWorkflow({
-                userId, domain, orgId, taskId: industryWorkflowTask.id,
-                resultText: responseText,
-                toolRecords: delivery.outbound.toolRecords,
-                source: 'rest_chat_stream',
-              })
-            : null;
-          res.write(`data: ${JSON.stringify({
-            done: true,
-            text: responseText,
-            toolCalls: delivery.outbound.toolRecords.length,
-            finalized: true,
-            blocked: finalized.blocked,
-            reason: finalized.reason,
-            notification: finalized.notification,
-            ...(workflowRecord ? { industryWorkflow: {
-              taskId: workflowRecord.task.id,
-              status: workflowRecord.task.status,
-              verification: workflowRecord.verification,
-            } } : {}),
-          })}\n\n`);
-          return res.end();
-        }
-
-        const result = await runRestToolTurn(normalizedMessages);
-
-        responseText = result.text || '';
-        const delivery = await finalizeRestToolResult(responseText, result, 'rest_chat');
-        const finalized = delivery.outbound.finalization;
-        responseText = finalized.text;
-        for (const u of delivery.usageRecords) {
-          recordTokenUsage(userId, u.provider, u.model, {
-            promptTokens: u.promptTokens,
-            completionTokens: u.completionTokens,
-            totalTokens: u.totalTokens,
-          }, `rest_chat_${Date.now()}`, 'chat');
-        }
-        const usage = {
-          totalTokens: delivery.usageRecords.reduce((sum, item) => sum + item.totalTokens, 0),
-          records: delivery.usageRecords.length,
-        };
-        const workflowRecord = industryWorkflowTask
-          ? settleBoundIndustryWorkflow({
-              userId, domain, orgId, taskId: industryWorkflowTask.id,
-              resultText: responseText,
-              toolRecords: delivery.outbound.toolRecords,
-              source: 'rest_chat',
-            })
-          : null;
-        return res.json({
-          text: responseText,
-          usage,
-          toolCalls: delivery.outbound.toolRecords.length,
-          finalized: true,
-          blocked: finalized.blocked,
-          reason: finalized.reason,
-          notification: finalized.notification,
-          ...(workflowRecord ? { industryWorkflow: {
-            taskId: workflowRecord.task.id,
-            status: workflowRecord.task.status,
-            verification: workflowRecord.verification,
-          } } : {}),
-        });
-      }
-
-      const outbound = await finalizeRestChatResponse({
-        taskText: routeText,
-        responseText,
-        source: 'rest_chat',
-        flow: restTurnDispatch.flow,
-      });
-      const finalized = outbound.finalization;
-      res.json({
-        text: finalized.text,
-        finalized: true,
-        blocked: finalized.blocked,
-        reason: finalized.reason,
-        notification: finalized.notification,
+          for (const usage of usageRecords) recordTokenUsage(userId, usage.provider, usage.model, {
+            promptTokens: usage.promptTokens, completionTokens: usage.completionTokens, totalTokens: usage.totalTokens,
+          }, 'rest_chat_' + Date.now(), 'chat');
+          const payload = { text: finalized.text, usage: { totalTokens: usageRecords.reduce((sum, item) => sum + item.totalTokens, 0), records: usageRecords.length },
+            toolCalls: toolRecords.length, industryWorkflow: industryWorkflow ? { taskId: businessTask!.id, status: industryWorkflow.task.status, verification: industryWorkflow.verification } : undefined,
+            finalized: true, blocked: finalized.blocked, reason: finalized.reason, notification: finalized.notification };
+          if (stream) { res.write('data: ' + JSON.stringify({ ...payload, done: true }) + '\n\n'); return res.end(); }
+          return res.json(payload);
+        },
       });
     } catch (error: any) {
-      if (request.signal.aborted) return;
+      if (businessTask) {
+        interruptIndustryWorkflow({ userId, domain, orgId }, businessTask.id, request.signal.aborted, request.signal.aborted ? 'Business execution was cancelled; previous receipts retained.' : 'Business execution stopped before verified delivery.');
+        try { await flushDBOrThrow(); }
+        catch (persistenceError) { error = persistenceError; }
+      }
+      const authorizationRevoked = error?.code === 'CONVERSATION_ENTRY_UNAVAILABLE' || !isBusinessAuthorized();
+      if (request.signal.aborted && (!authorizationRevoked || res.destroyed)) {
+        if (!res.destroyed && !res.writableEnded) {
+          const payload = { error: 'The chat request was cancelled before completion.', code: 'CHAT_REQUEST_CANCELLED', done: true, failed: true };
+          if (res.headersSent) { res.write(`data: ${JSON.stringify(payload)}\n\n`); res.end(); }
+          else res.status(503).json(payload);
+        }
+        return;
+      }
       console.error("AI Proxy Error:", error);
       const publicError = sanitizeChatAgentErrorPayload({
-        code: chatPublicErrorCodeForException(error),
+        code: authorizationRevoked ? 'CHAT_CONVERSATION_REFRESH_FAILED' : chatPublicErrorCodeForException(error),
       });
       if (res.headersSent) {
         if (!res.destroyed && !res.writableEnded) {
@@ -837,19 +352,114 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
         }
         return;
       }
-      res.status(publicError.code === 'CHAT_PRIVACY_RESTRICTED' ? 403 : publicError.code === 'CHAT_MODEL_ROUTES_UNAVAILABLE' ? 503 : 500).json({
+      res.status(authorizationRevoked || publicError.code === 'CHAT_PRIVACY_RESTRICTED' ? 403 : publicError.code === 'CHAT_MODEL_ROUTES_UNAVAILABLE' ? 503 : 500).json({
         error: publicError.message,
         code: publicError.code,
       });
     } finally {
+      unregisterShutdownCancellation();
+      membershipWatcher?.dispose();
       request.dispose();
     }
   });
 
   router.post("/ai/chat", optionalAuth, handleChat);
   router.post("/chat", optionalAuth, handleChat);
+}
 
-  router.post("/legal/tool/:toolName", requireAuth, asyncHandler(async (req, res) => {
+function mountLegalCompletionRoutes(router: Router, llm: SharedProviderGetters & Required<Pick<SharedProviderGetters, 'getOpenAI' | 'getAnthropic' | 'getQwen'>>, asyncHandler: typeof chatRouteAsyncHandler) {
+  router.get('/legal/client-case-sync', requireAuth, asyncHandler(async (req, res) => {
+    if (resolveDomain(req.user!).domain !== 'personal') return res.status(403).json({ error: 'Use the organization case workspace for work cases.' });
+    const userId = req.user!.uid;
+    return res.json({ cases: LegalCases.listCases(LegalCases.legalWorkspaceNamespace(userId), '', null, userId).filter(item => item.createdBy === userId),
+      removedCaseIds: LegalCases.listPersonalDeletedCaseIds(userId) });
+  }));
+
+  router.post('/legal/client-case-sync', requireAuth, asyncHandler(async (req, res) => {
+    const scope = resolveDomain(req.user!);
+    if (scope.domain !== 'personal') return res.status(403).json({ error: 'Use the organization case workspace for work cases.' });
+    const input = req.body?.case;
+    if (!input || typeof input !== 'object' || Array.isArray(input)
+      || typeof input.id !== 'string' || !/^[a-zA-Z0-9_.:@-]{1,200}$/.test(input.id)) {
+      return res.status(400).json({ error: 'A valid case snapshot is required.' });
+    }
+    const orgId = resolveLegalCaseworkOrgId({ domain: 'personal', userOrgId: '', userId: req.user!.uid });
+    if (LegalCases.listPersonalDeletedCaseIds(req.user!.uid).includes(input.id)) return res.status(409).json({ error: 'This personal case was deleted.', code: 'LEGAL_CASE_DELETED', caseId: input.id });
+    const existing = LegalCases.getCase(orgId, input.id, req.user!.uid);
+    if (existing && existing.createdBy !== req.user!.uid) return res.status(403).json({ error: 'Case belongs to another account.' });
+    const caseFile = LegalCases.upsertCaseSnapshot(orgId, req.user!.uid, input);
+    if (req.body.activate === true) {
+      const selectionScope = { userId: req.user!.uid, domain: 'personal' as const, orgId: '', productLine: 'legal' };
+      const active = getActiveIndustryWorkspaceContext(selectionScope);
+      if (active?.attributes.caseId !== caseFile.id || active.name !== caseFile.title) {
+        const existing = listIndustryWorkspaceContexts(selectionScope).find(item => item.attributes.caseId === caseFile.id);
+        bindIndustryWorkspaceContext(selectionScope, { id: existing?.id, productLine: 'legal', name: caseFile.title,
+          attributes: { caseId: caseFile.id, caseName: caseFile.title, caseNumber: caseFile.caseNumber, clientName: caseFile.party, court: caseFile.court, stage: caseFile.stage } });
+      }
+    }
+    return res.json({ case: caseFile });
+  }));
+
+  router.delete('/legal/client-case-sync/:caseId', requireAuth, asyncHandler(async (req, res) => {
+    const scope = resolveDomain(req.user!);
+    if (scope.domain !== 'personal') return res.status(403).json({ error: 'Use the organization case workspace for work cases.' });
+    const orgId = resolveLegalCaseworkOrgId({ domain: 'personal', userOrgId: '', userId: req.user!.uid });
+    const caseId = String(req.params.caseId);
+    if (!/^[a-zA-Z0-9_.:@-]{1,200}$/.test(caseId)) return res.status(400).json({ error: 'A valid case id is required.' });
+    const existing = LegalCases.getCase(orgId, caseId, req.user!.uid);
+    if (existing && existing.createdBy !== req.user!.uid) return res.status(403).json({ error: 'Case belongs to another account.' });
+    const removed = LegalCases.deleteCase(orgId, req.user!.uid, caseId);
+    if (!removed) LegalCases.recordPersonalCaseDeletion(req.user!.uid, caseId);
+    await flushDBOrThrow();
+    return res.json({ deleted: Boolean(removed), tombstoned: true, caseId });
+  }));
+
+  // Native review/removal records a user's decision, never a model/tool claim.
+  const materialReview = asyncHandler(async (req, res) => {
+    const user = req.user!;
+    if (!verifyDesktopSessionProof(req.headers[DESKTOP_SESSION_HEADER], user.uid)) {
+      return res.status(403).json({ error: 'A current native desktop session is required.' });
+    }
+    const scope = resolveDomain(user);
+    const orgId = resolveLegalCaseworkOrgId({ ...scope, userOrgId: scope.orgId, userId: user.uid });
+    const caseId = String(req.params.caseId);
+    const materialId = String(req.params.materialId);
+    const caseFile = LegalCases.getCase(orgId, caseId, user.uid);
+    const material = caseFile?.materials.find(item => item.id === materialId);
+    if (!caseFile || !material) return res.status(404).json({ error: 'Case material not found.' });
+    try {
+      if (scope.domain === 'work') {
+        if (req.method !== 'GET' && user.orgRole === 'viewer') return res.status(403).json({ error: 'Viewers cannot modify case materials.' });
+        assertOrganizationResourceAccess({ orgId, actorUserId: user.uid, resourceType: 'legal_case',
+          resourceId: caseId, ownerUserId: caseFile.createdBy, permission: req.method !== 'GET' ? 'write' : 'read' });
+      }
+      if (req.method === 'DELETE') {
+        if (!/^[a-f0-9]{64}$/.test(String(req.body?.expectedRevision || ''))) return res.status(400).json({ error: 'A current material revision is required.' });
+        const saved = LegalCases.removeMaterial(orgId, user.uid, caseId, materialId, req.body.expectedRevision);
+        if (!saved) return res.status(404).json({ error: 'Case material not found.' });
+        await flushDBOrThrow();
+        return res.json({ success: true, caseId, materialId, case: saved });
+      }
+      if (req.method === 'POST') {
+        const decision = req.body?.decision;
+        if (!['confirmed', 'revoked'].includes(decision) || !/^[a-f0-9]{64}$/.test(String(req.body?.expectedRevision || ''))) {
+          return res.status(400).json({ error: 'A valid review decision and material revision are required.' });
+        }
+        LegalCases.recordMaterialReview(orgId, user.uid, caseId, materialId, { decision, expectedRevision: req.body.expectedRevision });
+        await flushDBOrThrow();
+      }
+      return res.json({ ...LegalCases.getMaterialReview(orgId, user.uid, caseId, materialId), content: material.content });
+    } catch (error: any) {
+      if (error instanceof OrganizationResourceAuthorizationError) return res.status(error.statusCode).json({ error: error.message });
+      if (error?.code === 'LEGAL_MATERIAL_REVISION_CHANGED') return res.status(409).json({ error: 'The document or case materials changed. Read the current version before confirming.', code: error.code });
+      throw error;
+    }
+  });
+  router.get('/legal/cases/:caseId/materials/:materialId/review', requireAuth, requireLocalRequest, materialReview);
+  router.post('/legal/cases/:caseId/materials/:materialId/review', requireAuth, requireLocalRequest, materialReview);
+  router.delete('/legal/cases/:caseId/materials/:materialId', requireAuth, requireLocalRequest, materialReview);
+
+  const executeLegalTool = asyncHandler(async (req, res) => {
     const toolName = String(req.params?.toolName || '').trim();
     if (!DIRECT_LEGAL_TOOL_ALLOWLIST.has(toolName)) {
       return res.status(404).json({ error: 'Unknown or unavailable legal tool' });
@@ -887,8 +497,22 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
       return res.status(404).json({ error: `Legal tool "${toolName}" is not registered` });
     }
 
+    const industryTaskId = String(req.body?.industryWorkflowTaskId || '').trim();
+    const workflowScope = { userId, domain, orgId };
+    if (industryTaskId) {
+      const task = getIndustryWorkflowTask(workflowScope, industryTaskId);
+      const metadata = task?.metadata?.industryWorkflow;
+      if (!task || metadata?.entryId !== legalToolEntryId(toolName)
+        || metadata?.context?.caseIdentity !== legalToolCaseIdentity(args)
+        || !['queued', 'in_progress', 'waiting_confirmation'].includes(task.status)) {
+        return res.status(409).json({ error: 'The legal workflow no longer matches this case and entry. Reopen the requested workflow.' });
+      }
+    }
+
+    const request = createRequestAbortController(req, res);
+    let record: Awaited<ReturnType<typeof executeToolCall>> | undefined;
     try {
-      const text = await executeToolCallOrThrow({
+      record = await executeToolCall({
         registry: toolRegistry,
         name: toolName,
         arguments: args,
@@ -896,129 +520,58 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
           userId,
           domain,
           orgId,
+          requestId: randomUUID(),
           llmGetters: llm,
           source: 'legal-direct-tool',
+          executionSignal: request.signal,
+          isCancelled: () => request.signal.aborted,
           authenticated: true,
           authRole: req.user!.role,
           orgRole: req.user!.orgRole,
           localExecution: false,
         } as any,
       });
-      return res.json({ text, toolName });
+      if (request.signal.aborted || res.destroyed) {
+        if (industryTaskId) interruptIndustryWorkflow(workflowScope, industryTaskId, request.signal.aborted, request.signal.aborted ? 'Legal execution cancelled' : 'Legal execution failed');
+        return;
+      }
+      if (record.error) throw new Error(record.error);
+      const receipt: Record<string, any> = record.receipt && typeof record.receipt === 'object' ? record.receipt : {};
+      const changedIds = Array.isArray(receipt.changedCaseIds) ? receipt.changedCaseIds : [];
+      const caseUpdates = [...new Set([...changedIds, args.caseId])].filter((id): id is string => typeof id === 'string' && Boolean(id))
+        .map(id => LegalCases.getCase(legalOrgId, id, userId, 'read')).filter(Boolean);
+      const industryWorkflow = industryTaskId ? recordIndustryWorkflowExecution({ ...workflowScope, taskId: industryTaskId, resultText: record.result, toolRecords: [record], source: 'legal-direct-tool' }) : undefined;
+      return res.json({ requestId: record.requestId, text: record.result, toolName, receipt, verification: record.terminalVerification,
+        caseUpdates, artifacts: Array.isArray(receipt.artifacts) ? receipt.artifacts : [], industryWorkflow });
     } catch (err: any) {
+      if (industryTaskId) interruptIndustryWorkflow(workflowScope, industryTaskId, request.signal.aborted, request.signal.aborted ? 'Legal execution cancelled' : 'Legal execution failed');
+      if (request.signal.aborted || res.destroyed) return;
       console.warn('[LegalDirectTool] Execution failed:', redactDiagnosticSecrets(err?.message || err).slice(0, 500));
       return res.status(500).json({
         error: 'Legal tool execution failed',
         code: 'LEGAL_TOOL_EXECUTION_FAILED',
+        requestId: record?.requestId,
       });
-    }
-  }));
+    } finally { request.dispose(); }
+  });
+  router.post("/legal/tool/:toolName", requireAuth, executeLegalTool);
+  router.post("/legal/contract-review", requireAuth, (req, res, next) => {
+    req.params.toolName = "legal_review_contract";
+    req.body = { args: req.body };
+    return executeLegalTool(req, res, next);
+  });
 
-  router.post("/legal/contract-review", requireAuth, asyncHandler(async (req, res) => {
-    const contract = String(req.body?.contract || '').trim();
-    if (!contract) {
-      return res.status(400).json({ error: '请提供合同文本' });
-    }
+}
 
-    const userId = req.user!.uid;
-    const requestScope = resolveDomain(req.user!);
-    const domain = requestScope.domain;
-    const orgId = requestScope.orgId;
-    const legalOrgId = resolveLegalCaseworkOrgId({ domain, userOrgId: orgId, userId });
-    const args = {
-      contract,
-      orgId: legalOrgId,
-      userId,
-      caseId: String(req.body?.caseId || '').trim(),
-      caseName: String(req.body?.caseName || '').trim(),
-      caseType: String(req.body?.caseType || req.body?.cause || '').trim(),
-      court: String(req.body?.court || '').trim(),
-      persistCase: req.body?.persistCase === true || Boolean(req.body?.caseId || req.body?.caseName),
-    };
-    if (
-      domain === 'work'
-      && req.user!.orgRole === 'viewer'
-      && !isOrganizationViewerLegalRead('legal_review_contract', args)
-    ) {
-      return res.status(403).json({
-        error: 'Organization viewers may only run contract review without case persistence.',
-      });
-    }
-    const request = createRequestAbortController(req, res);
-    const deepSignal = AbortSignal.any([request.signal, AbortSignal.timeout(15_000)]);
-    const llmReview = executeToolCallOrThrow({
-      registry: toolRegistry,
-      name: 'legal_review_contract',
-      arguments: args,
-      context: {
-        userId,
-        domain,
-        orgId,
-        llmGetters: llm,
-        source: 'legal-contract-review',
-        executionSignal: deepSignal,
-        isCancelled: () => deepSignal.aborted,
-        authenticated: true,
-        authRole: req.user!.role,
-        orgRole: req.user!.orgRole,
-        localExecution: false,
-      } as any,
-    });
-    llmReview.catch(() => undefined);
-
-    try {
-      const text = await llmReview;
-      request.signal.throwIfAborted();
-
-      return res.json({ text, degraded: false });
-    } catch (err: any) {
-      if (request.signal.aborted || res.destroyed) return;
-      console.warn('[LegalContractReview] Deep review unavailable:', redactDiagnosticSecrets(err?.message || err).slice(0, 500));
-      try {
-        const fallback = await executeToolCallOrThrow({
-          registry: toolRegistry,
-          name: 'legal_review_contract',
-          arguments: args,
-          context: {
-            userId,
-            domain,
-            orgId,
-            source: 'legal-contract-review-fallback',
-            executionSignal: request.signal,
-            isCancelled: () => request.signal.aborted,
-            authenticated: true,
-            authRole: req.user!.role,
-            orgRole: req.user!.orgRole,
-            localExecution: false,
-          } as any,
-        });
-        request.signal.throwIfAborted();
-        return res.json({
-          text: `${fallback}\n\n*提示：深度 LLM 审查暂未及时完成，已先返回本地规则审查结果。*`,
-          degraded: true,
-          warning: 'Deep contract review unavailable; local rules fallback used.',
-          warningCode: 'LEGAL_REVIEW_FALLBACK_USED',
-        });
-      } catch (fallbackErr: any) {
-        if (request.signal.aborted || res.destroyed) return;
-        console.warn('[LegalContractReview] Fallback failed:', redactDiagnosticSecrets(fallbackErr?.message || fallbackErr).slice(0, 500));
-        return res.status(500).json({
-          error: 'Contract review failed',
-          code: 'LEGAL_CONTRACT_REVIEW_FAILED',
-        });
-      }
-    } finally {
-      request.dispose();
-    }
-  }));
-
+function mountMeetingCompletionRoutes(router: Router, llm: SharedProviderGetters & Required<Pick<SharedProviderGetters, 'getOpenAI' | 'getAnthropic' | 'getQwen'>>, asyncHandler: typeof chatRouteAsyncHandler) {
   router.post("/meeting/analyze", requireAuth, asyncHandler(async (req, res) => {
     const { provider: reqProvider, notes, startedAt, endedAt, language = "zh", purpose = "meeting", legalCase } = req.body || {};
     const userId = req.user?.uid || 'anonymous';
     const requestScope = req.user ? resolveDomain(req.user) : { domain: 'personal' as const, orgId: '' };
     const domain = requestScope.domain;
     const orgId = requestScope.orgId;
-    const preferred = getUserPreferredLLMConfig(userId, { maxTokens: 1800, domain, orgId });
+    const requestId = randomUUID();
+    const preferred = getUserPreferredLLMConfig(userId, { maxTokens: 4096, domain, orgId, requestId, source: 'meeting-analyze' });
     const provider = preferred.provider;
     const model = preferred.model;
     if (reqProvider && reqProvider !== provider) {
@@ -1060,8 +613,8 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
           '7. Raw transcript highlights',
           'Add a short safety boundary: this assists lawyers and does not replace licensed legal judgment.',
           '',
-          `Started: ${started}`,
-          `Ended: ${ended}`,
+          `Session opened (wall clock, includes pauses): ${started}`,
+          `Session closed (wall clock, not audio duration): ${ended}`,
           '',
           'Case context:',
           ...(caseContext.length > 0 ? caseContext : ['No case context provided.']),
@@ -1080,63 +633,76 @@ export function mountChatRoutes(router: Router, _jwtSecret: string, llm: {
           '5. Follow-up suggestions',
           '6. Raw transcript highlights',
           '',
-          `Started: ${started}`,
-          `Ended: ${ended}`,
+          `Session opened (wall clock, includes pauses): ${started}`,
+          `Session closed (wall clock, not audio duration): ${ended}`,
           '',
           'Transcript:',
           transcript,
         ].join('\n');
 
-    const result = await makeLLMCall(
-      [{ role: 'user', content: prompt }],
-      [],
-      { provider, model, maxTokens: 1800, userId },
-      llm.getDeepSeek, llm.getGemini, llm.getOpenAI, llm.getAnthropic, llm.getQwen,
-      llm.getOllama, llm.getLmStudio, llm.getArk, llm.getXiaomi,
-      llm.getKimi, llm.getGlm, llm.getRelay,
-    );
-
-    const report = result.text || '';
-    recordTokenUsage(userId, provider, model, result.usage, `meeting_analyze_${Date.now()}`, 'meeting');
-    const usage = result.usage || null;
-    let legalCasework = '';
-    let legalCaseworkError = '';
-    if (shouldArchiveLegalMeeting(purpose, legalCase, domain, orgId)) {
-      try {
-        legalCasework = await executeToolCallOrThrow({
-          registry: toolRegistry,
-          name: 'legal_meeting_minutes_to_case',
-          arguments: buildLegalMeetingMinutesArgs({
-            transcript,
-            startedAt,
-            endedAt,
-            legalCase,
-            orgId,
-            userId,
-          }),
-          context: {
-            userId,
-            authenticated: true,
-            authRole: req.user!.role,
-            orgRole: req.user!.orgRole,
-            localExecution: false,
-            domain,
-            orgId,
-            llmGetters: llm,
-            source: 'meeting-analyze',
-          },
-        });
-      } catch (err: any) {
-        legalCaseworkError = err?.message || String(err);
-        console.warn('[Meeting] Legal meeting archive failed:', legalCaseworkError);
+    const request = createRequestAbortController(req, res);
+    try {
+      const result = await makeLLMCall(
+        [{ role: 'user', content: prompt }],
+        [],
+        { ...preferred, signal: request.signal },
+        ...providerGetterArguments(llm),
+      );
+      if (request.signal.aborted || res.destroyed) return;
+      const report = result.text || '';
+      recordTokenUsage(userId, provider, model, result.usage, requestId, 'meeting');
+      if (!report.trim() || ['length', 'max_tokens', 'MAX_TOKENS'].includes(result.finishReason || '')) {
+        return res.status(502).json({ error: language === 'zh' ? CN_PUBLIC_AGENT_EVENT_MESSAGES.meetingIncomplete : 'No complete meeting report was generated. Preserve the transcript before continuing.' });
       }
+      res.json({ requestId, report, usage: result.usage || null });
+    } catch (error) {
+      if (request.signal.aborted || res.destroyed) return;
+      throw error;
+    } finally { request.dispose(); }
+  }));
+
+
+  router.post('/meeting/archive', requireAuth, asyncHandler(async (req, res) => {
+    const { notes, report = '', startedAt, endedAt, legalCase, meetingId } = req.body || {};
+    const userId = req.user!.uid;
+    const { domain, orgId } = resolveDomain(req.user!);
+    const workspaceId = LegalCases.legalWorkspaceNamespace(userId, domain === 'work' ? orgId : undefined);
+    const caseId = typeof legalCase?.id === 'string' ? legalCase.id.trim() : '';
+    if (!caseId || typeof meetingId !== 'string' || !meetingId.trim() || meetingId.length > 200 || typeof report !== 'string') {
+      return res.status(400).json({ error: 'An explicit case and meeting record are required.' });
     }
-    res.json({
-      report,
-      usage,
-      legalCasework,
-      legalCaseArchived: Boolean(legalCasework),
-      legalCaseworkError: legalCaseworkError || undefined,
-    });
+    if (domain === 'work' && req.user!.orgRole === 'viewer') {
+      return res.status(403).json({ error: 'Organization viewers cannot archive meeting materials.' });
+    }
+    const current = LegalCases.getCase(workspaceId, caseId, userId, 'write');
+    if (!current) return res.status(404).json({ error: 'The requested legal case is unavailable for writing.' });
+    const transcript = formatMeetingTranscriptForAnalysis(notes);
+    if (!transcript.trim()) return res.status(400).json({ error: 'No meeting transcript to archive.' });
+    const request = createRequestAbortController(req, res);
+    try {
+      const context = { userId, domain, orgId, authenticated: true, authRole: req.user!.role,
+        orgRole: req.user!.orgRole, localExecution: false, executionSignal: request.signal,
+        isCancelled: () => request.signal.aborted, source: 'meeting-archive' };
+      const encoded = await withLegalExecution(context, () => meetingMinutesToCaseHandler(buildLegalMeetingMinutesArgs({
+        transcript, report, startedAt, endedAt, meetingId: meetingId.trim(),
+        legalCase: { ...current, id: caseId }, orgId: workspaceId, userId,
+      }), context));
+      if (request.signal.aborted || res.destroyed) return;
+      const receipt = decodeToolResult(encoded).receipt as Record<string, any> | undefined;
+      const saved = LegalCases.getCase(workspaceId, caseId, userId, 'write');
+      const materialIds = receipt?.materialIds;
+      const original = saved?.materials.find(material => material.id === materialIds?.transcript && material.type === 'consultation' && material.source === 'import' && material.content === transcript);
+      const minutes = saved?.materials.find(material => material.id === materialIds?.minutes && material.type === 'note' && material.source === 'tool');
+      if (receipt?.archivedCaseId !== caseId || !saved || !original || !minutes) throw new Error('Meeting archive could not be verified.');
+      return res.json({ ok: true, status: 'archived', meetingId: meetingId.trim(), caseId,
+        caseFile: saved, materialIds: { transcript: original.id, minutes: minutes.id }, summaryPresent: Boolean(report.trim()) });
+    } catch (error: any) {
+      if (request.signal.aborted || res.destroyed) return;
+      console.warn('[MeetingArchive] Archive failed:', redactDiagnosticSecrets(error?.message || error).slice(0, 500));
+      return res.status(500).json({ error: 'Meeting materials were not completely archived.' });
+    } finally { request.dispose(); }
   }));
 }
+
+const chatRouteAsyncHandler = (fn: (req: any, res: any, next?: any) => Promise<any>) =>
+    (req: any, res: any, next: any) => Promise.resolve(fn(req, res, next)).catch(next);

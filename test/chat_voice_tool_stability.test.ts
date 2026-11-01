@@ -1,24 +1,28 @@
+import { readImplementationSource } from './implementation_source';
+import { readVoiceImplementationSource } from './voice_implementation_source';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { buildForegroundWeChatReadArgs, buildForegroundWeChatSendArgs, shouldChainTask } from '../server/agents/nl_chainer';
+import { normalizeActionIntent } from '../server/cognition/normalized_action_intent';
+import { buildForegroundWeChatSendArgs } from '../server/regions/packs/cn/foreground_wechat_intent';
 
 describe('chat and voice tool-call stability', () => {
   it('keeps text and voice on the shared routing and desktop execution path', () => {
     const root = process.cwd();
-    const chat = readFileSync(path.join(root, 'server/socket/chat.ts'), 'utf8');
-    const voice = readFileSync(path.join(root, 'server/socket/voice.ts'), 'utf8');
-    const task = readFileSync(path.join(root, 'server/socket/task.ts'), 'utf8');
-    const pipeline = readFileSync(path.join(root, 'server/cognition/execution_pipeline.ts'), 'utf8');
+    const chat = readImplementationSource(path.join(root, 'server/socket/chat.ts'), 'utf8');
+    const voice = readVoiceImplementationSource();
+    const pipeline = readImplementationSource(path.join(root, 'server/cognition/execution_pipeline.ts'), 'utf8');
 
-    for (const source of [chat, voice, task]) {
-      expect(source).toContain('buildLumiExecutionPipeline');
+    for (const source of [chat, voice]) {
       expect(source).toContain('buildDesktopExecutionStabilityPolicy');
       expect(source).toContain('actuationTools: desktopExecutionPolicy.actuationTools');
       expect(source).toContain('toolPolicy');
       expect(source).toContain('requestConfirmation');
       expect(source).toContain('supervisedExternalCommits');
     }
+    expect(chat).toContain('await runLumiEntryTurn<void>({');
+    expect(voice).toContain('await runLumiEntryTurn<void>({');
+    expect(readFileSync(path.join(root, 'server/cognition/turn_execution.ts'), 'utf8')).toContain('buildLumiExecutionPipeline({');
     expect(pipeline).toContain('buildLumiTurnDispatch');
     expect(pipeline).toContain('buildLumiExecutionDecision');
     expect(pipeline).toContain('buildLumiCapabilitySelection');
@@ -26,31 +30,29 @@ describe('chat and voice tool-call stability', () => {
 
   it('treats the shared pipeline policy and projection as immutable entry outputs', () => {
     const root = process.cwd();
-    const voice = readFileSync(path.join(root, 'server/socket/voice.ts'), 'utf8');
-    const task = readFileSync(path.join(root, 'server/socket/task.ts'), 'utf8');
-    const rest = readFileSync(path.join(root, 'server/routes/chat_routes.ts'), 'utf8');
+    const voice = readVoiceImplementationSource();
+    const rest = readImplementationSource(path.join(root, 'server/routes/chat_routes.ts'), 'utf8');
 
     expect(voice).toContain('const routedToolPolicy = executionPipeline.authorizationPolicy');
     expect(voice).toContain('const modelToolProjection = executionPipeline.modelToolProjection');
     expect(voice).toContain('const toolSessionActive = requestedToolSession');
-    expect(voice).toContain('continuationContext: [actionContinuationBridge, proactiveContextPrompt, pendingConfirmationPrompt]');
+    expect(voice).toContain('continuationContext: [actionContinuationBridge, pendingConfirmationPrompt]');
     expect(voice).toContain('currentTurnExecutionRequested: executionPipeline.executionRequested');
     expect(voice).toContain('trustedActionContinuation: executionPipeline.trustedActionContinuation');
-    expect(voice).toContain('|| executionPipeline.trustedActionContinuation');
-    expect(task).toContain('const modelToolPolicy = executionPipeline.authorizationPolicy');
-    expect(task).toContain('const modelToolProjection = executionPipeline.modelToolProjection');
-    expect(task).toContain('const toolSessionActive = executionPipeline.executionRequested');
-    expect(task).toContain('continuationContext: taskContinuationContext');
-    expect(task).toContain('currentTurnExecutionRequested: executionPipeline.executionRequested');
-    expect(task).toContain('trustedActionContinuation: executionPipeline.trustedActionContinuation');
-    expect(task).toContain('forceResume: Boolean(pendingConfirmation || executionPipeline.trustedActionContinuation)');
-    expect(rest).toContain('const restModelToolPolicy = restExecutionPipeline.authorizationPolicy');
-    expect(rest).toContain('const restModelToolProjection = restExecutionPipeline.modelToolProjection');
-    expect(rest).toContain('const restToolSessionActive = restExecutionPipeline.executionRequested');
-    expect(rest).toContain('currentTurnExecutionRequested: restExecutionPipeline.executionRequested');
-    expect(rest).toContain('trustedActionContinuation: restExecutionPipeline.trustedActionContinuation');
+    expect(voice).toContain('preparePlannedConversationExecution({');
+    expect(readFileSync(path.join(root, 'server/conversation/planned_execution.ts'), 'utf8')).toContain('input.acceptedInterruptedTurn || execution.trustedActionContinuation');
+    expect(rest).toContain('return await runLumiEntryTurn({');
+    expect(rest).toContain('maxIterations: execution.authorizationPolicy.maxIterations || 3');
+    const modelOwner = readFileSync(path.join(root, 'server/cognition/turn_model.ts'), 'utf8');
+    expect(readFileSync(path.join(root, 'server/cognition/turn_execution.ts'), 'utf8')).toContain('...assembled.model, execution, messages,');
+    expect(modelOwner).toContain('toolPolicy: execution.authorizationPolicy');
+    expect(modelOwner).toContain('modelToolProjection: execution.modelToolProjection');
+    expect(rest).toContain('const deferRestStream = execution.executionRequested');
+    expect(modelOwner).toContain('currentTurnExecutionRequested: true');
+    expect(modelOwner).toContain('trustedActionContinuation: execution.trustedActionContinuation');
+    expect(rest).not.toContain('const restModelToolProjection =');
 
-    for (const source of [voice, task, rest]) {
+    for (const source of [voice, rest]) {
       expect(source).not.toContain('buildModelCapabilityPolicy');
       expect(source).not.toContain('buildModelToolProjection');
       expect(source).not.toMatch(/(?:executionDecision|restExecutionDecision)\.(?:baseToolPolicy|toolPolicy|maxIterations|toolRoute)\s*=/);
@@ -59,8 +61,8 @@ describe('chat and voice tool-call stability', () => {
 
   it('feeds the same persisted action pointer into text and voice continuation routing', () => {
     const root = process.cwd();
-    const chat = readFileSync(path.join(root, 'server/socket/chat.ts'), 'utf8');
-    const voice = readFileSync(path.join(root, 'server/socket/voice.ts'), 'utf8');
+    const chat = readImplementationSource(path.join(root, 'server/socket/chat.ts'), 'utf8');
+    const voice = readVoiceImplementationSource();
 
     expect(chat).toContain('conversation?.actionContinuationState');
     expect(voice).toContain('conversation.actionContinuationState');
@@ -69,52 +71,33 @@ describe('chat and voice tool-call stability', () => {
     }
   });
 
-  it('keeps legal entry prompts in the shared execution decision instead of per-channel scripts', () => {
-    const executionDecision = readFileSync(path.join(process.cwd(), 'server/cognition/execution_decision.ts'), 'utf8');
-    const legalEntry = readFileSync(path.join(process.cwd(), 'server/cognition/legal_entry.ts'), 'utf8');
+ it('keeps REST chat on the normal model and finalizer path', () => {
+    const restChat = readImplementationSource(path.join(process.cwd(), 'server/routes/chat_routes.ts'), 'utf8');
 
-    expect(executionDecision).toContain('buildUnifiedLegalEntryPrompt');
-    expect(legalEntry).toContain('Unified Legal Casework Entry');
-    expect(legalEntry).toContain('Execution order');
-    expect(legalEntry).toContain('major premise -> minor premise -> conclusion/subsumption');
-    expect(legalEntry).toContain('Current-law gate');
-    expect(legalEntry).toContain('External legal platforms');
-    expect(legalEntry).toContain('authorized-collaboration surfaces');
-    expect(legalEntry).toContain('Remote bot intake must resolve the organization/case binding first');
-    expect(legalEntry).toContain('archive into the organization case workspace and organization knowledge base');
-    expect(legalEntry).toContain('personal chat, company/work chat, voice, task center');
-  });
-
-  it('keeps REST chat on the same legal entry and finalizer path', () => {
-    const restChat = readFileSync(path.join(process.cwd(), 'server/routes/chat_routes.ts'), 'utf8');
-
-    expect(restChat).toContain('buildUnifiedLegalEntryPrompt');
-    expect(restChat).toContain('buildRestChatSystemInstruction');
     expect(restChat).toContain('buildRestProviderMessages');
-    expect(restChat).toContain('buildRestAnthropicMessages');
-    expect(restChat).toContain('finalizeRestChatResponse');
-    expect(restChat).toContain('finalizeLumiResponse');
+    expect(restChat).toContain('buildRestConversationMessages');
+    expect(restChat).toContain('runLumiEntryTurn({');
+    expect(readFileSync(path.join(process.cwd(), 'server/cognition/prepared_turn.ts'), 'utf8')).toContain('await finalizeLumiResponseForDelivery({');
     expect(restChat).toContain("source: 'rest_chat'");
     expect(restChat).toContain('blocked: finalized.blocked');
   });
 
-  it('archives legal meeting analysis through the legal casework toolchain', () => {
+  it('keeps meeting analysis separate from automatic case writes', () => {
     const restChat = readFileSync(path.join(process.cwd(), 'server/routes/chat_routes.ts'), 'utf8');
-
-    expect(restChat).toContain('buildLegalMeetingMinutesArgs');
-    expect(restChat).toContain('shouldArchiveLegalMeeting');
-    expect(restChat).toContain("return isLegalMeeting && domain === 'work' && Boolean(orgId)");
-    expect(restChat).toContain('const orgId = requestScope.orgId');
-    expect(restChat).toContain('executeToolCallOrThrow({');
-    expect(restChat).toContain("name: 'legal_meeting_minutes_to_case'");
-    expect(restChat).toContain('shouldArchiveLegalMeeting(purpose, legalCase, domain, orgId)');
-    expect(restChat).toContain("source: 'meeting-analyze'");
-    expect(restChat).toContain('legalCasework');
-    expect(restChat).toContain('legalCaseArchived');
+    const start = restChat.indexOf('router.post("/meeting/analyze"');
+    expect(start).toBeGreaterThan(0);
+    const end = restChat.indexOf('\n  router.', start + 12);
+    const route = restChat.slice(start, end < 0 ? undefined : end);
+    expect(route).toContain('formatMeetingTranscriptForAnalysis(notes)');
+    expect(route).toContain('createRequestAbortController(req, res)');
+    expect(route).toContain("['length', 'max_tokens', 'MAX_TOKENS']");
+    expect(route).toContain('const orgId = requestScope.orgId');
+    expect(route).not.toContain('executeToolCallOrThrow');
+    expect(route).not.toContain('legal_meeting_minutes_to_case');
   });
 
   it('keeps personal direct legal tools out of the shared default organization scope', () => {
-    const restChat = readFileSync(path.join(process.cwd(), 'server/routes/chat_routes.ts'), 'utf8');
+    const restChat = readImplementationSource(path.join(process.cwd(), 'server/routes/chat_routes.ts'), 'utf8');
 
     expect(restChat).toContain('function resolveLegalCaseworkOrgId');
     expect(restChat).toContain("return `personal:${safeLegalScopeSegment(input.userId)}`");
@@ -126,21 +109,19 @@ describe('chat and voice tool-call stability', () => {
     expect(restChat).toContain("source: 'legal-contract-review'");
   });
 
-  it('binds legal meeting analysis to the current case and organization scope in the desktop client', () => {
-    const desktop = readFileSync(path.join(process.cwd(), 'src/components/DesktopUI.tsx'), 'utf8');
-
-    expect(desktop).toContain('const legalCaseId = legalCase?.id || getLegalConsultationCaseId()');
-    expect(desktop).toContain("const workLegalScope = workDomain === 'work' && Boolean(orgConnection?.connected && orgConnection?.orgId)");
-    expect(desktop).toContain('id: legalCaseId');
-    expect(desktop).toContain("domain: workLegalScope ? 'work' : 'personal'");
-    expect(desktop).toContain('orgId: workLegalScope ? orgConnection?.orgId : undefined');
-    expect(desktop).toContain('if (data.legalCaseArchived && workLegalScope && legalCaseId && notesForAnalysis.length > 0)');
-    expect(desktop).toContain('lastLegalMeetingArchiveRef.current = archiveKey');
-    expect(desktop).toContain('setLegalConsultationCaseId(String(detail.legalCaseId))');
+  it('binds meeting history to its current owner and retains source notes separately from reports', () => {
+    const workflow = readFileSync(path.join(process.cwd(), 'src/components/desktop/useMeetingWorkflow.ts'), 'utf8');
+    expect(workflow).toContain('meetingIdentityRef');
+    expect(workflow).toContain('meetingStorageKeys');
+    expect(workflow).toContain('waitForMeetingRefinement');
+    expect(workflow).toContain('meetingReportGenerating');
+    expect(workflow).toContain('selectMeetingRecord');
+    expect(workflow).not.toContain('lastLegalMeetingArchiveRef');
+    expect(workflow).not.toContain('getLegalConsultationCaseId');
   });
 
   it('keeps voice tool execution visible and aligned with chat permission behavior', () => {
-    const voice = readFileSync(path.join(process.cwd(), 'server/socket/voice.ts'), 'utf8');
+    const voice = readVoiceImplementationSource();
 
     expect(voice).toContain('shouldAllowVoiceLocalFileWriteForTurn');
     expect(voice).toContain('allowLocalFileWrites');
@@ -152,37 +133,30 @@ describe('chat and voice tool-call stability', () => {
     expect(voice).toContain('onProgress');
   });
 
-  it('keeps personal and organization knowledge retrieval aligned across text and voice', () => {
+  it('keeps explicit voice and messaging knowledge retrieval available', () => {
     const root = process.cwd();
-    const chat = readFileSync(path.join(root, 'server/socket/chat.ts'), 'utf8');
-    const voice = readFileSync(path.join(root, 'server/socket/voice.ts'), 'utf8');
-    const messagingEntry = readFileSync(path.join(root, 'server/messaging/routes.ts'), 'utf8');
-    const messaging = readFileSync(path.join(root, 'server/regions/packs/cn/messaging_routes.ts'), 'utf8');
-
-    for (const source of [chat, voice]) {
-      expect(source).toContain('retrieveChunks');
-      expect(source).toContain('searchKnowledgeBase');
-      expect(source).toContain('ragKnowledge');
-      expect(source).toContain('## Company Knowledge Base');
-      expect(source).toContain("domain === 'work'");
-    }
-    expect(voice).toContain('voiceScope.orgId');
-    expect(voice).toContain('cite article titles');
+    const voice = readFileSync(path.join(root, 'server/socket/voice/turn/prepare_voice_context_and_routing.ts'), 'utf8');
+    const common = readFileSync(path.join(root, 'server/knowledge/conversation_retrieval.ts'), 'utf8');
+    expect(voice).toContain('retrieveConversationKnowledge');
+    expect(common).toContain('searchKnowledgeBase');
+    expect(common).toContain("scope.domain === 'work'");
+    expect(common).toContain("getMember(scope.orgId, scope.userId)?.status !== 'active'");
+    expect(common).toContain('personal:');
+    expect(common).toContain('options.signal?.throwIfAborted()');
+    expect(common).not.toContain('PRODUCT_VARIANT');
+    const messaging = readImplementationSource(path.join(root, 'server/regions/packs/cn/messaging_routes.ts'), 'utf8');
     expect(messaging).toContain('searchOrgKnowledge(msg.boundOrgId');
-    expect(messaging).toContain('OrgKB.createArticle(msg.boundOrgId!');
     expect(messaging).toContain('getMember(binding.orgId, binding.lumiUserId)');
-    expect(messagingEntry).toContain("../regions/packs/cn/messaging_routes");
   });
 
   it('keeps ordinary tools silent and records hard boundaries for one-time text confirmation', () => {
     const root = process.cwd();
-    const chat = readFileSync(path.join(root, 'server/socket/chat.ts'), 'utf8');
-    const voice = readFileSync(path.join(root, 'server/socket/voice.ts'), 'utf8');
-    const task = readFileSync(path.join(root, 'server/socket/task.ts'), 'utf8');
+    const chat = readImplementationSource(path.join(root, 'server/socket/chat.ts'), 'utf8');
+    const voice = readVoiceImplementationSource();
 
-    for (const source of [chat, voice, task]) {
-      expect(source).toContain('canAutoApproveAction(toolName, args,');
-      expect(source).toContain('recordPendingConfirmation');
+    for (const source of [chat, voice]) {
+      expect(source).toContain('createTurnConfirmation({');
+      expect(source).not.toContain('canAutoApproveAction(toolName, args,');
       expect(source).not.toContain("socket.emit('agent:confirm_tool'");
       expect(source).not.toContain('socket.emit("agent:confirm_tool"');
     }
@@ -190,21 +164,15 @@ describe('chat and voice tool-call stability', () => {
 
   it('returns consumed confirmation receipts to the shared model loop in both text execution surfaces', () => {
     const root = process.cwd();
-    const chat = readFileSync(path.join(root, 'server/socket/chat.ts'), 'utf8');
-    const task = readFileSync(path.join(root, 'server/socket/task.ts'), 'utf8');
+    const chat = readImplementationSource(path.join(root, 'server/socket/chat.ts'), 'utf8');
 
-    for (const source of [chat, task]) {
+    for (const source of [chat]) {
       expect(source).toContain('buildConfirmedStepContinuationMessages');
       expect(source).toMatch(/priorToolRecords:\s*(?:taskAwareRecords\()?\[(?:confirmedRecord|confirmationRecord)\]/);
-      expect(source).toContain('confirmedStepNeedsContinuation(');
+      expect(source).not.toContain('confirmedStepNeedsContinuation(');
     }
     expect(chat).toContain('llmWasCalled: confirmationLlmWasCalled');
-    expect(chat).toContain('for (const usage of continuation.usageRecords)');
-  });
-
-  it('routes short foreground WeChat send follow-ups into the task chain', () => {
-    expect(shouldChainTask('\u76f4\u63a5\u53d1\u665a\u5b89')).toBe(true);
-    expect(shouldChainTask('\u5fae\u4fe1\u5e2e\u6211\u7f16\u8f91\u4e00\u6761\u665a\u5b89\u53d1\u7ed9\u963f\u9646')).toBe(true);
+    expect(chat).toContain('recordTokenUsageBatch(uid, continuation.usageRecords, interactionId)');
   });
 
   it('keeps foreground WeChat parsing advisory while main chat remains model-owned', () => {
@@ -216,13 +184,12 @@ describe('chat and voice tool-call stability', () => {
     });
     expect(String(args?.message || '')).toContain('\u665a\u5b89');
 
-    const chat = readFileSync(path.join(process.cwd(), 'server/socket/chat.ts'), 'utf8');
+    const chat = readImplementationSource(path.join(process.cwd(), 'server/socket/chat.ts'), 'utf8');
     expect(chat).not.toContain('buildForegroundWeChatSendArgs');
     expect(chat).not.toContain('executeForegroundMessagingAction');
     expect(chat).not.toContain('shouldRunLegacyDirectExecution() && !responseText');
     expect(chat).toContain('toolPolicy: modelCapabilityPolicy');
     expect(chat).toContain('recognition and legacy quick matches are advisory inputs');
-    expect(chat).toContain('buildRecentFailureExplanation');
     expect(chat).toContain('## Grounded current-turn evidence');
     expect(chat).not.toContain('recent_failure_explanation');
   });
@@ -258,9 +225,10 @@ describe('chat and voice tool-call stability', () => {
       message: '在干嘛？',
     });
 
-    const voice = readFileSync(path.join(process.cwd(), 'server/socket/voice.ts'), 'utf8');
+    const voice = readVoiceImplementationSource();
     expect(voice).toContain('executeForegroundMessagingAction');
-    expect(voice).toContain("action: 'send'");
+    expect(voice).toContain("foregroundWeChatReadArgs ? 'read' : 'send'");
+    expect(voice).toContain('action: foregroundMessagingAction');
     expect(voice).toContain('if (!isCurrentTurn()) return');
     expect(voice).toContain('session.pipelineAbortController === pipelineAbort');
   });
@@ -290,15 +258,13 @@ describe('chat and voice tool-call stability', () => {
   });
 
   it('extracts foreground WeChat chat reading as a generic contact task', () => {
-    expect(buildForegroundWeChatReadArgs('\u6253\u5f00\u5fae\u4fe1\u770b\u770b\u6211\u548c\u963f\u9646\u6700\u8fd1\u7684\u804a\u5929\u5185\u5bb9')).toMatchObject({
-      contact: '\u963f\u9646',
-      applicationTarget: 'wechat',
-      useSearch: true,
-      maxMessages: 8,
+    expect(normalizeActionIntent('\u6253\u5f00\u5fae\u4fe1\u770b\u770b\u6211\u548c\u963f\u9646\u6700\u8fd1\u7684\u804a\u5929\u5185\u5bb9')).toMatchObject({
+      kind: 'messaging_read',
+      target: '\u963f\u9646',
+      operation: 'read',
     });
 
-    const chat = readFileSync(path.join(process.cwd(), 'server/socket/chat.ts'), 'utf8');
-    expect(chat).not.toContain('buildForegroundWeChatReadArgs');
+    const chat = readImplementationSource(path.join(process.cwd(), 'server/socket/chat.ts'), 'utf8');
     expect(chat).not.toContain("const toolName = 'wechat_read_recent_chat'");
     expect(chat).toContain('toolPolicy: modelCapabilityPolicy');
   });

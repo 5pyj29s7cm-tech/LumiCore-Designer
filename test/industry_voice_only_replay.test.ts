@@ -5,18 +5,15 @@ import { formatClientSelfPrompt } from '../server/client/self_model';
 import { classifyConversationActionFollowupIntent } from '../server/cognition/action_continuation';
 import { buildLumiExecutionPipeline } from '../server/cognition/execution_pipeline';
 import { normalizeActionIntent } from '../server/cognition/normalized_action_intent';
-import {
-  buildDeterministicClientNavigationCommand,
-  matchQuickCommand,
-} from '../server/cognition/quick_commands';
 import { registerAllTools } from '../server/tools/definitions';
 import {
-  buildVoiceConfirmationChannelScope,
+  buildTransportNeutralConfirmationScope,
   clearAllPendingConfirmationsForTests,
-  consumePendingConfirmation,
+  consumePendingConfirmationDurably,
   getPendingConfirmation,
-  recordPendingConfirmation,
+  recordPendingConfirmationDurably,
 } from '../server/tools/pending_confirmation';
+import { ensurePendingConfirmationPersistenceInitialized } from '../server/tools/pending_confirmation_repository';
 import { ToolRegistry } from '../server/tools/registry';
 
 interface VoiceReplayScenario {
@@ -66,6 +63,7 @@ let registry: ToolRegistry;
 beforeAll(async () => {
   const { initDatabase } = await import('../db_layer');
   await initDatabase();
+  await ensurePendingConfirmationPersistenceInitialized();
   registry = new ToolRegistry();
   registerAllTools(registry);
 });
@@ -92,7 +90,7 @@ describe('industry edition pure voice replay', () => {
     expect(pipeline.execution.toolPolicy.allowedTools || []).not.toContain('industry_workflow_start');
   });
 
-  it('opens every spoken industry workspace through the native client action only', async () => {
+  it('routes every spoken industry workspace to the native client action policy without dispatching a legacy quick command', () => {
     for (const scenario of SCENARIOS[PRODUCT_VARIANT.productLine]) {
       const intent = normalizeActionIntent(scenario.command);
       expect(intent).toMatchObject({
@@ -107,29 +105,17 @@ describe('industry edition pure voice replay', () => {
       expect(voice.turnIntent.flow.clientActionOnlyTurn).toBe(true);
       expect(voice.turnIntent.flow.industryWorkflowEntryId || '').toBe('');
       expect(new Set(voice.execution.toolPolicy.allowedTools)).toEqual(new Set(['client_get_state', 'client_action']));
-      // Main chat remains model-owned: normalized navigation narrows intent,
-      // but it does not restore the legacy regex/quick-command dispatcher.
-      expect(chat.execution.toolPolicy.allowedTools).toEqual(expect.arrayContaining([
-        'client_get_state',
-        'client_action',
-      ]));
-      expect(chat.execution.toolPolicy.allowedTools.length).toBeGreaterThan(2);
+      // Both current channels share the bounded client-navigation contract;
+      // the model still owns choosing a call and requires a real client receipt.
+      expect(chat.turnIntent.flow.clientActionOnlyTurn).toBe(true);
+      expect(new Set(chat.execution.toolPolicy.allowedTools)).toEqual(new Set(['client_get_state', 'client_action']));
       expect(voice.execution.toolPolicy.allowedTools).not.toContain('desktop_open');
       expect(voice.execution.toolPolicy.allowedTools).not.toContain('industry_workflow_start');
 
-      const deterministic = buildDeterministicClientNavigationCommand(
-        voice.normalizedIntent,
-      );
-      expect(deterministic?.toolCall).toEqual({
-        name: 'client_action',
-        arguments: { action: scenario.action },
-      });
-      expect(deterministic?.formatToolResult?.(JSON.stringify({
-        ok: true,
-        verification: { status: 'verified' },
-      }))).toContain('\u5df2\u6253\u5f00');
-      const quick = await matchQuickCommand(scenario.command, 'industry_voice_only_user');
-      expect(quick?.toolCall).toEqual({ name: 'client_action', arguments: { action: scenario.action } });
+      // The current normalized contract constrains the model/tool executor;
+      // recognizing navigation is not evidence that a native window opened.
+      expect(voice.normalizedIntent.clientAction).toBe(scenario.action);
+      expect(chat.normalizedIntent.clientAction).toBe(scenario.action);
     }
   });
 
@@ -152,12 +138,13 @@ describe('industry edition pure voice replay', () => {
     expect(correction.execution.toolPolicy.allowedTools || []).not.toContain('industry_workflow_start');
   });
 
-  it('carries an exact pending confirmation across separate voice utterance request ids', () => {
+  it('carries one exact durable confirmation across utterances in the same persisted conversation and task', async () => {
     clearAllPendingConfirmationsForTests();
-    const channelScope = buildVoiceConfirmationChannelScope({
-      domain: 'personal', orgId: '', channelId: 'voice-socket-1', taskId: 'durable-task-1',
+    const channelScope = buildTransportNeutralConfirmationScope({
+      domain: 'personal', orgId: '', conversationId: 'voice-conversation-1', taskId: 'durable-task-1',
+      originRequestId: 'voice-proposal-request-1',
     });
-    const pending = recordPendingConfirmation(
+    const pending = await recordPendingConfirmationDurably(
       'industry_voice_confirm_user',
       'wechat_send_message',
       { contact: '客户甲', message: '确认后的正文' },
@@ -168,7 +155,12 @@ describe('industry edition pure voice replay', () => {
     const nextUtterance = getPendingConfirmation('industry_voice_confirm_user', channelScope);
     expect(nextUtterance?.id).toBe(pending.id);
     expect(nextUtterance?.taskId).toBe('durable-task-1');
-    expect(consumePendingConfirmation(
+    expect(getPendingConfirmation('industry_voice_confirm_user', { ...channelScope, taskId: 'foreign-task' })).toBeNull();
+    expect(await consumePendingConfirmationDurably(
+      'industry_voice_confirm_user', pending.id, pending.toolName,
+      { ...pending.exactArgs, message: 'changed payload' }, channelScope,
+    )).toBe(false);
+    expect(await consumePendingConfirmationDurably(
       'industry_voice_confirm_user',
       pending.id,
       pending.toolName,
@@ -176,5 +168,8 @@ describe('industry edition pure voice replay', () => {
       channelScope,
     )).toBe(true);
     expect(getPendingConfirmation('industry_voice_confirm_user', channelScope)).toBeNull();
+    expect(await consumePendingConfirmationDurably(
+      'industry_voice_confirm_user', pending.id, pending.toolName, pending.exactArgs, channelScope,
+    )).toBe(false);
   });
 });

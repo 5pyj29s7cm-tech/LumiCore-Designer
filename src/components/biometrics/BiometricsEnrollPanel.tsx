@@ -1,16 +1,23 @@
 import { useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Mic, Camera, Shield, CheckCircle2, Loader2, Trash2, RefreshCw } from 'lucide-react';
+import { Mic, Camera, Shield, CheckCircle2, Loader2, Trash2 } from 'lucide-react';
 import { useVoiceprint } from '../../hooks/useVoiceprint';
 import { useFaceRecognition } from '../../hooks/useFaceRecognition';
 import { useT } from '../../lib/useT';
 import { toast } from 'sonner';
 import { formatUiMessage, uiMessage } from '../../i18n/uiMessages';
+import { useApp } from '@/contexts/AppContext';
+import { useRecoverableRead } from '@/hooks/useRecoverableRead';
+import { settingsRecoveryCopy } from '@/i18n/locales/settingsRecovery';
 
 export function BiometricsEnrollPanel() {
+  const { user, workDomain, orgConnection } = useApp();
+  return <BiometricsEnrollContent key={JSON.stringify([user?.uid, user?.role, workDomain, orgConnection?.orgId])} />;
+}
+
+function BiometricsEnrollContent() {
   const t = useT();
-  const isZh = t.langCode !== 'en';
-  const ui = (zh: string, en: string) => isZh ? zh : en;
+  const recovery = settingsRecoveryCopy(t.langCode);
   const voiceprint = useVoiceprint();
   // Enrollment opens its own short-lived camera stream on demand.
   const faceRecognition = useFaceRecognition({ enabled: false });
@@ -21,21 +28,16 @@ export function BiometricsEnrollPanel() {
 
   const [faceStatus, setFaceStatus] = useState<'idle' | 'scanning' | 'done'>('idle');
 
-  const [voiceprints, setVoiceprints] = useState<any[]>([]);
-  const [faces, setFaces] = useState<any[]>([]);
-
-  const loadEnrolled = useCallback(async () => {
-    try {
-      const res = await fetch('/api/auth/biometric/list', { credentials: 'include' });
-      if (res.ok) {
-        const data = await res.json();
-        setVoiceprints(data.voiceprints || []);
-        setFaces(data.faces || []);
-      }
-    } catch {}
-  }, []);
-
-  useEffect(() => { loadEnrolled(); }, [loadEnrolled]);
+  const read = useRecoverableRead<{ voiceprints: any[]; faces: any[] }>('biometrics', async signal => {
+    const res = await fetch('/api/auth/biometric/list', { credentials: 'include', signal });
+    if (!res.ok) throw new Error('Biometric list read failed');
+    const data = await res.json();
+    if (![data?.voiceprints, data?.faces].every(items => Array.isArray(items) && items.every(item => item && typeof item.id === 'string' && typeof item.label === 'string'))) throw new Error('Invalid biometric list');
+    return data;
+  });
+  const voiceprints = read.error ? [] : read.data?.voiceprints || [], faces = read.error ? [] : read.data?.faces || [];
+  const loadEnrolled = read.refresh;
+  const [deleteError, setDeleteError] = useState(false);
 
   const notifyBiometricsUpdated = useCallback((type: string) => {
     window.dispatchEvent(new CustomEvent('lumi:biometrics-updated', { detail: { type } }));
@@ -80,7 +82,7 @@ export function BiometricsEnrollPanel() {
       setVoiceStatus('idle');
       toast.error(uiMessage('biometrics-enroll-panel.voiceprint-enrollment-failed-move-closer.b1d5ff9891'));
     }
-  }, [voiceStatus, voiceLabel, voiceprint, loadEnrolled, notifyBiometricsUpdated, ui]);
+  }, [voiceStatus, voiceLabel, voiceprint, loadEnrolled, notifyBiometricsUpdated]);
 
   // ── Face enrollment ──
   const handleFaceEnroll = useCallback(async () => {
@@ -97,24 +99,28 @@ export function BiometricsEnrollPanel() {
       setFaceStatus('idle');
       toast.error(uiMessage('biometrics-enroll-panel.face-enrollment-failed-look-at.ccc08993ab'));
     }
-  }, [faceStatus, faceRecognition, loadEnrolled, notifyBiometricsUpdated, ui]);
+  }, [faceStatus, faceRecognition, loadEnrolled, notifyBiometricsUpdated]);
 
   // ── Delete ──
   const handleDelete = useCallback(async (type: string, id: string) => {
+    setDeleteError(false);
     try {
-      const res = await fetch(`/api/auth/biometric/${type}/${id}`, { method: 'DELETE', credentials: 'include' });
-      if (res.ok) {
+      const res = await fetch(`/api/auth/biometric/${type}/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'include', signal: AbortSignal.timeout(15_000) });
+      const result = await res.json();
+      if (!res.ok || result?.success !== true) throw new Error('Biometric deletion not confirmed');
         toast.success(uiMessage('biometrics-enroll-panel.deleted.e8250ae78f'));
         notifyBiometricsUpdated(type);
-        loadEnrolled();
-      }
+        await loadEnrolled();
     } catch {
+      setDeleteError(true);
       toast.error(uiMessage('biometrics-enroll-panel.delete-failed.eea779ae78'));
     }
-  }, [loadEnrolled, notifyBiometricsUpdated, ui]);
+  }, [loadEnrolled, notifyBiometricsUpdated]);
 
   return (
     <div className="space-y-8">
+      {read.loading && <p role="status">{recovery.loading}</p>}
+      {(read.error || deleteError) && <div role="alert">{read.error ? recovery.biometricFailed : recovery.deleteFailed} <button onClick={() => { setDeleteError(false); void loadEnrolled(); }}>{recovery.retry}</button></div>}
       {/* ── Voiceprint ── */}
       <div className="space-y-4">
         <div className="flex items-center gap-3">

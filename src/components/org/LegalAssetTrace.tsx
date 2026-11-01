@@ -1,9 +1,9 @@
-import React, { useEffect, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { AlertCircle, Building2, FileText, FolderOpen, Loader2, Network, Search, Target } from 'lucide-react';
-import { toast } from 'sonner';
+import { useLegalDocument, useLegalDocumentScope } from '../../hooks/useLegalDocument';
 import { useT } from '../../lib/useT';
 import { getLegalCaseLabel, type LegalCaseFile, type LegalCaseMaterial } from '../../lib/legalCaseStore';
-import { runLegalTool } from '../../lib/legalToolClient';
+import { runLegalToolExecution } from '../../lib/legalToolClient';
 import { LegalCaseContextBar } from './LegalCaseContextBar';
 import { uiMessage } from '../../i18n/uiMessages';
 import { chinaLegalCopy } from '../../i18n/regions/cn/legal';
@@ -16,7 +16,6 @@ interface TraceResult {
   establishDate?: string;
   shareholders?: { name: string; ratio: number }[];
   enforcements?: { caseNumber: string; court: string; target: string; date: string }[];
-  risks?: { type: string; count: number }[];
   raw?: string;
 }
 
@@ -25,70 +24,52 @@ function legalCaseTitle(caseFile?: LegalCaseFile | null): string {
 }
 
 function assetTraceCaseArgs(caseFile?: LegalCaseFile | null, orgId?: string): Record<string, any> {
-  if (!caseFile) return orgId ? { orgId } : {};
+  if (!caseFile) return { ...(orgId ? { orgId } : {}), persistCase: false };
   return {
     caseId: caseFile.id,
     caseName: legalCaseTitle(caseFile),
     caseType: caseFile.cause || chinaLegalCopy().assetTraceCaseType,
     parties: caseFile.party || undefined,
     orgId,
-    persistCase: true,
+    persistCase: false,
   };
 }
 
-export function LegalAssetTrace({
-  caseFile,
-  orgId,
-  onAddMaterial,
-}: {
+type Props = {
   caseFile?: LegalCaseFile | null;
   orgId?: string;
-  onAddMaterial?: (type: LegalCaseMaterial['type'], title: string, content?: string, source?: LegalCaseMaterial['source']) => void;
-}) {
+  onAddMaterial?: (type: LegalCaseMaterial['type'], title: string, content?: string, source?: LegalCaseMaterial['source']) => boolean | Promise<boolean>;
+};
+export function LegalAssetTrace(props: Props) {
+  return <AssetTrace key={useLegalDocumentScope(props.caseFile?.id, props.orgId)} {...props} />;
+}
+
+function AssetTrace({ caseFile, orgId, onAddMaterial }: Props) {
   const t = useT();
-  const isZh = t.langCode !== 'en';
-  const ui = (zh: string, en: string) => (isZh ? zh : en);
-  const [name, setName] = useState(caseFile?.party || '');
-  const [result, setResult] = useState<TraceResult | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [activeTab, setActiveTab] = useState<'info' | 'enforcement' | 'equity' | 'raw'>('info');
+  const { text: name, setText: setName, result: output, successfulResult, busy, generate, save } = useLegalDocument(caseFile?.party || '', { error: uiMessage('legal-asset-trace.error.1d47687da7') });
+  const result = useMemo(() => output ? parseTraceResult(output) : null, [output]);
+  const [verified, setVerified] = useState(false);
+  const loading = Boolean(busy);
+  const [selectedTab, setActiveTab] = useState<'' | 'info' | 'enforcement' | 'equity' | 'raw'>('');
+  const activeTab = selectedTab || (result?.company ? 'info' : 'raw');
 
-  useEffect(() => {
-    setName(caseFile?.party || '');
-    setResult(null);
-    setActiveTab('info');
-  }, [caseFile?.id, caseFile?.party]);
-
-  const trace = async () => {
-    if (!name.trim() || loading) return;
-    setLoading(true);
-    setResult(null);
-    try {
-      const commonArgs = assetTraceCaseArgs(caseFile, orgId);
-      const assetText = await runLegalTool('legal_trace_assets', {
-        ...commonArgs,
-        name,
-      });
-      const equityText = await runLegalTool('legal_equity_penetration', {
-        ...commonArgs,
-        name,
-      });
-      const text = [assetText, equityText].filter(Boolean).join('\n\n---\n\n');
-      const parsed = parseTraceResult(text);
-      setResult(parsed);
-      setActiveTab(parsed.company ? 'info' : 'raw');
-    } catch (e: any) {
-      setResult({ raw: `${uiMessage('legal-asset-trace.error.1d47687da7')}: ${e.message}` });
-      setActiveTab('raw');
-    } finally {
-      setLoading(false);
-    }
+  const executeTrace = (toolName: 'legal_trace_assets' | 'legal_equity_penetration') => {
+    if (!name.trim()) return;
+    return generate(async signal => {
+      setActiveTab('');
+      setVerified(false);
+      const args = { ...assetTraceCaseArgs(caseFile, orgId), name };
+      const execution = await runLegalToolExecution(toolName, args, signal);
+      setVerified(execution.verification?.status === 'verified' && execution.receipt.ok !== false);
+      return execution.text;
+    });
   };
 
+  const trace = () => executeTrace('legal_trace_assets');
+
   const archive = () => {
-    if (!result?.raw || !onAddMaterial) return;
-    onAddMaterial('note', `${legalCaseTitle(caseFile)} ${uiMessage('legal-asset-trace.asset-trace-report.d6c2fdd263')}`, result.raw, 'tool');
-    toast.success(uiMessage('legal-asset-trace.asset-trace-report-archived-to.2e6765985f'));
+    if (!verified || !successfulResult || !onAddMaterial) return;
+    return save(() => onAddMaterial('note', `${legalCaseTitle(caseFile)} ${uiMessage('legal-asset-trace.asset-trace-report.d6c2fdd263')}`, successfulResult, 'tool'), uiMessage('legal-asset-trace.asset-trace-report-archived-to.2e6765985f'));
   };
 
   return (
@@ -108,7 +89,7 @@ export function LegalAssetTrace({
           </div>
         </section>
 
-        <LegalCaseContextBar caseFile={caseFile} state={loading ? 'running' : result ? 'result' : 'input'} />
+        <LegalCaseContextBar caseFile={caseFile} state={loading ? 'running' : verified ? 'result' : 'input'} />
 
         <section className="rounded-lg border border-white/10 bg-white/[0.04] p-4">
           <div className="grid gap-3 md:grid-cols-[1fr_auto]">
@@ -123,6 +104,7 @@ export function LegalAssetTrace({
                 className="w-full rounded-lg border border-white/10 bg-black/20 py-2.5 pl-9 pr-3 text-sm text-white outline-none placeholder:text-white/35 focus:border-cyan-400/35"
               />
             </div>
+            <div className="flex flex-wrap gap-2">
             <button
               onClick={trace}
               disabled={loading || !name.trim()}
@@ -131,6 +113,15 @@ export function LegalAssetTrace({
               {loading ? <Loader2 size={16} className="animate-spin" /> : <Search size={16} />}
               {t.legalAssetTraceSearch || uiMessage('legal-asset-trace.trace.d2c6a7c6c9')}
             </button>
+            <button
+              onClick={() => executeTrace('legal_equity_penetration')}
+              disabled={loading || !name.trim()}
+              className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-white/65 hover:bg-white/10 disabled:opacity-50"
+            >
+              <Network size={16} />
+              {t.legalAssetTraceSearch || uiMessage('legal-asset-trace.trace.d2c6a7c6c9')} · {uiMessage('legal-asset-trace.equity.88cbe6797c')}
+            </button>
+            </div>
           </div>
         </section>
 
@@ -148,8 +139,8 @@ export function LegalAssetTrace({
                   <TabButton active={activeTab === 'equity'} icon={<Network size={14} />} label={uiMessage('legal-asset-trace.equity.88cbe6797c')} onClick={() => setActiveTab('equity')} />
                   <TabButton active={activeTab === 'raw'} icon={<FileText size={14} />} label={uiMessage('legal-asset-trace.raw-report.ed806061d6')} onClick={() => setActiveTab('raw')} />
                 </div>
-                {result.raw && onAddMaterial && !orgId && (
-                  <button onClick={archive} className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white/65 transition hover:bg-white/10 hover:text-white">
+                {verified && successfulResult && onAddMaterial && !orgId && (
+                  <button onClick={archive} disabled={loading} className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white/65 transition hover:bg-white/10 hover:text-white disabled:opacity-50">
                     <FolderOpen size={14} />
                     {uiMessage('legal-asset-trace.archive-to-case.6dc41a223d')}
                   </button>
@@ -157,9 +148,9 @@ export function LegalAssetTrace({
               </div>
 
               <div className="min-h-0 flex-1 overflow-y-auto custom-scrollbar">
-                {activeTab === 'info' && <EnterpriseInfo result={result} ui={ui} />}
-                {activeTab === 'enforcement' && <EnforcementList result={result} ui={ui} />}
-                {activeTab === 'equity' && <EquityList result={result} ui={ui} />}
+                {activeTab === 'info' && <EnterpriseInfo result={result} />}
+                {activeTab === 'enforcement' && <EnforcementList result={result} />}
+                {activeTab === 'equity' && <EquityList result={result} />}
                 {activeTab === 'raw' && <RawReport text={result.raw || uiMessage('legal-asset-trace.no-raw-output.f6fab13ffa')} />}
               </div>
             </div>
@@ -191,7 +182,7 @@ function TabButton({ active, icon, label, onClick }: { active: boolean; icon: Re
   );
 }
 
-function EnterpriseInfo({ result, ui }: { result: TraceResult; ui: (zh: string, en: string) => string }) {
+function EnterpriseInfo({ result }: { result: TraceResult }) {
   if (!result.company && !result.legalPerson && !result.capital && !result.status) {
     return <Empty text={uiMessage('legal-asset-trace.no-structured-enterprise-data-parsed.a78346c3cf')} />;
   }
@@ -215,7 +206,7 @@ function EnterpriseInfo({ result, ui }: { result: TraceResult; ui: (zh: string, 
   );
 }
 
-function EnforcementList({ result, ui }: { result: TraceResult; ui: (zh: string, en: string) => string }) {
+function EnforcementList({ result }: { result: TraceResult }) {
   if (!result.enforcements || result.enforcements.length === 0) {
     return <Empty text={uiMessage('legal-asset-trace.no-enforcement-records-parsed-check.19d42c2925')} />;
   }
@@ -238,7 +229,7 @@ function EnforcementList({ result, ui }: { result: TraceResult; ui: (zh: string,
   );
 }
 
-function EquityList({ result, ui }: { result: TraceResult; ui: (zh: string, en: string) => string }) {
+function EquityList({ result }: { result: TraceResult }) {
   if (!result.shareholders || result.shareholders.length === 0) {
     return <Empty text={uiMessage('legal-asset-trace.no-equity-structure-parsed-check.60dfc119e1')} />;
   }

@@ -1,8 +1,8 @@
 import React, { Suspense, lazy, useMemo, useState } from 'react';
 import {
-  Building2, BookOpen, Package, Users, Settings,
-  ClipboardCheck, ScrollText, MessageSquare,
-  Shield, User, Briefcase, Home, Scale, GitBranch, Loader2, MessagesSquare,
+  Building2, BookOpen, Users, Settings,
+  ScrollText, MessageSquare,
+  Shield, User, Briefcase, Home, Scale, Palette, GitBranch, Loader2, MessagesSquare,
 } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { useT } from '../../lib/useT';
@@ -18,12 +18,11 @@ import {
   takePendingOrganizationWorkspaceRoute,
 } from '../../lib/orgWorkspaceNavigation';
 import { uiMessage } from '../../i18n/uiMessages';
-import { interiorDesignMessage } from '../../i18n/locales/interiorDesign';
 
 const AuditLogViewer = lazy(() => import('./AuditLogViewer').then(m => ({ default: m.AuditLogViewer })));
 const BranchDashboard = lazy(() => import('./BranchDashboard').then(m => ({ default: m.BranchDashboard })));
 const CentralLumiChat = lazy(() => import('./CentralLumiChat').then(m => ({ default: m.CentralLumiChat })));
-const DesignHub = lazy(() => import('./DesignHub').then(m => ({ default: m.DesignHub })));
+const DesignHub = lazy(() => import('./GeneralDesignHub').then(m => ({ default: m.GeneralDesignHub })));
 const KnowledgeBaseBrowser = lazy(() => import('./KnowledgeBaseBrowser').then(m => ({ default: m.KnowledgeBaseBrowser })));
 const KnowledgeBaseEditor = lazy(() => import('./KnowledgeBaseEditor').then(m => ({ default: m.KnowledgeBaseEditor })));
 const LegalHub = lazy(() => import('./LegalHub').then(m => ({ default: m.LegalHub })));
@@ -63,8 +62,6 @@ export function OrgHub() {
   const [editingArticleId, setEditingArticleId] = useState<string | undefined>(() => initialRoute?.articleId);
   const [switchBusy, setSwitchBusy] = useState(false);
   const t = useT();
-  const isZh = t.langCode !== 'en';
-  const ui = (zh: string, en: string) => (isZh ? zh : en);
 
   const allNavItems: NavItem[] = useMemo(() => [
     { id: 'dashboard', label: t.orgDashboard, icon: <Home size={16} />, roles: ['owner', 'admin', 'member', 'viewer'] },
@@ -73,11 +70,12 @@ export function OrgHub() {
     { id: 'messaging', label: t.messaging || uiMessage('org-hub.messaging.ec30100616'), icon: <MessagesSquare size={16} />, roles: ['owner', 'admin', 'member'] },
     { id: 'members', label: t.orgMembers, icon: <Users size={16} />, roles: ['owner', 'admin'], showInNav: false },
     { id: 'audit', label: t.orgAudit, icon: <ScrollText size={16} />, roles: ['owner', 'admin'] },
-    { id: 'legal', label: t.legalHub || uiMessage('org-hub.legal.95d17f5100'), icon: <Scale size={16} />, roles: ['owner', 'admin', 'member', 'viewer'] },
-    { id: 'spatial-design', label: interiorDesignMessage('workspaceTitle', isZh ? 'zh' : 'en'), icon: <Building2 size={16} />, roles: ['owner', 'admin', 'member', 'viewer'] },
+    { id: 'legal', label: t.legalHub || uiMessage('org-hub.legal.95d17f5100'), icon: <Scale size={16} />, roles: ['owner', 'admin', 'member', 'viewer'], showInNav: false },
+    { id: 'spatial-design', label: uiMessage('org-hub.spatial-architecture.ad5a608bfc'), icon: <Building2 size={16} />, roles: ['owner', 'admin', 'member', 'viewer'], showInNav: false },
+    { id: 'brand-design', label: uiMessage('org-hub.brand-creative.2ae19b7f69'), icon: <Palette size={16} />, roles: ['owner', 'admin', 'member', 'viewer'], showInNav: false },
     { id: 'settings', label: t.orgSettings, icon: <Settings size={16} />, roles: ['owner', 'admin', 'member', 'viewer'] },
     { id: 'branch', label: uiMessage('org-hub.branch-connection.9cecc72547'), icon: <GitBranch size={16} />, roles: ['owner', 'admin', 'member', 'viewer'], showInNav: false },
-  ], [t, isZh]);
+  ], [t]);
 
   const roleLabel: Record<string, { label: string; icon: React.ReactNode; color: string }> = useMemo(() => ({
     owner:  { label: t.orgRoleOwner,  icon: <Shield size={10} />, color: 'text-amber-400 bg-amber-500/10' },
@@ -107,8 +105,7 @@ export function OrgHub() {
     () => listOrganizationWorkspaceViewsForRole(orgRole),
     [orgRole],
   );
-  const hiddenModuleIds = useMemo(() => new Set<SubView>(['legal', 'spatial-design']), []);
-  const primaryNavItems = visibleItems.filter(item => item.showInNav !== false && !hiddenModuleIds.has(item.id));
+  const primaryNavItems = visibleItems.filter(item => item.showInNav !== false);
   const roleInfo = roleLabel[orgRole] || roleLabel.member;
   const currentItem = visibleItems.find(item => item.id === subView) || allNavItems.find(item => item.id === subView) || allNavItems[0];
 
@@ -158,7 +155,8 @@ export function OrgHub() {
       case 'settings': return <OrganizationSettingsWorkspace />;
       case 'audit': return <AuditLogViewer />;
       case 'legal': return <LegalHub />;
-      case 'spatial-design': return <DesignHub />;
+      case 'spatial-design': return <DesignHub workspace="spatial" />;
+      case 'brand-design': return <DesignHub workspace="brand" />;
       case 'branch': return <OrganizationSettingsWorkspace initialTab="branch" />;
       default: return <BranchDashboard />;
     }
@@ -215,20 +213,6 @@ export function OrgHub() {
               <span className="lumi-org-nav-copy hidden min-w-0 truncate sm:block">{item.label}</span>
             </button>
           ))}
-          <div className="my-2 border-t border-white/[0.08]" />
-          <button
-            onClick={() => openSubView('spatial-design')}
-            aria-label={interiorDesignMessage('workspaceTitle', isZh ? 'zh' : 'en')}
-            title={interiorDesignMessage('workspaceTitle', isZh ? 'zh' : 'en')}
-            className={`flex w-full items-center justify-center gap-2 rounded-xl border px-2 py-2 text-sm transition-colors sm:justify-start sm:px-3 ${
-              subView === 'spatial-design'
-                ? 'border-amber-300/25 bg-amber-300/10 text-amber-100'
-                : 'border-transparent text-white/50 hover:border-amber-300/15 hover:bg-amber-300/[0.06] hover:text-amber-100'
-            }`}
-          >
-            <Building2 size={16} />
-            <span className="lumi-org-nav-copy hidden min-w-0 truncate sm:block">{interiorDesignMessage('workspaceTitle', isZh ? 'zh' : 'en')}</span>
-          </button>
         </nav>
       </div>
 

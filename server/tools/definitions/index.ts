@@ -1,3 +1,5 @@
+import { registerChatSongTools } from './chat_song_tools';
+import { registerBusinessCalculationTools } from './business_calculation_tools';
 import { ToolRegistry } from '../registry';
 import { registerFileOpsTools } from './file_ops';
 import { registerSystemOpsTools } from './system_ops';
@@ -19,6 +21,7 @@ import { registerDocumentTools } from './document_tools';
 import { registerKnowledgeTools } from './knowledge_tools';
 import { registerWorkflowTools } from './workflow_tools';
 import { registerImageTools } from './image_tools';
+import { registerMemoryAvatarTools } from './memory_avatar_tools';
 import { registerVideoTools } from './video_tools';
 import { registerInputTools } from './input_tools';
 import { registerComputerUseTool } from './computer_use_tool';
@@ -44,16 +47,17 @@ import { registerMessagingTools } from './messaging_tools';
 import { registerModelConfigurationTools } from './model_configuration_tools';
 import { registerDesktopWechatWatchTools } from './desktop_wechat_watch_tools';
 import { registerNetworkDiagnosticTools } from './network_diagnostic_tools';
+import { registerLocalDeviceTools } from './local_device_tools';
 import { registerRuntimeWorkTools } from './runtime_work_tools';
 import { registerCadWorkflowTools } from './cad_workflow_tools';
 import { registerExtensionRegistryTools } from './extension_registry_tools';
 import { registerIndustryWorkflowTools } from './industry_workflow_tools';
-import { PRODUCT_VARIANT } from '../../../shared/product_variant';
 
 export function registerAllTools(
   registry: ToolRegistry,
   llmGetters?: NonNullable<Parameters<typeof setSkillLLMGetters>[0]>,
 ): void {
+  registerBusinessCalculationTools(registry);
   registerFileOpsTools(registry);
   registerSystemOpsTools(registry);
   registerWebOpsTools(registry);
@@ -74,7 +78,9 @@ export function registerAllTools(
   registerKnowledgeTools(registry);
   registerWorkflowTools(registry);
   registerImageTools(registry);
+  registerMemoryAvatarTools(registry);
   registerVideoTools(registry);
+  registerChatSongTools(registry);
   registerInputTools(registry);
   registerComputerUseTool(registry);
   registerPythonTools(registry);
@@ -101,6 +107,7 @@ export function registerAllTools(
   registerMessagingTools(registry);
   registerDesktopWechatWatchTools(registry);
   registerNetworkDiagnosticTools(registry);
+  registerLocalDeviceTools(registry);
   registerRuntimeWorkTools(registry);
   registerExtensionRegistryTools(registry);
   if (llmGetters) {
@@ -119,70 +126,5 @@ export function registerProductVariantTools(
   registry: ToolRegistry,
   llmGetters?: NonNullable<Parameters<typeof setSkillLLMGetters>[0]>,
 ): void {
-  const productLine = PRODUCT_VARIANT.productLine;
-  if (!['design', 'legal', 'finance'].includes(productLine)) {
-    throw new Error(`Unsupported industry tool profile: ${productLine}`);
-  }
-
-  // Lumi core: conversation execution, memory/knowledge access, models,
-  // desktop/file work, messaging and receipts. The Designer edition runs on
-  // the same single LumiCore owner as the primary client; legacy local-agent
-  // and external-AI delegation tools are intentionally not registered.
-  registerFileOpsTools(registry);
-  registerSystemOpsTools(registry);
-  registerWebOpsTools(registry);
-  registerWebLoginTools(registry);
-  registerDataOpsTools(registry);
-  registerDesktopTools(registry);
-  registerVerifyTools(registry);
-  registerSkillTools(registry);
-  registerOfficeTools(registry);
-  registerScreenMonitorTools(registry);
-  registerClipboardTools(registry);
-  registerOCRTools(registry);
-  registerPdfTools(registry);
-  registerDocumentTools(registry);
-  registerKnowledgeTools(registry);
-  registerWorkflowTools(registry);
-  registerInputTools(registry);
-  registerComputerUseTool(registry);
-  registerBiometricTools(registry);
-  registerClientSelfTools(registry);
-  registerModelConfigurationTools(registry);
-  registerExternalAppTools(registry);
-  registerExternalControlTools(registry);
-  registerAutonomyTools(registry);
-  registerCapabilityResearchTools(registry);
-  registerSleepTools(registry);
-  registerAdapterTools(registry);
-  registerSelfExtensionTools(registry);
-  registerUsageTools(registry);
-  registerWorkProductTools(registry);
-  registerWorkTakeoverTools(registry);
-  registerIndustryWorkflowTools(registry);
-  registerDesktopAiTools(registry);
-  registerExternalAiHistoryTools(registry);
-  registerMessagingTools(registry);
-  registerDesktopWechatWatchTools(registry);
-  registerNetworkDiagnosticTools(registry);
-  registerRuntimeWorkTools(registry);
-  registerExtensionRegistryTools(registry);
-
-  if (productLine === 'design') {
-    registerImageTools(registry);
-    registerVideoTools(registry);
-    registerPythonTools(registry);
-    registerCadWorkflowTools(registry);
-    registerAuthorityResearchTools(registry);
-  } else if (productLine === 'legal') {
-    registerCalendarTools(registry);
-    registerLegalTools(registry);
-    registerAuthorityResearchTools(registry);
-  } else if (productLine === 'finance') {
-    registerCalendarTools(registry);
-    registerPythonTools(registry);
-    registerAuthorityResearchTools(registry);
-  }
-
-  if (llmGetters) setSkillLLMGetters(llmGetters);
+  registerAllTools(registry, llmGetters);
 }

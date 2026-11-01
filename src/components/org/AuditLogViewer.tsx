@@ -1,8 +1,7 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import { FeedbackBanner } from './FeedbackBanner';
+import { useCallback, useEffect, useState } from 'react';
 import { motion } from 'motion/react';
 import {
-  AlertCircle,
-  CheckCircle,
   Clock,
   Download,
   FileText,
@@ -12,95 +11,83 @@ import {
   Search,
   User,
 } from 'lucide-react';
+import { useApp } from '../../contexts/AppContext';
+import { useAsyncOperation } from '../../hooks/useAsyncOperation';
+import { apiFetch, apiJson } from '../../services/apiClient';
 import { useT } from '../../lib/useT';
-import { formatUiMessage, uiMessage } from '../../i18n/uiMessages';
+import { uiMessage } from '../../i18n/uiMessages';
+import { organizationRecoveryCopy } from '../../i18n/locales/organizationRecovery';
+import { orgAdminCompletenessCopy } from '../../i18n/locales/orgAdminCompleteness';
+import type { AuditEntry as StoredAuditEntry } from '../../../server/org/db';
 
-interface AuditEntry {
-  id: string;
-  userId: string;
-  action: string;
-  resourceType: string;
-  resourceId: string;
-  details: string;
-  timestamp: string;
+type AuditEntry = Pick<StoredAuditEntry, 'id' | 'userId' | 'action' | 'resourceType' | 'resourceId' | 'details' | 'timestamp'>;
+
+function paramsFor(value: Record<string, string>) {
+  return new URLSearchParams(Object.fromEntries(Object.entries(value).map(([key, value]) => [key, value.trim()]).filter(([, value]) => value)));
 }
 
-type Feedback = { type: 'success' | 'error'; text: string };
-
 export function AuditLogViewer() {
-  const t = useT();
-  const isZh = t.langCode !== 'en';
-  const ui = useCallback((zh: string, en: string) => (isZh ? zh : en), [isZh]);
-  const [entries, setEntries] = useState<AuditEntry[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { user, workDomain, orgConnection } = useApp();
+  return user ? <AuditLog key={JSON.stringify([user.uid, user.role, workDomain, orgConnection?.orgId, orgConnection?.orgRole])} /> : null;
+}
+function AuditLog() {
+  const t = useT(), isZh = t.langCode !== 'en';
+  const recovery = organizationRecoveryCopy(t.langCode);
+  const copy = orgAdminCompletenessCopy(t.langCode);
+  const [records, setRecords] = useState<AuditEntry[] | null>(null);
   const [filters, setFilters] = useState({ userId: '', action: '', resourceType: '' });
-  const [showFilters, setShowFilters] = useState(false);
-  const [feedback, setFeedback] = useState<Feedback | null>(null);
-
-  const loadEntries = useCallback(async (withFilters = filters) => {
-    setLoading(true);
-    setFeedback(null);
-    try {
-      const params = new URLSearchParams();
-      params.set('limit', '100');
-      if (withFilters.userId.trim()) params.set('userId', withFilters.userId.trim());
-      if (withFilters.action.trim()) params.set('action', withFilters.action.trim());
-      if (withFilters.resourceType.trim()) params.set('resourceType', withFilters.resourceType.trim());
-      const res = await fetch(`/api/org/audit?${params.toString()}`, { credentials: 'include' });
-      const data = await res.json().catch(() => []);
-      if (!res.ok) throw new Error((data as any).error || formatUiMessage('audit-log-viewer.audit-log-load-failed-value0.3784d1af66', { value0: res.status }));
-      setEntries(Array.isArray(data) ? data : []);
-    } catch (err: any) {
-      setFeedback({ type: 'error', text: err.message || String(err) });
-      setEntries([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [filters, ui]);
-
-  useEffect(() => {
-    void loadEntries();
-  }, []); // initial load only; explicit filter button controls filtered reload
-
-  const handleFilter = () => {
-    void loadEntries(filters);
-  };
-
+  const [appliedFilters, setAppliedFilters] = useState(filters);
+  const [page, setPage] = useState({ offset: 0, total: 0, nextCursor: null as string | null, previousCursor: null as string | null });
+  const [requestedPage, setRequestedPage] = useState({ filters, cursor: '' });
+  const [retryKind, setRetryKind] = useState<'load' | 'export'>('load');
+  const [showFilters, setShowFilters] = useState(false), [message, setMessage] = useState('');
+  const { busy, error, run, cancel } = useAsyncOperation();
+  const entries = records || [], loading = busy === 'load' || (records === null && !error);
+  const feedback = error ? { type: 'error' as const, text: error } : message ? { type: 'success' as const, text: message } : null;
+  const loadEntries = useCallback((value = { userId: '', action: '', resourceType: '' }, cursor = '') => {
+    cancel(); setMessage('');
+    setRetryKind('load');
+    setRequestedPage({ filters: value, cursor });
+    void run('load', async signal => {
+      const params = paramsFor(value); params.set('limit', '100'); params.set('pagination', 'cursor');
+      if (cursor) params.set('cursor', cursor);
+      const data = await apiJson('/api/org/audit?' + params, { signal });
+      if (!data || !Array.isArray(data.entries) || !data.entries.every((item: any) => item && ['id', 'userId', 'action', 'resourceType', 'timestamp'].every(field => typeof item[field] === 'string'))
+        || !Number.isSafeInteger(data.total) || data.total < 0 || !Number.isSafeInteger(data.offset) || data.offset < 0 || data.offset % 100 !== 0
+        || data.entries.length !== Math.min(100, data.total - data.offset) || (!cursor && data.offset !== 0)
+        || new Set(data.entries.map((item: any) => item.id)).size !== data.entries.length
+        || typeof data.cursor !== 'string' || !data.cursor || (cursor && data.cursor !== cursor)
+        || ![data.nextCursor, data.previousCursor].every(value => value === null || (typeof value === 'string' && value.length > 0))
+        || (data.nextCursor !== null) !== (data.offset + data.entries.length < data.total)
+        || (data.previousCursor !== null) !== (data.offset > 0)) throw new Error('Invalid audit log response');
+      return () => { setRecords(data.entries); setAppliedFilters(value); setPage({ offset: data.offset, total: data.total, nextCursor: data.nextCursor, previousCursor: data.previousCursor }); };
+    });
+  }, [run, cancel]);
+  useEffect(() => { loadEntries(); }, [loadEntries]);
+  const handleFilter = () => loadEntries(filters);
   const handleClear = () => {
-    const empty = { userId: '', action: '', resourceType: '' };
-    setFilters(empty);
-    void loadEntries(empty);
+    const empty = { userId: '', action: '', resourceType: '' }; setFilters(empty); loadEntries(empty);
   };
-
-  const handleExport = async () => {
-    setFeedback(null);
-    try {
-      const params = new URLSearchParams();
-      if (filters.userId.trim()) params.set('userId', filters.userId.trim());
-      if (filters.action.trim()) params.set('action', filters.action.trim());
-      if (filters.resourceType.trim()) params.set('resourceType', filters.resourceType.trim());
-      const res = await fetch(`/api/org/audit/export?${params.toString()}`, { credentials: 'include' });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || formatUiMessage('audit-log-viewer.audit-export-failed-value0.7234f86e58', { value0: res.status }));
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = `audit-export-${Date.now()}.csv`;
-      document.body.appendChild(anchor);
-      anchor.click();
-      document.body.removeChild(anchor);
-      URL.revokeObjectURL(url);
-      setFeedback({ type: 'success', text: uiMessage('audit-log-viewer.audit-csv-exported.e2579c1ff2') });
-    } catch (err: any) {
-      setFeedback({ type: 'error', text: err.message || String(err) });
-    }
+  const handleExport = () => {
+    setMessage(''); setRetryKind('export');
+    return run('export', async signal => {
+      const response = await apiFetch('/api/org/audit/export?' + paramsFor(appliedFilters), { signal });
+      if (!response.ok) throw new Error('Audit export failed: HTTP ' + response.status);
+      const blob = await response.blob();
+      return () => {
+        const url = URL.createObjectURL(blob), anchor = document.createElement('a');
+        anchor.href = url; anchor.download = `audit-export-${Date.now()}.csv`;
+        document.body.appendChild(anchor); anchor.click(); anchor.remove(); URL.revokeObjectURL(url);
+        setMessage(uiMessage('audit-log-viewer.audit-csv-exported.e2579c1ff2'));
+      };
+    }, 60_000);
   };
 
   const parseDetails = (details: string): Record<string, any> => {
-    try { return JSON.parse(details); } catch { return {}; }
+    try {
+      const parsed = JSON.parse(details);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch { return {}; }
   };
 
   const actionColor = (action: string): string => {
@@ -122,10 +109,11 @@ export function AuditLogViewer() {
               </span>
               <div>
                 <h2 className="text-xl font-semibold text-white">{t.orgAudit || uiMessage('audit-log-viewer.audit-log.bd5de459f0')}</h2>
-                <p className="mt-1 text-sm text-white/50">{formatUiMessage('audit-log-viewer.value0-entries.5100b27748', { value0: entries.length })}</p>
+                <p className="mt-1 text-sm text-white/50">{records !== null && copy.auditCount(entries.length, page.total)}</p>
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              <button type="button" disabled={Boolean(busy)} onClick={() => loadEntries(appliedFilters)} className="rounded-lg border border-white/10 px-3 py-2 text-sm disabled:opacity-40">{copy.refreshAudit}</button>
               <button
                 onClick={() => setShowFilters(prev => !prev)}
                 className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition ${
@@ -139,6 +127,7 @@ export function AuditLogViewer() {
               </button>
               <button
                 onClick={handleExport}
+                disabled={Boolean(busy)}
                 className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white/65 transition hover:bg-white/10 hover:text-white"
               >
                 <Download size={14} />
@@ -149,6 +138,7 @@ export function AuditLogViewer() {
         </section>
 
         {feedback && <FeedbackBanner feedback={feedback} />}
+        {error && <button type="button" disabled={Boolean(busy)} onClick={() => retryKind === 'export' ? void handleExport() : loadEntries(requestedPage.filters, requestedPage.cursor)} className="self-start rounded-lg border border-white/10 px-3 py-2 text-sm">{recovery.retry}</button>}
 
         {showFilters && (
           <motion.section
@@ -193,11 +183,11 @@ export function AuditLogViewer() {
         )}
 
         <section className="min-h-[360px] overflow-hidden rounded-lg border border-white/10 bg-white/[0.04]">
-          {loading ? (
+          {loading && records === null ? (
             <div className="flex h-72 items-center justify-center text-white/55">
               <Loader2 size={24} className="animate-spin" />
             </div>
-          ) : entries.length === 0 ? (
+          ) : entries.length === 0 && !error ? (
             <div className="flex h-72 flex-col items-center justify-center gap-2 text-center text-sm text-white/45">
               <ScrollText size={32} className="text-white/20" />
               <span>{uiMessage('audit-log-viewer.no-audit-entries-found.be752eeb23')}</span>
@@ -231,6 +221,13 @@ export function AuditLogViewer() {
             </div>
           )}
         </section>
+        {(page.offset > 0 || page.nextCursor) && (
+          <div className="flex justify-end gap-3">
+            <span className="self-center text-sm text-white/50">{recovery.page} {page.offset / 100 + 1}</span>
+            <button type="button" disabled={Boolean(busy) || !page.previousCursor} onClick={() => loadEntries(appliedFilters, page.previousCursor!)} className="rounded-lg border border-white/10 px-3 py-2 text-sm disabled:opacity-40">{recovery.previous}</button>
+            <button type="button" disabled={Boolean(busy) || !page.nextCursor} onClick={() => loadEntries(appliedFilters, page.nextCursor!)} className="rounded-lg border border-white/10 px-3 py-2 text-sm disabled:opacity-40">{recovery.next}</button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -257,18 +254,5 @@ function FilterInput({
         className="w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none placeholder:text-white/35 focus:border-amber-400/35"
       />
     </label>
-  );
-}
-
-function FeedbackBanner({ feedback }: { feedback: Feedback }) {
-  return (
-    <div className={`flex items-start gap-2 rounded-lg border px-3 py-2 text-sm ${
-      feedback.type === 'success'
-        ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200'
-        : 'border-red-500/20 bg-red-500/10 text-red-200'
-    }`}>
-      {feedback.type === 'success' ? <CheckCircle size={16} className="mt-0.5 shrink-0" /> : <AlertCircle size={16} className="mt-0.5 shrink-0" />}
-      <span>{feedback.text}</span>
-    </div>
   );
 }

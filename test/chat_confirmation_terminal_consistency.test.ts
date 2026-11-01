@@ -31,7 +31,7 @@ vi.mock('../server/agents/rag', async importOriginal => {
 });
 
 import { initDatabase, readDB, querySQL } from '../db_layer';
-import { getConversationActionStateByTaskId } from '../server/conversation/action_ledger';
+import { getConversationActionStateByTaskId } from "../server/conversation/ledger/queries";
 import { getConversationActionTurn } from '../server/conversation/action_turn_ledger';
 import { getOrCreateActiveConversation, startIsolatedConversation } from '../server/conversation/manager';
 import { registerChatHandler } from '../server/socket/chat';
@@ -263,9 +263,8 @@ describe('chat pending-confirmation terminal consistency', () => {
       const context = args[11];
       const requestTurn = modelTurn;
       modelTurn += 1;
-      const proposed = requestTurn === 0
-        ? { name: 'write_file', arguments: { path: targets[0], content } }
-        : context.runtimeOwnedDeterministicRecoveryCall;
+      Object.assign(context, await context.prepareSelectedToolCall());
+      const proposed = { name: 'write_file', arguments: { path: targets[requestTurn], content } };
       expect(proposed).toMatchObject({
         name: 'write_file',
         arguments: { path: targets[requestTurn], content },
@@ -279,7 +278,7 @@ describe('chat pending-confirmation terminal consistency', () => {
           taskId: context.taskId,
           turnId: context.requestId,
           requestId: context.requestId,
-          executionOrigin: requestTurn === 0 ? 'model_selected' : 'deterministic_route',
+          executionOrigin: 'model_selected',
           name: proposed.name,
           arguments: proposed.arguments,
           result: 'Tool "write_file" requires user confirmation and was not approved.',
@@ -375,8 +374,8 @@ describe('chat pending-confirmation terminal consistency', () => {
       },
     });
 
-    const status = await send(statusRequestId, '当前任务状态怎么样');
-    expect(status).toMatchObject({
+    const status = await send(statusRequestId, '刚才的任务状态怎么样');
+    expect(status, JSON.stringify(status)).toMatchObject({
       reason: 'task_status',
       finalized: true,
       blocked: false,
@@ -504,6 +503,7 @@ describe('chat pending-confirmation terminal consistency', () => {
     const confirmationRequestId = `fast-confirm-${suffix}`;
     mocks.runWithTools.mockImplementation(async (...args: any[]) => {
       expect(args[11].requestId).toBe(proposalRequestId);
+      Object.assign(args[11], await args[11].prepareSelectedToolCall());
       expect(await args[11].requestConfirmation('write_file', { path: target, content })).toBe(false);
       return { text: 'waiting confirmation', toolCalls: [], usageRecords: [] };
     });

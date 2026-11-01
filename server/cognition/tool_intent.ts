@@ -1,4 +1,9 @@
-import { withoutNegatedLookupClauses, isStoredMemoryRecallQuestion } from './normalized_action_intent';
+import { hasExplicitNoToolInstruction } from './no_tool_instruction';
+import { actionInstructionClauses } from './action_instruction_clauses';
+export { hasExplicitNoToolInstruction } from './no_tool_instruction';
+import type { ActionIntentAnalysis } from './normalized_action_intent';
+import { CLIENT_STATE_INSPECTION_REQUEST, withoutNegatedLookupClauses, isStoredMemoryRecallQuestion, hasAffirmativeArtifactMutationAction } from './normalized_action_intent';
+import { withoutLocationLiterals } from './location_literals';
 import {
   detectRequestedOperationMode,
   isPureOperationModeSwitchRequest,
@@ -10,6 +15,7 @@ import { normalizeActionIntent } from './normalized_action_intent';
 import { isReadOnlyKnowledgeBaseInspectionRequest } from './knowledge_intent';
 import { isVideoPlaybackRequest } from './media_intent';
 import { isExternalCliRequest } from './external_cli_intent';
+import { isModelConfigurationReadRequest } from './model_configuration_intent';
 
 interface IntentGrammarRule {
   name: string;
@@ -53,54 +59,54 @@ export interface ToolIntentDecisionTrace {
     autonomousTask: boolean;
   };
 }
-const EXPLICIT_NO_TOOL_PATTERNS: RegExp[] = [
-  // i18n-allow: discussion-only planning requests, not user-facing copy.
-  /(?:^|[。！？；;，,：:]|\s)(?:请)?(?:现在|这次|先)?(?:只|仅)(?:告诉我|说说|说明|解释)(?:你)?(?:准备|打算|计划)?(?:怎么做|如何做|怎样做|执行步骤|计划|方案)/u,
-  /\b(?:first\s+)?(?:only|just)\s+(?:tell\s+me|explain|describe)\s+(?:how\s+you\s+(?:would|plan\s+to)|(?:the|your)\s+plan)\b/iu,
-  /(?:\u4e0d\u8981|\u522b|\u65e0\u9700|\u4e0d\u7528)\s*(?:\u518d)?(?:\u6267\u884c|\u8fdb\u884c|\u505a)\s*(?:\u4efb\u4f55|\u65b0\u7684?|\u5176\u4ed6|\u5176\u5b83)?\s*(?:\u64cd\u4f5c|\u52a8\u4f5c|\u4efb\u52a1)/u,
-  // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
-  /(?:不要|别|无需|不需要|不用|禁止|请勿|勿)\s*(?:再|继续|再次)?\s*(?:调用|使用|执行|启动)?\s*(?:(?:任何|这些|外部|新(?:的)?|其他|其它)\s*){0,3}(?:工具|插件|技能|脚本)(?!(?:说明|介绍|解释|清单|列表|文档))/u,
-  /不\s*(?:再|继续)?\s*(?:调用|使用|执行|启动)\s*(?:(?:任何|这些|外部|新(?:的)?|其他|其它)\s*){0,3}(?:工具|插件|技能|脚本)/u,
-  /(?:只|仅)\s*(?:回复|回答|解释|复述|确认)\s*[,，、]?\s*(?:不要|别|无需|不用)\s*(?:调用|使用|执行)?\s*(?:工具|插件|技能|脚本)/u,
-  /\b(?:do\s+not|don't|without|no)\s+(?:call(?:ing)?|use|using|run(?:ning)?|execute|executing)?\s*(?:any\s+)?(?:tools?|plugins?|skills?|scripts?)\b/i,
-  /\b(?:reply|answer|explain|repeat)\s+only\b[^.!?\n]{0,24}\b(?:no|without)\s+(?:tools?|plugins?|skills?|scripts?)\b/i,
+
+
+// The broad read-only/action veto is shared with local mutation recognition;
+// scoped file/settings limits must not acquire that whole-turn meaning.
+// i18n-allow: Existing no-mutation and read-only input grammar, not tool routing.
+const WHOLE_TURN_READ_ONLY = /(?:^|[，,。；;\n])\s*(?:只读(?!取)|read[- ]only)/iu;
+const LOCAL_NEGATION_CN = String.raw`(?:不要|不|别|无需|不用|禁止|请勿|勿)\s*(?:再|继续|重新)?\s*`;
+const LOCAL_NEGATION_EN = String.raw`\b(?:do\s+not|don't|without)\s+`;
+// i18n-allow: Existing negative instruction and clause-boundary recognition.
+const WHOLE_TURN_NO_ACTION_CN = new RegExp(LOCAL_NEGATION_CN + String.raw`(?:操作|(?:执行|推进)(?:\s*(?:或|和|及)\s*(?:执行|推进))?\s*(?:任何|后续|新|当前|现有|所有|全部)?\s*(?:步骤|任务|工作|动作|操作))`, 'u');
+const WHOLE_TURN_NO_ACTION_EN = new RegExp(LOCAL_NEGATION_EN + String.raw`(?:execute|advance)(?:\s+(?:or|and)\s+(?:execute|advance))?\s+(?:(?:any|new|further|current|existing|all)\s+)?(?:steps?|tasks?|work|actions?)\b`, 'iu');
+const EXPLICIT_NO_LOCAL_MUTATION_PATTERNS: RegExp[] = [
+  WHOLE_TURN_READ_ONLY, WHOLE_TURN_NO_ACTION_CN, WHOLE_TURN_NO_ACTION_EN,
+  // i18n-allow: Existing negative instruction and clause-boundary recognition.
+  new RegExp(LOCAL_NEGATION_CN + String.raw`(?:修改|改动|写入|保存|覆盖|删除|(?:改写|创建|新建|生成|起草|撰写|制作|整理成|做一份|给我一份)(?:(?:这|该|当前|任何|原|新)?(?:个|份)?\s*(?:文件|文档|内容|页面|系统|数据|图片|图像|视频|草稿|它)|(?=\s*(?:$|[，,。！？!?；;、\n]|或|和|及))))`, 'u'),
+  // i18n-allow: Existing negative instruction and clause-boundary recognition.
+  /(?:保持|保留)\s*(?:原|源)?(?:文件|文档|数据)(?:原样|不变)|(?:原|源)(?:文件|文档|数据)\s*(?:不动|不变|保持原样)/u,
+  new RegExp(LOCAL_NEGATION_EN + String.raw`(?:(?:modify|edit|write|save|overwrite|delete|change)\b|(?:create|generate|draft)\b(?=\s*(?:(?:(?:the|this|that|any|all|new|original|current)\s+)?(?:files?|documents?|content|pages?|systems?|data|images?|pictures?|videos?|drafts?|it)\b|$|[.,;!?\n])))`, 'iu'),
 ];
 
-/** A hard, current-turn veto shared by chat and voice tool routing. */
-export function hasExplicitNoToolInstruction(text: string): boolean {
+// The same existing prohibition verbs are scoped to external effects, not all local creation.
+const EXPLICIT_NO_EXTERNAL_COMMIT_PATTERNS: RegExp[] = [
+  // i18n-allow: Existing negative instruction and clause-boundary recognition.
+  /(?:不要|不|别|无需|不用|禁止|请勿|勿)\s*(?:再|继续)?\s*(?:发送|提交)/u,
+  /\b(?:do\s+not|don't|without)\s+(?:send|submit)\b/iu,
+];
+
+export function explicitNoMutationScope(text: string): { local: boolean; external: boolean; allEffects: boolean } {
   const normalized = String(text || '').trim();
-  if (!normalized) return false;
-  if (/(?:不是|并非|并不是)\s*(?:不要|别|不用|无需).{0,8}(?:工具|插件|技能|脚本)/u.test(normalized)) {
-    return false;
-  }
-  return EXPLICIT_NO_TOOL_PATTERNS.some(pattern => pattern.test(normalized));
+  // i18n-allow: preserve the existing double-negative input boundary.
+  if (!normalized || /(?:不是|并非|并不是)\s*(?:不要|别|不用|无需).{0,12}(?:修改|改动|写入|保存|创建|生成|操作|执行|推进)/u.test(normalized)) return { local: false, external: false, allEffects: false };
+  return {
+    local: EXPLICIT_NO_LOCAL_MUTATION_PATTERNS.some(pattern => pattern.test(normalized)),
+    external: EXPLICIT_NO_EXTERNAL_COMMIT_PATTERNS.some(pattern => pattern.test(normalized)),
+    allEffects: WHOLE_TURN_READ_ONLY.test(normalized) || WHOLE_TURN_NO_ACTION_CN.test(normalized)
+      || WHOLE_TURN_NO_ACTION_EN.test(normalized) || hasExplicitNoToolInstruction(normalized),
+  };
 }
-
-const EXPLICIT_NO_MUTATION_PATTERNS: RegExp[] = [
-  // i18n-allow: Chinese prohibition input recognition, not user-visible copy.
-  /(?:不要|不|别|无需|不用|禁止|请勿|勿)\s*(?:再|继续)?\s*(?:修改|改动|改写|写入|保存|覆盖|创建|新建|生成|删除|发送|提交|操作)(?:这|该|当前|任何|原)?(?:个|份)?\s*(?:文件|文档|内容|页面|系统|数据)?/u,
-  /(?:保持|保留)\s*(?:原|源)?(?:文件|文档|数据)(?:原样|不变)|(?:原|源)(?:文件|文档|数据)\s*(?:不动|不变|保持原样)/u, // i18n-allow: Chinese preservation input recognition.
-  /\b(?:do\s+not|don't|without)\s+(?:modify|edit|write|save|overwrite|create|delete|send|submit|change)\b/iu,
-];
 
 /** A current-turn veto for side-effecting tools while preserving read-only inspection. */
 export function hasExplicitNoMutationInstruction(text: string): boolean {
-  const normalized = String(text || '').trim();
-  if (!normalized) return false;
-  if (/(?:不是|并非|并不是)\s*(?:不要|别|不用|无需).{0,12}(?:修改|改动|写入|保存|创建|生成|操作)/u.test(normalized)) {
-    return false;
-  }
-  return EXPLICIT_NO_MUTATION_PATTERNS.some(pattern => pattern.test(normalized));
+  const scope = explicitNoMutationScope(text);
+  return scope.local || scope.external;
 }
 
 /** The positive artifact operation, with prohibited operations removed. */
 export function hasRequestedArtifactMutation(text: string): boolean {
-  const positive = EXPLICIT_NO_MUTATION_PATTERNS.reduce(
-    (value, pattern) => value.replace(new RegExp(pattern.source, `${pattern.flags.replace('g', '')}g`), ' '),
-    String(text || ''),
-  );
-  // i18n-allow: multilingual task-operation recognition, not user-facing copy.
-  return /(?:创建|新建|写入|编辑|修改|更新|追加|替换|删除|重命名|移动|复制|保存|另存|导出|生成|覆盖)|\b(?:creat(?:e|es|ed|ing)|writ(?:e|es|ing|ten)|edit(?:s|ed|ing)?|modif(?:y|ies|ied|ying)|updat(?:e|es|ed|ing)|append(?:s|ed|ing)?|replac(?:e|es|ed|ing)|delet(?:e|es|ed|ing)|remov(?:e|es|ed|ing)|renam(?:e|es|ed|ing)|mov(?:e|es|ed|ing)|copy|copies|copied|copying|sav(?:e|es|ed|ing)|export(?:s|ed|ing)?|generat(?:e|es|ed|ing)|overwrit(?:e|es|ing|ten))\b/iu.test(positive);
+  return hasAffirmativeArtifactMutationAction(text);
 }
 
 const CLIENT_NAVIGATION_VERBS = /(?:\u6253\u5f00|\u8fdb\u5165|\u53bb|\u770b\u770b|\u5207\u6362|\u5207\u5230|\u6362\u5230|\u542f\u52a8|\u5f00\u542f|\u5f00\u59cb|\u5c55\u5f00|\u9000\u51fa|\u6536\u8d77|\u5173\u95ed|\u5173\u6389|\u56de\u5230|\u8fd4\u56de|\b(?:open|show|enter|switch|start|expand|exit|hide|close|collapse|return|go back)\b)/iu;
@@ -111,10 +117,10 @@ const EXTERNAL_APP_CONTEXT = /(?:\u5fae\u4fe1|\u4f01\u4e1a\u5fae\u4fe1|\u98de\u4
 const LUMI_CLIENT_CONTEXT = /(?:Lumi|\u5ba2\u6237\u7aef|\u4e2d\u67a2|\u4e16\u754c\u89c6\u56fe|\u4e91\u7aef\u753b\u5e03|\u6280\u80fd\u5927\u5385|\u8fd0\u884c\u65e5\u5fd7|\u8bbe\u7f6e|\u5c0f\u7ec4\u4ef6|\b(?:client|nexus|cloud canvas|world view|skill center|settings|runtime log|widget)\b)/iu;
 
 function canonicalIntentOwnsNonClientAction(
-  kind: ReturnType<typeof normalizeActionIntent>['kind'],
+  canonical: ReturnType<typeof normalizeActionIntent>,
   text: string,
 ): boolean {
-  if (kind === 'desktop_operation') return EXTERNAL_APP_CONTEXT.test(text);
+  if (canonical.kind === 'desktop_operation') return canonical.sideEffectClass === 'local_write' || EXTERNAL_APP_CONTEXT.test(text);
   return [
     'external_ai_history',
     'external_cli_status',
@@ -129,7 +135,7 @@ function canonicalIntentOwnsNonClientAction(
     'scheduled_task',
     'work_task',
     'workflow',
-  ].includes(kind);
+  ].includes(canonical.kind);
 }
 const SKILL_TERMS = /(?:\u6280\u80fd|\u6280\u80fd\u5927\u5385|\b(?:skill|skills|plugin|mcp)\b)/iu;
 const INSTALL_VERBS = /(?:\u5b89\u88c5|\u88c5\u4e0a|\u88c5\u4e00\u4e0b|\binstall\b)/iu;
@@ -227,7 +233,7 @@ const CLIENT_ACTION_INTENT_PATTERNS: RegExp[] = [
   /\b(switch|change|set|enter|open|start|turn\s+on)\b.*\b(chat|assistant|meeting|music|auto(?:nomous)?|auto\s+execute|autonomous)\s+mode\b/i,
   /\b(open|start|show|hide|close|inspect|check)\b.*\b(nexus|nexus\s+view|cloud\s+canvas|world\s+view|client|meeting\s+notes?|music\s+center|mood\s+layer|knowledge\s+base|runtime\s+log|run\s+logs?|logs?|settings|wallpaper\s+mode|organization|org\s+workspace|cloud|files?|skills?|tools?|avatar|sound\s+studio|devices?|sync|kernel|monitor|plan|planner)\b/i,
   /\b(play|put\s+on|listen\s+to)\b.*\b(music|song|playlist|album)\b/i,
-  /(?:\u5207\u6362|\u5207\u5230|\u6362\u5230|\u8fdb\u5165|\u6253\u5f00|\u5f00\u542f|\u542f\u52a8|\u5f00\u59cb|\u53bb|\u770b\u770b|\u68c0\u67e5|\u67e5|\u6478\u7d22).*(?:\u81ea\u5df1\u7684\u5ba2\u6237\u7aef|\u5ba2\u6237\u7aef|\u4e2d\u67a2\u4e16\u754c|\u4e2d\u67a2|\u4e16\u754c\u89c6\u56fe|\u4e91\u7aef\u753b\u5e03|\u804a\u5929|\u52a9\u624b|\u4f1a\u8bae|\u97f3\u4e50|\u81ea\u52a8\u6267\u884c|\u81ea\u4e3b\u6267\u884c|\u4f1a\u8bae\u6a21\u5f0f|\u97f3\u4e50\u6a21\u5f0f|\u52a9\u624b\u6a21\u5f0f|\u804a\u5929\u6a21\u5f0f|\u6c1b\u56f4\u5c42|\u97f3\u4e50\u4e2d\u5fc3|\u77e5\u8bc6\u5e93|\u8fd0\u884c\u65e5\u5fd7|\u65e5\u5fd7|\u8bbe\u7f6e|\u58c1\u7eb8\u6a21\u5f0f|\u7ec4\u7ec7|\u4e91\u7aef|\u6587\u4ef6|\u6587\u4ef6\u7ba1\u7406\u5668|\u6587\u4ef6\u4e2d\u5fc3|\u6280\u80fd|\u6280\u80fd\u5927\u5385|\u5de5\u5177|\u5f62\u8c61|\u58f0\u97f3|\u8bbe\u5907|\u540c\u6b65|\u5185\u6838|\u76d1\u63a7|\u8ba1\u5212|\u56e2\u961f)/u,
+  /(?:\u5207\u6362|\u5207\u5230|\u6362\u5230|\u8fdb\u5165|\u6253\u5f00|\u5f00\u542f|\u542f\u52a8|\u5f00\u59cb|\u53bb|\u770b\u770b|\u68c0\u67e5|\u67e5|\u6478\u7d22)[^，,。！？.!?；;\n]{0,24}(?:\u81ea\u5df1\u7684\u5ba2\u6237\u7aef|\u5ba2\u6237\u7aef|\u4e2d\u67a2\u4e16\u754c|\u4e2d\u67a2|\u4e16\u754c\u89c6\u56fe|\u4e91\u7aef\u753b\u5e03|\u804a\u5929|\u52a9\u624b|\u4f1a\u8bae|\u97f3\u4e50|\u81ea\u52a8\u6267\u884c|\u81ea\u4e3b\u6267\u884c|\u4f1a\u8bae\u6a21\u5f0f|\u97f3\u4e50\u6a21\u5f0f|\u52a9\u624b\u6a21\u5f0f|\u804a\u5929\u6a21\u5f0f|\u6c1b\u56f4\u5c42|\u97f3\u4e50\u4e2d\u5fc3|\u77e5\u8bc6\u5e93|\u8fd0\u884c\u65e5\u5fd7|\u65e5\u5fd7|\u8bbe\u7f6e|\u58c1\u7eb8\u6a21\u5f0f|\u7ec4\u7ec7|\u4e91\u7aef|\u6587\u4ef6|\u6587\u4ef6\u7ba1\u7406\u5668|\u6587\u4ef6\u4e2d\u5fc3|\u6280\u80fd|\u6280\u80fd\u5927\u5385|\u5de5\u5177|\u5f62\u8c61|\u58f0\u97f3|\u8bbe\u5907|\u540c\u6b65|\u5185\u6838|\u76d1\u63a7|\u8ba1\u5212|\u56e2\u961f)/u,
   /(?:\u653e|\u64ad\u653e|\u542c).*(?:\u97f3\u4e50|\u6b4c|\u6b4c\u66f2|\u6b4c\u5355|\u4e13\u8f91)/u,
 ];
 
@@ -235,7 +241,7 @@ const CLIENT_ACTION_ONLY_PATTERNS: RegExp[] = [
   /\b(switch|change|set|enter|open|start|turn\s+on)\b.*\b(chat|assistant|meeting|music|auto(?:nomous)?|auto\s+execute|autonomous)\s+mode\b/i,
   /\b(open|start|show|hide|close|inspect|check)\b.*\b(nexus|nexus\s+view|cloud\s+canvas|world\s+view|client|meeting\s+notes?|music\s+center|mood\s+layer|knowledge\s+base|runtime\s+log|run\s+logs?|logs?|settings|wallpaper\s+mode|organization|org\s+workspace|cloud|skill\s+center|skills?|tools?|avatar|sound\s+studio|devices?|sync|kernel|monitor|plan|planner|file\s+manager|files\s+app)\b/i,
   /\b(play|put\s+on|listen\s+to)\b.*\b(music|song|playlist|album)\b/i,
-  /(?:\u5207\u6362|\u5207\u5230|\u6362\u5230|\u8fdb\u5165|\u6253\u5f00|\u5f00\u542f|\u542f\u52a8|\u5f00\u59cb|\u53bb|\u770b\u770b|\u68c0\u67e5|\u67e5|\u6478\u7d22).*(?:\u81ea\u5df1\u7684\u5ba2\u6237\u7aef|\u5ba2\u6237\u7aef|\u4e2d\u67a2\u4e16\u754c|\u4e2d\u67a2|\u4e16\u754c\u89c6\u56fe|\u4e91\u7aef\u753b\u5e03|\u804a\u5929|\u52a9\u624b|\u4f1a\u8bae|\u97f3\u4e50|\u81ea\u52a8\u6267\u884c|\u81ea\u4e3b\u6267\u884c|\u4f1a\u8bae\u6a21\u5f0f|\u97f3\u4e50\u6a21\u5f0f|\u52a9\u624b\u6a21\u5f0f|\u804a\u5929\u6a21\u5f0f|\u6c1b\u56f4\u5c42|\u97f3\u4e50\u4e2d\u5fc3|\u77e5\u8bc6\u5e93|\u8fd0\u884c\u65e5\u5fd7|\u65e5\u5fd7|\u8bbe\u7f6e|\u58c1\u7eb8\u6a21\u5f0f|\u7ec4\u7ec7|\u4e91\u7aef|\u6280\u80fd|\u6280\u80fd\u5927\u5385|\u5de5\u5177|\u5f62\u8c61|\u58f0\u97f3|\u8bbe\u5907|\u540c\u6b65|\u5185\u6838|\u76d1\u63a7|\u8ba1\u5212|\u56e2\u961f|\u6587\u4ef6\u7ba1\u7406\u5668|\u6587\u4ef6\u4e2d\u5fc3)/u,
+  /(?:\u5207\u6362|\u5207\u5230|\u6362\u5230|\u8fdb\u5165|\u6253\u5f00|\u5f00\u542f|\u542f\u52a8|\u5f00\u59cb|\u53bb|\u770b\u770b|\u68c0\u67e5|\u67e5|\u6478\u7d22)[^，,。！？.!?；;\n]{0,24}(?:\u81ea\u5df1\u7684\u5ba2\u6237\u7aef|\u5ba2\u6237\u7aef|\u4e2d\u67a2\u4e16\u754c|\u4e2d\u67a2|\u4e16\u754c\u89c6\u56fe|\u4e91\u7aef\u753b\u5e03|\u804a\u5929|\u52a9\u624b|\u4f1a\u8bae|\u97f3\u4e50|\u81ea\u52a8\u6267\u884c|\u81ea\u4e3b\u6267\u884c|\u4f1a\u8bae\u6a21\u5f0f|\u97f3\u4e50\u6a21\u5f0f|\u52a9\u624b\u6a21\u5f0f|\u804a\u5929\u6a21\u5f0f|\u6c1b\u56f4\u5c42|\u97f3\u4e50\u4e2d\u5fc3|\u77e5\u8bc6\u5e93|\u8fd0\u884c\u65e5\u5fd7|\u65e5\u5fd7|\u8bbe\u7f6e|\u58c1\u7eb8\u6a21\u5f0f|\u7ec4\u7ec7|\u4e91\u7aef|\u6280\u80fd|\u6280\u80fd\u5927\u5385|\u5de5\u5177|\u5f62\u8c61|\u58f0\u97f3|\u8bbe\u5907|\u540c\u6b65|\u5185\u6838|\u76d1\u63a7|\u8ba1\u5212|\u56e2\u961f|\u6587\u4ef6\u7ba1\u7406\u5668|\u6587\u4ef6\u4e2d\u5fc3)/u,
   /(?:\u653e|\u64ad\u653e|\u542c).*(?:\u97f3\u4e50|\u6b4c|\u6b4c\u66f2|\u6b4c\u5355|\u4e13\u8f91)/u,
 ];
 
@@ -248,7 +254,6 @@ CLIENT_ACTION_ONLY_PATTERNS.push(/(?:\u6253\u5f00|\u8fdb\u5165|\u53bb|\u770b\u77
 // informational in wording but still require the safe client_get_state tool.
 // Keep this separate from broad capability questions so ordinary conversation
 // does not unexpectedly gain desktop access.
-const CLIENT_STATE_INSPECTION_REQUEST = /(?:(?:介绍|说明|讲讲|告诉我|查看|检查).{0,24}(?:Lumi\s*)?客户端.{0,24}(?:每一?个|各个|所有|全部)?(?:页面|界面|模块)|(?:Lumi\s*)?客户端.{0,24}(?:每一?个|各个|所有|全部)(?:页面|界面|模块).{0,24}(?:干什么|作用|功能|用途|介绍|说明))/iu; // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
 
 CLIENT_ACTION_INTENT_PATTERNS.push(CLIENT_STATE_INSPECTION_REQUEST);
 CLIENT_ACTION_ONLY_PATTERNS.push(CLIENT_STATE_INSPECTION_REQUEST);
@@ -257,7 +262,7 @@ const DIAGNOSTIC_OR_REPAIR_PATTERNS: RegExp[] = [
   /\b(what happened|what went wrong|diagnose|debug|fix|repair|recover|self[-\s]?check|self[-\s]?heal|not working|doesn'?t work|broken|failed|failure|error|crash(?:ed)?|stuck|hang(?:ing)?|blank screen|white screen|no sound|silent|cannot|can'?t)\b/i,
   /\bwhy\b.*\b(not|can'?t|cannot|failed?|failure|error|broken|wrong|crash(?:ed)?|stuck|hang(?:ing)?|blank|silent|doesn'?t\s+work|not\s+working)\b/i,
   /(?:\u4e0d\u4f1a|\u4e0d\u80fd|\u65e0\u6cd5).*(?:\u6253\u5f00|\u542f\u52a8|\u8fd0\u884c|\u6267\u884c|\u5b89\u88c5|\u63a8\u9001|\u90e8\u7f72|\u751f\u6210|\u8bfb|\u8fde\u63a5|\u63a5\u5165|\u767b\u5f55|\u767b\u9646|\u64ad\u653e|\u5b8c\u6210|\u751f\u6548|\u5de5\u4f5c|\u8c03\u7528|\u4f7f\u7528)/u,
-  /(?:(?:\u4e3a\u4ec0\u4e48|\u4e3a\u5565).*(?:\u6ca1|\u4e0d|\u65e0\u6cd5|\u5931\u8d25|\u9519|\u62a5\u9519|\u5d29|\u5361|\u95ee\u9898|\u6545\u969c|\u5b8c\u6210|\u751f\u6548|\u6253\u5f00|\u653e\u51fa|\u58f0\u97f3|\u542c\u89c1)|\u600e\u4e48\u56de\u4e8b|\u54ea\u91cc.*(?:\u95ee\u9898|\u574f|\u6ca1\u8dd1\u901a)|\u8bca\u65ad|\u6392\u67e5|\u4fee\u590d|\u5904\u7406.*(?:\u95ee\u9898|\u6545\u969c|\u9519\u8bef)|\u81ea\u68c0|\u81ea\u4fee\u590d|\u6062\u590d|\u62a5\u9519|\u9519\u8bef|\u5931\u8d25|\u5d29\u4e86|\u5d29\u6e83|\u5361\u4f4f|\u5361\u6b7b|\u767d\u5c4f|\u6ca1\u53cd\u5e94|\u4e0d\u751f\u6548|\u4e0d\u8d77\u4f5c\u7528|\u6253\u4e0d\u5f00|\u653e\u4e0d\u51fa|\u6ca1\u58f0\u97f3|\u542c\u4e0d\u89c1|\u4e0d\u5bf9|\u6709\u95ee\u9898|\u88ab\u9650\u5236|\u9650\u5236)/u,
+  /(?:(?:\u4e3a\u4ec0\u4e48|\u4e3a\u5565).*(?:\u6ca1|\u4e0d|\u65e0\u6cd5|\u5931\u8d25|\u9519|\u62a5\u9519|\u5d29|\u5361|\u95ee\u9898|\u6545\u969c|\u5b8c\u6210|\u751f\u6548|\u6253\u5f00|\u653e\u51fa|\u58f0\u97f3|\u542c\u89c1)|\u600e\u4e48\u56de\u4e8b|\u54ea\u91cc.*(?:\u95ee\u9898|\u574f|\u6ca1\u8dd1\u901a)|\u8bca\u65ad|\u6392\u67e5|\u4fee\u590d|\u5904\u7406.*(?:\u95ee\u9898|\u6545\u969c|\u9519\u8bef)|\u81ea\u68c0|\u81ea\u4fee\u590d|\u6062\u590d|\u62a5\u9519|(?:\u53d1\u751f|\u51fa\u73b0|\u63d0\u793a|\u8fd0\u884c|\u542f\u52a8|\u6267\u884c)(?:\u4e86)?\u9519\u8bef|\u5931\u8d25|\u5d29\u4e86|\u5d29\u6e83|\u5361\u4f4f|\u5361\u6b7b|\u767d\u5c4f|\u6ca1\u53cd\u5e94|\u4e0d\u751f\u6548|\u4e0d\u8d77\u4f5c\u7528|\u6253\u4e0d\u5f00|\u653e\u4e0d\u51fa|\u6ca1\u58f0\u97f3|\u542c\u4e0d\u89c1|\u4e0d\u5bf9|\u6709\u95ee\u9898|\u88ab\u9650\u5236|\u9650\u5236)/u,
   /\b(?:HTTP\s*)?(?:400|404|500)\b/i,
 ];
 
@@ -309,7 +314,10 @@ export function isCoordinatedClientHealthRequest(text: string): boolean {
 }
 
 export function isCurrentClientDiagnosticRequest(text: string): boolean {
-  const normalized = String(text || '').trim();
+  // Location tokens are data, not the subject of a diagnostic. In particular,
+  // a report saved below D:/LumiCore-... must not make "check the formulas"
+  // look like "check Lumi".
+  const normalized = withoutLocationLiterals(text).trim();
   if (!normalized) return false;
   if (PRIOR_CLIENT_DIAGNOSTIC_INQUIRY_RE.test(normalized)) return false;
   if (/^(?:请|帮我)?(?:做一下|进行|执行|检查一下)?状态检查[。！!\s]*$/u.test(normalized)) return true; // i18n-allow: Standalone runtime status-check request.
@@ -340,10 +348,10 @@ function hasExplicitActionRequest(text: string): boolean {
  * or corrections, not fresh commands. Keep this narrow so real diagnostics
  * such as "为什么打不开 AutoCAD" can still use observation tools.
  */
-export function isUserCorrectionOrExplanationQuestion(text: string): boolean {
+export function isUserCorrectionOrExplanationQuestion(text: string, analysis?: ActionIntentAnalysis): boolean {
   const normalized = String(text || '').trim();
   if (!normalized) return false;
-  if (normalizeActionIntent(normalized).kind === 'correction_explanation') return true;
+  if (normalizeActionIntent(normalized, analysis).kind === 'correction_explanation') return true;
   if (PRIOR_CLIENT_DIAGNOSTIC_INQUIRY_RE.test(normalized)) return true;
   // A negated authorization is feedback about the preceding action, never a
   // fresh command. Keep this semantic and verb-based so corrections do not
@@ -375,7 +383,6 @@ export function isUserCorrectionOrExplanationQuestion(text: string): boolean {
     // Product-behaviour corrections such as “不要动不动就进入介绍客户端的界面”
     // are feedback, not requests to navigate the client right now.
     // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
-    /^(?:你|lumi)?[，,\s]*(?:能不能|不要|别|以后不要|别再|不准再)[^。！？!?\n]{0,80}(?:动不动|总是|老是|每次|随便|擅自)[^。！？!?\n]{0,80}(?:进入|打开|切换|跳到|回复|回答|说|讲)/iu,
     // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
     /^(?:你|lumi)[，,\s]*(?:刚才|刚刚|之前|上一轮|上一次)?[^。！？!?\n]{0,24}(?:为什么|怎么|为何|干嘛|做什么|干什么)[^。！？!?\n]{0,60}(?:这么久|这么慢|才回|才回复|打开|启动|运行|执行|操作|做了|干了)/iu,
     // i18n-allow: Chinese input-recognition pattern; not user-visible copy.
@@ -393,15 +400,28 @@ export function isUserCorrectionOrExplanationQuestion(text: string): boolean {
   ].some(pattern => pattern.test(normalized));
 }
 
-export function isInformationOnlyQuestion(text: string): boolean {
+export function isInformationOnlyQuestion(text: string, analysis?: ActionIntentAnalysis): boolean {
   if (isStoredMemoryRecallQuestion(text)) return true;
   if (isExternalAiHistoryCapabilityQuestion(text)) return true;
   if (isExternalAiHistoryActionRequest(text)) return false;
   // i18n-allow: Chinese input-recognition patterns; not user-visible copy.
   if (/(?:我问你)?(?:刚刚|刚才|之前|上一轮|上一次).{0,80}(?:干了什么|做了什么|操作了什么|打开.{0,24}干了什么|为什么.{0,40}(?:打开|操作|执行|回复))/u.test(text)) return true;
   if (/^(?:为什么|为何|怎么).{0,80}(?:没有|没|未能|不能).{0,40}(?:打开|启动|运行|执行|发送)/u.test(text)) return true; // i18n-allow: input recognition
-  if (isUserCorrectionOrExplanationQuestion(text)) return true;
-  if (isDiagnosticOrRepairRequest(text)) return false;
+  if (isUserCorrectionOrExplanationQuestion(text, analysis)) return true;
+  if (CLIENT_STATE_INSPECTION_REQUEST.test(text) || isDiagnosticOrRepairRequest(text, analysis)) return false;
+  // A user asking how to perform an operation does not request that operation.
+  // Keep a separate affirmative instruction executable, including after a question mark.
+  // i18n-allow: procedural-question grammar; not a fixed user-facing reply.
+  const methodQuestion = /^(?:(?:请问|请教|那|那么)\s*)?(?:(?:我|我们)(?:自己)?\s*)?(?:应该|该|要|需要)?\s*(?:怎么|如何|怎样)|^(?:请)?(?:教我|告诉我|说明)(?:具体)?\s*(?:怎么|如何|怎样)|^how\s+(?:do|can|should|would)\s+(?:I|we)\b/iu;
+  const clauses = actionInstructionClauses(text).map(clause => clause.probe.trim()).filter(Boolean);
+  if (clauses.some(clause => methodQuestion.test(clause)) && !clauses.some(clause => {
+    if (methodQuestion.test(clause)) return false;
+    // i18n-allow: Existing negative instruction and clause-boundary recognition.
+    const instruction = clause.replace(/^(?:然后|接着|随后|之后|同时|并且|再)\s*/u, '');
+    return hasExplicitActionRequest(instruction) || normalizeActionIntent(instruction, analysis).kind !== 'none'
+      || matchesIntentGrammar(instruction, STRUCTURED_TOOL_INTENT_RULES)
+      || TOOL_INTENT_PATTERNS.some(pattern => pattern.test(instruction));
+  })) return true;
   if (hasExplicitActionRequest(text)) return false;
   if (
     CLIENT_NAVIGATION_VERBS.test(text) &&
@@ -467,73 +487,51 @@ function hasExternalDesktopExecutionIntent(text: string): boolean {
   return EXTERNAL_DESKTOP_OBSERVATION_REQUEST.test(text);
 }
 
-export function hasExplicitToolIntent(text: string): boolean {
+export function hasExplicitToolIntent(text: string, analysis?: ActionIntentAnalysis): boolean {
   const normalized = withoutNegatedLookupClauses(text).trim();
   if (!normalized) return false;
   if (hasExplicitNoToolInstruction(normalized)) return false;
+  if (isModelConfigurationReadRequest(normalized)) return true;
   if (isExternalCliRequest(normalized)) return true;
   if (isVideoPlaybackRequest(normalized)) return true;
   if (isExternalAiHistoryActionRequest(normalized)) return true;
-  const canonical = normalizeActionIntent(normalized);
-  if (canonical.kind === 'external_ai_history') return !isInformationOnlyQuestion(normalized);
+  const canonical = normalizeActionIntent(normalized, analysis);
+  if (canonical.kind === 'external_ai_history') return !isInformationOnlyQuestion(normalized, analysis);
   if (canonical.kind === 'messaging_read' || canonical.kind === 'messaging_send') return true;
   if (canonical.kind === 'work_task') return true;
   if (canonical.kind === 'media_generation') return true;
   if (canonical.kind === 'correction_explanation' || canonical.kind === 'status_query') return false;
-  if (isInformationOnlyQuestion(normalized)) return false;
+  if (isInformationOnlyQuestion(normalized, analysis)) return false;
   if (matchesIntentGrammar(normalized, STRUCTURED_TOOL_INTENT_RULES)) return true;
   return TOOL_INTENT_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
-export function hasClientActionIntent(text: string): boolean {
+export function hasClientActionIntent(text: string, analysis?: ActionIntentAnalysis, only = false): boolean {
   const normalized = withoutNegatedLookupClauses(text).trim();
-  if (!normalized) return false;
-  if (hasExplicitNoToolInstruction(normalized)) return false;
-  if (isExternalAiHistoryActionRequest(normalized)) return false;
-  if (isReadOnlyKnowledgeBaseInspectionRequest(normalized)) return false;
-  const canonical = normalizeActionIntent(normalized);
+  if (!normalized || hasExplicitNoToolInstruction(normalized)
+    || isExternalAiHistoryActionRequest(normalized) || isReadOnlyKnowledgeBaseInspectionRequest(normalized)) return false;
+  const canonical = normalizeActionIntent(normalized, analysis);
+  const instruction = withoutLocationLiterals(normalized);
   if (canonical.kind === 'client_navigation' || canonical.kind === 'client_state') return true;
-  // Once the shared normalizer has identified a concrete non-client action,
-  // broad legacy surface words must not steal the turn.  This matters for
-  // payloads such as "Open WPS and type: Lumi ...": the word Lumi describes
-  // document content, not a request to navigate the Lumi client.
-  if (canonicalIntentOwnsNonClientAction(canonical.kind, normalized)) return false;
-  if (isInformationOnlyQuestion(normalized)) return false;
-  if (isDesktopMusicControlRequest(normalized)) return false;
-  if (detectRequestedOperationMode(normalized)) return true;
-  if (hasExternalDesktopExecutionIntent(normalized)) return false;
-  if (EXTERNAL_APP_CONTEXT.test(normalized) && !LUMI_CLIENT_CONTEXT.test(normalized) && !ORGANIZATION_WORKSPACE_SURFACES.test(normalized)) return false;
-  if (matchesIntentGrammar(normalized, STRUCTURED_CLIENT_ACTION_RULES)) return true;
-  return CLIENT_ACTION_INTENT_PATTERNS.some((pattern) => pattern.test(normalized));
+  if (canonicalIntentOwnsNonClientAction(canonical, instruction)
+    || isInformationOnlyQuestion(normalized, analysis) || isDesktopMusicControlRequest(normalized)) return false;
+  if (only && hasExternalDesktopExecutionIntent(instruction)) return false;
+  const requestedMode = detectRequestedOperationMode(instruction);
+  return Boolean(requestedMode && (!only || isPureOperationModeSwitchRequest(instruction, requestedMode)));
 }
 
-export function hasClientActionOnlyIntent(text: string): boolean {
-  const normalized = withoutNegatedLookupClauses(text).trim();
-  if (!normalized) return false;
-  if (hasExplicitNoToolInstruction(normalized)) return false;
-  if (isExternalAiHistoryActionRequest(normalized)) return false;
-  if (isReadOnlyKnowledgeBaseInspectionRequest(normalized)) return false;
-  const canonical = normalizeActionIntent(normalized);
-  if (canonical.kind === 'client_navigation' || canonical.kind === 'client_state') return true;
-  if (canonicalIntentOwnsNonClientAction(canonical.kind, normalized)) return false;
-  if (isInformationOnlyQuestion(normalized)) return false;
-  if (isDesktopMusicControlRequest(normalized)) return false;
-  if (hasExternalDesktopExecutionIntent(normalized)) return false;
-  const requestedMode = detectRequestedOperationMode(normalized);
-  if (requestedMode && isPureOperationModeSwitchRequest(normalized, requestedMode)) return true;
-  if (EXTERNAL_APP_CONTEXT.test(normalized) && !LUMI_CLIENT_CONTEXT.test(normalized) && !ORGANIZATION_WORKSPACE_SURFACES.test(normalized)) return false;
-  if (matchesIntentGrammar(normalized, STRUCTURED_CLIENT_ACTION_RULES)) return true;
-  return CLIENT_ACTION_ONLY_PATTERNS.some((pattern) => pattern.test(normalized));
+export function hasClientActionOnlyIntent(text: string, analysis?: ActionIntentAnalysis): boolean {
+  return hasClientActionIntent(text, analysis, true);
 }
 
-export function isDiagnosticOrRepairRequest(text: string): boolean {
+export function isDiagnosticOrRepairRequest(text: string, analysis?: ActionIntentAnalysis): boolean {
   const normalized = text.trim();
   if (!normalized) return false;
   // File and directory names are data, not instructions. A deliverable such as
   // `C:\\...\\repair-retest.txt` must stay on the artifact lane merely because
   // its path happens to contain a diagnostic keyword.
   const diagnosticText = normalized.replace(/\b[A-Za-z]:[\\/][^\s，。；;！？!?]+/gu, ' ');
-  if (isUserCorrectionOrExplanationQuestion(normalized)) return false;
+  if (isUserCorrectionOrExplanationQuestion(normalized, analysis)) return false;
   // A requested learning check is an evidence-only self inspection. Route it
   // through the diagnostic lane so Lumi must read the learning ledger and
   // client health instead of merely promising to perform a check later. i18n-allow: Reviewed input recognition.
@@ -547,20 +545,20 @@ export function isDiagnosticOrRepairRequest(text: string): boolean {
   return DIAGNOSTIC_OR_REPAIR_PATTERNS.some((pattern) => pattern.test(diagnosticText));
 }
 
-export function shouldAllowToolUseForTurn(text: string, source?: string, operationMode?: string): boolean {
+export function shouldAllowToolUseForTurn(text: string, source?: string, operationMode?: string, analysis?: ActionIntentAnalysis): boolean {
   if (hasExplicitNoToolInstruction(text)) return false;
   const mode = normalizeOperationMode(operationMode);
-  if (isDiagnosticOrRepairRequest(text)) return true;
-  if (mode === 'meeting') return hasClientActionIntent(text);
+  if (isDiagnosticOrRepairRequest(text, analysis)) return true;
+  if (mode === 'meeting') return hasClientActionIntent(text, analysis);
   if (hasVisionIntent(text)) return true;
   if (AUTONOMOUS_TASK_PATTERNS.some((pattern) => pattern.test(text.trim()))) return true;
-  if (hasExplicitToolIntent(text)) return true;
+  if (hasClientActionIntent(text, analysis) || hasExplicitToolIntent(text, analysis)) return true;
   return false;
 }
 
-export function traceToolIntentDecision(text: string, source?: string, operationMode?: string): ToolIntentDecisionTrace {
+export function traceToolIntentDecision(text: string, source?: string, operationMode?: string, analysis?: ActionIntentAnalysis): ToolIntentDecisionTrace {
   const normalized = withoutNegatedLookupClauses(text).trim();
-  const canonical = normalizeActionIntent(normalized);
+  const canonical = normalizeActionIntent(normalized, analysis);
   const mode = normalizeOperationMode(operationMode);
   const requestedMode = normalized ? detectRequestedOperationMode(normalized) : null;
   const matchedRules: ToolIntentMatchedRule[] = [];
@@ -568,25 +566,23 @@ export function traceToolIntentDecision(text: string, source?: string, operation
   if (requestedMode) pushRule(matchedRules, 'client_action', `operation-mode-request:${requestedMode}`);
   const explicitNoToolInstruction = normalized ? hasExplicitNoToolInstruction(normalized) : false;
 
-  const clientStateInspectionRequest = normalized ? CLIENT_STATE_INSPECTION_REQUEST.test(normalized) : false;
-  const externalAiHistoryAction = normalized ? isExternalAiHistoryActionRequest(normalized) : false;
   const correctionOrExplanation = normalized
-    ? canonical.kind === 'correction_explanation' || isUserCorrectionOrExplanationQuestion(normalized)
+    ? canonical.kind === 'correction_explanation' || isUserCorrectionOrExplanationQuestion(normalized, analysis)
     : false;
   const informationOnlyQuestion = normalized
     ? correctionOrExplanation
       || canonical.kind === 'status_query'
-      || (isInformationOnlyQuestion(normalized) && !clientStateInspectionRequest && !externalAiHistoryAction)
+      || isInformationOnlyQuestion(normalized, analysis)
     : false;
   const externalDesktopExecution = normalized
     ? (
-        canonicalIntentOwnsNonClientAction(canonical.kind, normalized)
+        canonicalIntentOwnsNonClientAction(canonical, normalized)
         || hasExternalDesktopExecutionIntent(normalized)
       )
     : false;
   const desktopMusicControl = normalized ? isDesktopMusicControlRequest(normalized) : false;
-  const diagnosticOrRepair = normalized && !informationOnlyQuestion
-    ? isDiagnosticOrRepairRequest(normalized)
+  const diagnosticOrRepair = normalized
+    ? isDiagnosticOrRepairRequest(normalized, analysis)
     : false;
   const diagnosticRules = diagnosticOrRepair
     ? matchPatternRuleNames(normalized, DIAGNOSTIC_OR_REPAIR_PATTERNS, 'diagnostic-pattern')
@@ -594,7 +590,7 @@ export function traceToolIntentDecision(text: string, source?: string, operation
   const matchedStructuredToolRules = !informationOnlyQuestion && normalized
     ? matchIntentGrammarRuleNames(normalized, STRUCTURED_TOOL_INTENT_RULES)
     : [];
-  const structuredToolRules = externalAiHistoryAction
+  const structuredToolRules = isExternalAiHistoryActionRequest(normalized)
     ? ['external-ai-history']
     : canonical.kind === 'messaging_read'
       ? ['messaging-read']
@@ -602,6 +598,7 @@ export function traceToolIntentDecision(text: string, source?: string, operation
         ? ['messaging-send']
         : matchedStructuredToolRules;
   if (canonical.kind === 'media_generation') structuredToolRules.push('media-generation');
+  if (isModelConfigurationReadRequest(normalized)) structuredToolRules.push('model-configuration-read');
   if (!informationOnlyQuestion && isVideoPlaybackRequest(normalized)) {
     structuredToolRules.push('video-playback');
   }
@@ -633,55 +630,20 @@ export function traceToolIntentDecision(text: string, source?: string, operation
   for (const name of autonomousTaskRules) pushRule(matchedRules, 'mode', name);
   if (visionIntent) pushRule(matchedRules, 'vision', 'vision-intent');
 
-  const explicitToolIntent = structuredToolRules.length > 0 || legacyToolRules.length > 0;
-  const clientActionIntent = canonical.kind === 'client_navigation'
-    || canonical.kind === 'client_state'
-    || Boolean(requestedMode)
-    || structuredClientRules.length > 0
-    || clientActionRules.length > 0;
-  const pureOperationModeSwitch = Boolean(
-    requestedMode && isPureOperationModeSwitchRequest(normalized, requestedMode),
-  );
-  const clientActionOnlyIntent = !externalDesktopExecution
-    && (
-      canonical.kind === 'client_navigation'
-      || canonical.kind === 'client_state'
-      || pureOperationModeSwitch
-      || structuredClientRules.length > 0
-      || clientActionOnlyRules.length > 0
-    );
+  // Trace observes the execution predicates; it never runs a second classifier.
+  const explicitToolIntent = hasExplicitToolIntent(text, analysis);
+  const clientActionIntent = hasClientActionIntent(text, analysis);
+  const clientActionOnlyIntent = hasClientActionOnlyIntent(text, analysis);
   const autonomousTask = autonomousTaskRules.length > 0;
-
-  let allowToolUse = false;
-  let decisionReason = 'no action signal matched';
-  if (!normalized) {
-    decisionReason = 'empty turn';
-  } else if (explicitNoToolInstruction) {
-    allowToolUse = false;
-    decisionReason = 'explicit current-turn no-tool instruction';
-  } else if (diagnosticOrRepair) {
-    allowToolUse = true;
-    decisionReason = 'diagnostic or repair wording enables self-inspection tools';
-  } else if (mode === 'meeting') {
-    allowToolUse = clientActionIntent;
-    decisionReason = allowToolUse
-      ? 'meeting mode allows client control action'
-      : 'meeting mode only allows client control action';
-  } else if (clientActionIntent) {
-    allowToolUse = true;
-    decisionReason = clientActionOnlyIntent
-      ? 'safe Lumi client-state/action request matched'
-      : 'Lumi client action request matched';
-  } else if (visionIntent) {
-    allowToolUse = true;
-    decisionReason = 'vision wording asks Lumi to inspect visible content';
-  } else if (autonomousTask) {
-    allowToolUse = true;
-    decisionReason = 'explicit continuing-task intent matched';
-  } else if (explicitToolIntent) {
-    allowToolUse = true;
-    decisionReason = 'explicit tool or work action matched';
-  }
+  const allowToolUse = shouldAllowToolUseForTurn(text, source, mode, analysis);
+  const decisionReason = !normalized ? 'empty turn'
+    : explicitNoToolInstruction ? 'explicit current-turn no-tool instruction'
+    : !allowToolUse ? mode === 'meeting' ? 'meeting mode only allows client control action' : 'no action signal matched'
+    : diagnosticOrRepair ? 'diagnostic or repair wording enables self-inspection tools'
+    : clientActionIntent ? clientActionOnlyIntent ? 'safe Lumi client-state/action request matched' : 'Lumi client action request matched'
+    : visionIntent ? 'vision wording asks Lumi to inspect visible content'
+    : autonomousTask ? 'explicit continuing-task intent matched'
+    : 'explicit tool or work action matched';
 
   const blockedBy: string[] = [];
   if (!allowToolUse) {
@@ -722,9 +684,17 @@ export function traceToolIntentDecision(text: string, source?: string, operation
  * from task corrections (for example "do not open Chrome; open WPS") so an
  * exact server-bound continuation can still execute the corrected task.
  */
-export function isConversationalProductFeedback(text: string): boolean {
-  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+export function isConversationalProductFeedback(text: string, analysis?: ActionIntentAnalysis): boolean {
+  const normalized = String(text || '').replace(/[^\S\n]+/g, ' ').trim();
   if (!normalized) return false;
+  // A media brief describes the requested artifact, not Lumi's chat UI.
+  // Words such as "bubble", "natural" and "do not" must not cancel the
+  // explicit creation operation. Current-turn tool/mutation vetoes remain
+  // enforced separately by the execution pipeline.
+  if (normalizeActionIntent(normalized, analysis).kind === 'media_generation') return false;
+  // A correction in one sentence must not consume a fresh inspection in the
+  // next. The execution pipeline independently preserves the no-mutation veto.
+  if (hasVisionIntent(withoutNegatedLookupClauses(normalized))) return false;
   const replyOrUiSubject = /(?:\u56de\u590d|\u56de\u7b54|\u56de\u5e94|\u6d88\u606f|\u8bdd\u672f|\u8868\u8fbe|\u8bf4\u8bdd\u65b9\u5f0f|\u8f93\u51fa|\u6392\u7248|\u683c\u5f0f|\u6362\u884c|\u5206\u6bb5|\u4e00\u5768|\u4e00\u5927\u6bb5|\u6c14\u6ce1|\u5b57\u4f53|\u663e\u793a|\u754c\u9762|\u63d0\u793a\u8bed|reply|answer|response|message|wording|format|layout|paragraph|line\s*break|bubble|display|ui)/iu.test(normalized);
   if (!replyOrUiSubject) return false;
   const preferenceOrCorrection = /(?:\u80fd\u4e0d\u80fd|\u53ef\u4e0d\u53ef\u4ee5|\u4ee5\u540e|\u4e0b\u6b21|\u6bcf\u6b21|\u603b\u662f|\u8001\u662f|\u4e0d\u8981|\u522b\u518d|\u522b\u603b|\u6211\u5e0c\u671b|\u9ebb\u70e6\u4f60|\u5e94\u8be5|can\s+you|could\s+you|please|from\s+now\s+on|stop|don't|do\s+not).{0,100}(?:\u4e0d\u8981|\u522b|\u6539\u6210|\u6362\u6210|\u5206\u6bb5|\u6362\u884c|\u6392\u7248|\u7b80\u6d01|\u6e05\u695a|\u81ea\u7136|\u597d\u770b|\u4e00\u5768|\u4e00\u5927\u6bb5|format|layout|paragraph|line\s*break|concise|clear|natural)|(?:\u4e0d\u8981|\u522b\u518d|\u522b\u603b).{0,100}(?:\u56de\u590d|\u56de\u7b54|\u6d88\u606f|\u8f93\u51fa|\u663e\u793a|reply|answer|message|display)/iu.test(normalized);

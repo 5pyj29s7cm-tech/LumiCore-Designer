@@ -1,4 +1,4 @@
-import { readDB, writeDB } from '../../db_layer';
+import { readDatabaseTables, commitDatabaseTables } from '../../db_layer';
 import { PRODUCT_VARIANT } from '../../shared/product_variant';
 import {
   isCurrentIndustryWorkflowExecutionRequest,
@@ -79,7 +79,7 @@ function saveStore(db: any, store: Record<string, IndustryGuidancePreference>): 
 export function getIndustryGuidancePreference(
   scope: IndustryGuidanceScope,
 ): IndustryGuidancePreference {
-  const stored = readStore(readDB())[preferenceKey(scope)];
+  const stored = readStore(readDatabaseTables(["settings"]))[preferenceKey(scope)];
   return {
     ...DEFAULT_PREFERENCE,
     ...(stored || {}),
@@ -94,7 +94,7 @@ export function setIndustryGuidancePreference(
   patch: Partial<Pick<IndustryGuidancePreference, 'level' | 'mode'>>
     & { familiarEntryId?: string },
 ): IndustryGuidancePreference {
-  const db = readDB();
+  const db = readDatabaseTables(["settings"]);
   const store = readStore(db);
   const key = preferenceKey(scope);
   const current = getIndustryGuidancePreference(scope);
@@ -109,7 +109,7 @@ export function setIndustryGuidancePreference(
   };
   store[key] = next;
   saveStore(db, store);
-  writeDB(db);
+  commitDatabaseTables(db);
   return { ...next, familiarEntryIds: [...next.familiarEntryIds] };
 }
 

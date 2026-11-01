@@ -227,7 +227,7 @@ describe('runtime data isolation', () => {
   });
 
   it('keeps explicit data roots isolated from the legacy cwd data importer', () => {
-    const source = fs.readFileSync(path.join(process.cwd(), 'db_layer.ts'), 'utf8');
+    const source = fs.readFileSync(path.join(process.cwd(), 'server', 'db', 'startup.ts'), 'utf8');
     const preflight = fs.readFileSync(
       path.join(process.cwd(), 'server', 'runtime', 'data_root_preflight.ts'),
       'utf8',
@@ -251,7 +251,11 @@ describe('runtime data isolation', () => {
       'server/stt/artifact_paths.ts',
     ];
     for (const consumer of consumers) {
-      const source = fs.readFileSync(consumer, 'utf8');
+      const legalDirectory = 'server/regions/packs/cn/legal_tools';
+      const source = consumer === 'server/regions/packs/cn/legal_tools.ts'
+        ? [consumer, ...fs.readdirSync(legalDirectory).filter(file => file.endsWith('.ts')).sort()
+            .map(file => path.join(legalDirectory, file))].map(file => fs.readFileSync(file, 'utf8')).join('\n')
+        : fs.readFileSync(consumer, 'utf8');
       expect(source).not.toMatch(/process\.cwd\(\).{0,80}lumi_output/);
       expect(source).not.toMatch(/path\.join\(process\.cwd\(\),\s*['"]data['"]/);
       expect(source).toMatch(/get(?:GeneratedOutputDir|DataDirectory|DataPath)/);

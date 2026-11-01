@@ -1,5 +1,6 @@
+import { cloneDatabaseValue } from '../server/db/snapshot_changes';
 import './helpers';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { initDatabase, readDB, writeDB } from '../db_layer';
 import {
   addMessage,
@@ -12,8 +13,14 @@ import {
   settleConversationActionExecutionRequest,
   setConversationActionExecutionStatus,
 } from '../server/conversation/manager';
-import { getConversationActionStateFromLedger } from '../server/conversation/action_ledger';
-import { normalizeActionIntent } from '../server/cognition/normalized_action_intent';
+import { getConversationActionStateFromLedger } from "../server/conversation/ledger/queries";
+import { genericExternalCommit, normalizeActionIntent } from '../server/cognition/normalized_action_intent';
+
+import { registerComputerUseTool } from '../server/tools/definitions/computer_use_tool';
+import { ToolRegistry } from '../server/tools/registry';
+
+const desktopBoundaryCalls = vi.hoisted(() => ({ loop: vi.fn() }));
+vi.mock('../server/agents/computer_use', () => ({ computerUseLoop: desktopBoundaryCalls.loop }));
 
 function durableActionState(conversationId: string, userId: string) {
   return getConversationActionStateFromLedger(readDB(), { conversationId, userId });
@@ -54,10 +61,17 @@ describe('conversation action continuation state', () => {
     expect(normalizeActionIntent(goal)).toMatchObject({ kind: 'workflow', sideEffectClass: 'local_write' });
     expect(durableActionState(conversation.id, userId)?.goal).toBe(goal);
   });
-  it('retains external-commit treatment for publishing a workflow to a public destination', () => {
+  it('refuses the same public workflow destinations at the selected desktop action boundary', async () => {
+    const registry = new ToolRegistry(); registerComputerUseTool(registry);
+    const desktopRelay = vi.fn();
+    desktopBoundaryCalls.loop.mockReset().mockRejectedValue(new Error('OFFLINE_DESKTOP_LOOP_SENTINEL'));
+    const context = { userId: 'external-boundary-offline', domain: 'personal', source: 'offline', authenticated: true, authRole: 'admin', localExecution: true, executionBoundary: 'trusted_local' as const, userConfirmed: true, currentTurnExecutionRequested: true, desktopRelay, llmGetters: { getDeepSeek: () => null, getGemini: () => null } };
     for (const text of ['发布工作流到 GitHub', '把工作流发布到官网', 'Publish workflow to GitHub']) {
-      expect(normalizeActionIntent(text)).toMatchObject({ kind: 'public_publish', sideEffectClass: 'external_commit' });
+      expect(genericExternalCommit(text)).toMatchObject({ kind: 'public_publish', sideEffectClass: 'external_commit' });
+      await expect(registry.execute('computer_use', { task: text }, { ...context, actionIntent: text })).rejects.toThrow('final external commit');
     }
+    expect(desktopBoundaryCalls.loop).not.toHaveBeenCalled();
+    expect(desktopRelay).not.toHaveBeenCalled();
   });
   it('hydrates a detailed workflow resumption from the ledger when the live pointer is absent', () => {
     const userId = `workflow-hydration-${Date.now()}`;
@@ -215,78 +229,248 @@ describe('conversation action continuation state', () => {
       });
   });
 
-  it('settles a durable CAD task when industry receipts use the canonical conversation task id', () => {
-    const userId = `conversation-industry-canonical-task-${Date.now()}-${Math.random()}`;
+  it('replays the formal WPS foreground sequence without replacing the blocked task or adopting LumiCore as its target', () => {
+    const nonce = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const userId = `wps-foreground-continuation-${nonce}`;
     const conversation = getOrCreateActiveConversation(userId, 'lumi', 'personal', '');
-    const instruction = '为暮蓝住宅生成并核验 DXF 和 SVG 预览。';
-    const requestId = 'request-cad-canonical';
-    const prepared = prepareConversationActionExecution({
+    const firstRequestId = `chat-wps-current-document-${nonce}`;
+    const firstText = '帮我分析一下wps当前打开的文件';
+    const firstMessageId = persistActionTurn({
       conversationId: conversation.id,
       userId,
-      userText: instruction,
-      requestId,
-      userMessageId: persistActionTurn({
-        conversationId: conversation.id,
-        userId,
-        userText: instruction,
-        requestId,
-      }),
-      toolPolicy: {
-        allowedTools: ['cad_generate_dxf', 'industry_workflow_complete'],
-        requireConfirmation: [],
-        forbiddenTools: [],
-        maxIterations: 8,
-      },
+      userText: firstText,
+      requestId: firstRequestId,
+    });
+    const toolPolicy = {
+      allowedTools: ['desktop_active_window', 'desktop_poll_activity'],
+      requireConfirmation: [],
+      forbiddenTools: [],
+      maxIterations: 4,
+    };
+    const first = prepareConversationActionExecution({
+      conversationId: conversation.id,
+      userId,
+      userText: firstText,
+      requestId: firstRequestId,
+      userMessageId: firstMessageId,
+      toolPolicy,
       forceTask: true,
     });
-    const taskId = prepared.state?.taskId || '';
+    const taskId = first.state?.taskId || '';
     expect(taskId).toBeTruthy();
+
+    addMessageIdempotent({
+      userId,
+      agentId: 'lumi',
+      conversationId: conversation.id,
+      role: 'assistant',
+      content: '我现在看到的前台窗口是 Visual Studio Code，不是可读取的 WPS 文档。请先把要分析的文档切到前台。',
+      requestId: firstRequestId,
+      taskIntent: 'task',
+      domain: 'personal',
+      source: 'test',
+      channel: 'chat',
+      toolCalls: [{
+        id: `active-vscode-${nonce}`,
+        key: 'desktop_active_window:{}',
+        name: 'desktop_active_window',
+        arguments: {},
+        result: JSON.stringify({
+          window_id: '4198450',
+          title: 'lumiOS - Visual Studio Code',
+          process_name: 'Code.exe',
+          executable_path: 'C:\\Program Files\\Microsoft VS Code\\Code.exe',
+        }),
+        outcome: 'success',
+        terminalVerification: {
+          status: 'verified',
+          strategy: 'terminal_receipt',
+          reason: 'The active window observation returned.',
+        },
+        taskId,
+        requestId: firstRequestId,
+        turnId: firstRequestId,
+        recordedAt: '2026-08-28T10:15:41.044Z',
+      }],
+      terminalTaskDisposition: {
+        outcome: 'blocked',
+        taskId,
+        requestId: firstRequestId,
+        reason: 'desktop_execution_plan_receipt: target_mismatch',
+      },
+      timestamp: '2026-08-28T10:15:41.044Z',
+    });
+
+    const blocked = getOrCreateActiveConversation(userId, 'lumi', 'personal', '')
+      .actionContinuationState;
+    expect(blocked).toMatchObject({
+      taskId,
+      status: 'blocked',
+      unfinished: true,
+      activeRequestId: undefined,
+      goal: firstText,
+    });
+    const taskBefore = cloneDatabaseValue(
+      (readDB().conversationActionTasks || []).find((row: any) => row.id === taskId),
+    );
+    expect(taskBefore).toBeDefined();
+
+    const secondRequestId = `chat-wps-foreground-ready-${nonce}`;
+    const secondText = '已经切到前台';
+    const secondMessageId = persistActionTurn({
+      conversationId: conversation.id,
+      userId,
+      userText: secondText,
+      requestId: secondRequestId,
+    });
+    const second = prepareConversationActionExecution({
+      conversationId: conversation.id,
+      userId,
+      userText: secondText,
+      requestId: secondRequestId,
+      userMessageId: secondMessageId,
+      toolPolicy,
+      forceTask: true,
+    });
+
+    expect(second).not.toHaveProperty('bindingFailure');
+    expect(second.kind).toBe('resume');
+    expect(second.state).toMatchObject({
+      taskId,
+      goal: firstText,
+      latestInstruction: secondText,
+      status: 'planning',
+      activeRequestId: secondRequestId,
+    });
+    expect(second.state?.taskCapsule?.target).toEqual(blocked?.taskCapsule?.target);
+
+    const lumiRuntimePath = 'D:\\lumiOS\\src-tauri\\target-codex-lumicore-tauri\\release\\lumi-core.exe';
+    addMessageIdempotent({
+      userId,
+      agentId: 'lumi',
+      conversationId: conversation.id,
+      role: 'assistant',
+      content: '前台仍是 LumiCore，尚未获得 WPS 当前文档。',
+      requestId: secondRequestId,
+      taskIntent: 'task',
+      domain: 'personal',
+      source: 'test',
+      channel: 'chat',
+      toolCalls: [{
+        id: `poll-lumicore-${nonce}`,
+        key: 'desktop_poll_activity:{}',
+        name: 'desktop_poll_activity',
+        arguments: {},
+        result: JSON.stringify({
+          window: {
+            window_id: '489555400',
+            title: 'LumiCore',
+            process_name: 'lumi-core.exe',
+            executable_path: lumiRuntimePath,
+          },
+          idle: { idle_ms: 13094, idle_seconds: 13 },
+        }),
+        outcome: 'success',
+        terminalVerification: {
+          status: 'verified',
+          strategy: 'terminal_receipt',
+          reason: 'The foreground observation returned.',
+        },
+        taskId,
+        requestId: secondRequestId,
+        turnId: secondRequestId,
+        recordedAt: '2026-08-28T10:16:21.105Z',
+      }],
+      terminalTaskDisposition: {
+        outcome: 'blocked',
+        taskId,
+        requestId: secondRequestId,
+        reason: 'desktop_execution_plan_receipt: target_mismatch',
+      },
+      timestamp: '2026-08-28T10:16:21.105Z',
+    });
+
+    const finalConversation = getOrCreateActiveConversation(userId, 'lumi', 'personal', '');
+    expect(finalConversation.actionContinuationState).toMatchObject({
+      taskId,
+      status: 'blocked',
+      unfinished: true,
+      activeRequestId: undefined,
+      goal: firstText,
+    });
+    expect(finalConversation.actionContinuationState?.sourcePaths).not.toContain(lumiRuntimePath);
+    expect(finalConversation.actionContinuationState?.taskCapsule?.paths).not.toContain(lumiRuntimePath);
+    expect(finalConversation.actionContinuationState?.taskCapsule?.target.path).not.toBe(lumiRuntimePath);
+
+    const db = readDB();
+    const tasks = (db.conversationActionTasks || [])
+      .filter((row: any) => row.conversationId === conversation.id);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]).toMatchObject({
+      id: taskId,
+      goal: firstText,
+      target: taskBefore.target,
+      status: 'blocked',
+      rootUserMessageId: firstMessageId,
+    });
+    expect(tasks[0].target).not.toContain('LumiCore');
+    expect(tasks[0].target).not.toContain('lumi-core.exe');
+
+    const turns = (db.conversationActionTurns || [])
+      .filter((row: any) => row.conversationId === conversation.id)
+      .filter((row: any) => [firstRequestId, secondRequestId].includes(row.requestId));
+    expect(turns).toHaveLength(2);
+    expect(turns.map((row: any) => row.taskId)).toEqual([taskId, taskId]);
+    expect(turns.map((row: any) => row.requestId)).toEqual([firstRequestId, secondRequestId]);
+  });
+
+  it('persists receipt-only cancellation truth into the durable conversation task', () => {
+    const userId = `conversation-receipt-only-${Date.now()}-${Math.random()}`;
+    const conversation = getOrCreateActiveConversation(userId, 'lumi', 'personal', '');
 
     addMessage({
       userId,
       agentId: 'lumi',
       conversationId: conversation.id,
-      role: 'assistant',
-      content: 'CAD 方案已生成并通过核验。',
+      role: 'user',
+      content: '\u505c\u6b62\u540e\u53f0\u4efb\u52a1',
       domain: 'personal',
-      requestId,
+    });
+    addMessage({
+      userId,
+      agentId: 'lumi',
+      conversationId: conversation.id,
+      role: 'assistant',
+      content: '\u540e\u53f0\u4efb\u52a1\u5df2\u53d6\u6d88\u3002',
       toolCalls: [{
-        taskId,
-        requestId,
-        name: 'cad_generate_dxf',
+        id: `receipt-only-cancel-${Date.now()}`,
+        name: 'runtime_work_cancel',
         arguments: {},
-        result: JSON.stringify({
-          path: 'C:\\Lumi\\plan.dxf',
-          previewPath: 'C:\\Lumi\\plan.svg',
-          exists: true,
-          size: 128,
-          previewExists: true,
-          previewSize: 128,
-        }),
-        terminalVerification: { status: 'verified', strategy: 'artifact', reason: 'files exist' },
-      }, {
-        taskId,
-        requestId,
-        name: 'industry_workflow_complete',
-        arguments: { taskId: 'wt_task_cad' },
-        result: JSON.stringify({
+        result: '',
+        receipt: JSON.stringify(JSON.stringify({
           ok: true,
+          status: 'cancelled',
+          matchedCount: 1,
+          cancelledCount: 1,
+          cancellingCount: 0,
+          failedCount: 0,
+        })),
+        terminalVerification: {
           status: 'verified',
-          persisted: true,
-          task: { id: 'wt_task_cad', status: 'delivered' },
-          verification: { verificationId: 'wt_verify_cad', passed: true, status: 'passed' },
-          archivedFilePaths: ['C:\\Lumi\\plan.dxf', 'C:\\Lumi\\plan.svg'],
-        }),
-        terminalVerification: { status: 'verified', strategy: 'terminal_receipt', reason: 'passed' },
+          strategy: 'terminal_receipt',
+          reason: 'The unified runtime ledger confirmed cancellation.',
+        },
       }],
+      domain: 'personal',
     });
 
-    // Terminal design work remains queryable from the durable task ledger but
-    // no longer occupies the live foreground pointer after its request closes.
-    expect(getOrCreateActiveConversation(userId, 'lumi', 'personal', '').actionContinuationState)
-      .toBeUndefined();
-    expect((readDB().conversationActionTasks || []).find((task: any) => task.id === taskId))
-      .toMatchObject({ status: 'completed', activeRequestId: '', completionSource: 'tool_receipt' });
+    expect(durableActionState(conversation.id, userId)).toMatchObject({
+      goal: '\u505c\u6b62\u540e\u53f0\u4efb\u52a1',
+      status: 'completed',
+      unfinished: false,
+      completionSource: 'tool_receipt',
+      evidenceTools: ['runtime_work_cancel'],
+    });
   });
 
   it('clears a deferred prior-action status turn after a deterministic zero-tool reply', () => {
@@ -779,7 +963,7 @@ describe('conversation action continuation state', () => {
       { requestId: taskRequestId, assistantState: 'Waiting for confirmation.' },
     );
 
-    const before = structuredClone(
+    const before = cloneDatabaseValue(
       (readDB().conversationActionTasks || []).find((row: any) => row.id === prepared.state?.taskId),
     );
     expect(before).toBeDefined();
@@ -904,9 +1088,8 @@ describe('conversation action continuation state', () => {
       revision: 1,
       updatedAt: liveAt,
     };
-    conversation.actionContinuationState = terminalState;
-
     const db = readDB();
+    db.conversations.find((row: any) => row.id === conversation.id).actionContinuationState = terminalState;
     for (const [state, createdAt] of [
       [terminalState, terminalAt],
       [liveState, liveAt],
@@ -1368,7 +1551,13 @@ describe('conversation action continuation state', () => {
       toolPolicy: { allowedTools: [], requireConfirmation: [], forbiddenTools: [], maxIterations: 1 },
     });
 
-    expect(plain).toEqual({ state: null, kind: 'conversation' });
+    const plainTurn = (readDB().conversationActionTurns || []).find((row: any) =>
+      row.conversationId === conversation.id && row.userId === userId && row.requestId === 'request-new-model-question');
+    expect(plainTurn).toMatchObject({ taskId: '' });
+    expect(plain).toEqual({
+      state: null, kind: 'conversation', turnRowId: plainTurn.id,
+      acceptedTranscriptText: 'Which model are you using right now?', detachedTaskReference: undefined,
+    });
     expect(getOrCreateActiveConversation(userId, 'lumi', 'personal', '').actionContinuationState)
       .toBeUndefined();
     expect((readDB().conversationActionTasks || []).find((row: any) => row.id === oldTask.state?.taskId))
@@ -1411,7 +1600,13 @@ describe('conversation action continuation state', () => {
       }),
       toolPolicy: { allowedTools: [], requireConfirmation: [], forbiddenTools: [], maxIterations: 1 },
     });
-    expect(plain).toEqual({ state: null, kind: 'conversation' });
+    const plainTurn = (readDB().conversationActionTurns || []).find((row: any) =>
+      row.conversationId === conversation.id && row.userId === userId && row.requestId === 'request-format-feedback');
+    expect(plainTurn).toMatchObject({ taskId: '' });
+    expect(plain).toEqual({
+      state: null, kind: 'conversation', turnRowId: plainTurn.id,
+      acceptedTranscriptText: 'Please format your replies in short paragraphs.', detachedTaskReference: undefined,
+    });
     expect(getOrCreateActiveConversation(userId, 'lumi', 'personal', '').actionContinuationState)
       .toBeUndefined();
     settleConversationActionExecutionRequest(conversation.id, userId, 'request-format-feedback');

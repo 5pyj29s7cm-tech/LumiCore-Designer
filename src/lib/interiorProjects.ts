@@ -1,3 +1,6 @@
+import { apiJson } from '../services/apiClient';
+import { withRequestDeadline } from './requestDeadline';
+
 export type InteriorProjectType = 'residential' | 'office' | 'retail' | 'hospitality' | 'other';
 export type InteriorProjectStatus = 'brief' | 'planning' | 'design' | 'visualization' | 'handoff' | 'archived';
 export type InteriorAssetCategory = 'floor-plan' | 'cad' | 'site-photo' | 'material' | 'reference' | 'other';
@@ -92,33 +95,25 @@ export interface InteriorProjectAsset {
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    ...init,
-    credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers || {}),
-    },
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(typeof data.error === 'string' ? data.error : `Request failed (${response.status})`);
-  }
-  return data as T;
+  return withRequestDeadline(signal => apiJson<T>(url, { ...init, signal,
+    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
+  }), init?.signal || undefined, 15_000);
 }
 
 function projectRoute(domain: InteriorProjectDomain): string {
   return domain === 'work' ? '/api/org/interior/projects' : '/api/personal/interior/projects';
 }
 
-export async function listInteriorProjects(domain: InteriorProjectDomain): Promise<InteriorProject[]> {
-  const data = await request<{ projects: InteriorProject[] }>(projectRoute(domain));
-  return Array.isArray(data.projects) ? data.projects : [];
+export async function listInteriorProjects(domain: InteriorProjectDomain, signal?: AbortSignal): Promise<InteriorProject[]> {
+  const data = await request<{ projects: InteriorProject[] }>(projectRoute(domain), { signal });
+  if (!Array.isArray(data.projects)) throw new Error('Invalid project list response');
+  return data.projects;
 }
 
-export async function getActiveInteriorProject(domain: InteriorProjectDomain): Promise<InteriorProject | null> {
-  const data = await request<{ project: InteriorProject | null }>(`${projectRoute(domain)}/active`);
-  return data.project || null;
+export async function getActiveInteriorProject(domain: InteriorProjectDomain, signal?: AbortSignal): Promise<InteriorProject | null> {
+  const data = await request<{ project: InteriorProject | null }>(`${projectRoute(domain)}/active`, { signal });
+  if (data.project !== null && (!data.project || typeof data.project.id !== 'string')) throw new Error('Invalid active project response');
+  return data.project;
 }
 
 export async function setActiveInteriorProject(
@@ -135,10 +130,12 @@ export async function setActiveInteriorProject(
 export async function getInteriorProjectWorkflow(
   domain: InteriorProjectDomain,
   projectId: string,
+  signal?: AbortSignal,
 ): Promise<InteriorProjectWorkflowState> {
   const data = await request<{ workflow: InteriorProjectWorkflowState }>(
-    `${projectRoute(domain)}/${encodeURIComponent(projectId)}/workflow`,
+    `${projectRoute(domain)}/${encodeURIComponent(projectId)}/workflow`, { signal },
   );
+  if (!data.workflow || !['project', 'cad', 'visualization', 'presentation', 'handoff'].every(id => typeof data.workflow.stages?.[id]?.status === 'string')) throw new Error('Invalid project stage response');
   return data.workflow;
 }
 
@@ -160,11 +157,12 @@ export function updateInteriorProject(domain: InteriorProjectDomain, projectId: 
   });
 }
 
-export async function listInteriorProjectAssets(domain: InteriorProjectDomain, projectId: string): Promise<InteriorProjectAsset[]> {
+export async function listInteriorProjectAssets(domain: InteriorProjectDomain, projectId: string, signal?: AbortSignal): Promise<InteriorProjectAsset[]> {
   const data = await request<{ assets: InteriorProjectAsset[] }>(
-    `${projectRoute(domain)}/${encodeURIComponent(projectId)}/assets`,
+    `${projectRoute(domain)}/${encodeURIComponent(projectId)}/assets`, { signal },
   );
-  return Array.isArray(data.assets) ? data.assets : [];
+  if (!Array.isArray(data.assets)) throw new Error('Invalid project sources response');
+  return data.assets;
 }
 
 export function updateInteriorProjectAsset(

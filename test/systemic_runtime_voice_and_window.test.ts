@@ -6,11 +6,10 @@ import {
 } from '../server/cognition/action_contract';
 import {
   buildRecentActionContinuationBridge,
-  getRecoveredApplicationContinuationTarget,
   type ConversationActionContinuationState,
 } from '../server/cognition/action_continuation';
-import { guardCurrentAppToolCall, isRecoveredWpsCreateTask } from '../server/cognition/current_app_execution';
-import { buildDeterministicRuntimeWorkCommand, matchQuickCommand } from '../server/cognition/quick_commands';
+import { guardCurrentAppToolCall, isWpsCreateTask } from '../server/cognition/current_app_execution';
+import { buildDesktopObservationPlan, formatDesktopObservationResult } from '../server/cognition/desktop_observation';
 import { routeToolsForTurn } from '../server/cognition/tool_router';
 import { finalizeLumiResponse } from '../server/cognition/result_finalizer';
 import type { ToolExecutionRecord } from '../server/tools/types';
@@ -38,411 +37,26 @@ const persistedWps: ConversationActionContinuationState = {
   updatedAt: new Date().toISOString(),
 };
 
-/* Removed contract: the single-core runtime no longer exposes background
- * delegation tasks. Current autonomy/takeover contracts live in the dedicated
- * runtime-work suites and the tests below keep the Designer desktop behavior.
-describe('systemic runtime work control', () => {
-  it('routes status and cancellation to the unified ledger', () => {
-    const tools = [declaration('runtime_work_status'), declaration('runtime_work_cancel'), declaration('desktop_running_processes')];
-    expect(buildActionContract('\u540e\u53f0\u4efb\u52a1\u8fdb\u5ea6\u600e\u4e48\u6837').kind).toBe('task_control');
-    expect(routeToolsForTurn('\u540e\u53f0\u4efb\u52a1\u8fdb\u5ea6\u600e\u4e48\u6837', tools).toolNames).toContain('runtime_work_status');
-    expect(routeToolsForTurn('\u505c\u6b62\u540e\u53f0\u4efb\u52a1', tools).toolNames).toContain('runtime_work_cancel');
-  });
-
-  it('executes exact background task control without delegating it as new work', () => {
-    const cancel = buildDeterministicRuntimeWorkCommand('\u505c\u6b62\u540e\u53f0\u4efb\u52a1 bg_1787047896265_le8w7');
-    expect(cancel?.toolCall).toEqual({
-      name: 'runtime_work_cancel',
-      arguments: { taskId: 'bg_1787047896265_le8w7' },
-    });
-
-    const status = buildDeterministicRuntimeWorkCommand('\u540e\u53f0\u4efb\u52a1\u8fdb\u5ea6\u600e\u4e48\u6837');
-    const reply = status?.formatToolResult?.(JSON.stringify({
-      status: 'active',
-      activeCount: 1,
-      items: [{ id: 'bg_exact', title: '\u8bbe\u8ba1\u9879\u76ee\u6838\u9a8c', status: 'running', running: true }],
-    }));
-    expect(reply).toContain('bg_exact');
-  });
-
-  it('does not describe blocked durable tasks as currently running', () => {
-    const status = buildDeterministicRuntimeWorkCommand('\u540e\u53f0\u4efb\u52a1\u8fdb\u5ea6\u600e\u4e48\u6837');
-    const reply = status?.formatToolResult?.(JSON.stringify({
-      status: 'paused',
-      activeCount: 0,
-      items: [{ id: 'wt_task_blocked', title: 'Blocked project', status: 'blocked', running: false }],
-    }));
-    expect(reply).toBe('\u5f53\u524d\u6ca1\u6709\u6b63\u5728\u8fd0\u884c\u7684\u5de5\u4f5c\u3002');
-    expect(reply).not.toContain('wt_task_blocked');
-  });
-
-  it('only accepts an exact runtime receipt as cancellation evidence', () => {
-    const contract = buildActionContract('\u505c\u6b62\u540e\u53f0\u4efb\u52a1');
-    const processRecord: ToolExecutionRecord = {
-      name: 'desktop_running_processes', arguments: {}, result: '[]',
-    };
-    const cancelRecord: ToolExecutionRecord = {
-      name: 'runtime_work_cancel',
-      arguments: {},
-      result: JSON.stringify({ ok: true, status: 'cancelled', matchedCount: 1, cancelledCount: 1 }),
-    };
-    expect(hasCoreActionEvidence(contract, [processRecord], '\u505c\u6b62\u540e\u53f0\u4efb\u52a1')).toBe(false);
-    expect(hasCoreActionEvidence(contract, [cancelRecord], '\u505c\u6b62\u540e\u53f0\u4efb\u52a1')).toBe(true);
-  });
-
-  it('cancels a real queued delegation and returns an exact receipt', () => {
-    resetBackgroundTasksForTest();
-    const userId = 'runtime-work-test';
-    registerBackgroundTask({ userId, title: 'test work', prompt: 'test' });
-    expect(getRuntimeWorkSnapshot(userId).activeCount).toBe(1);
-    const result = cancelRuntimeWork({ userId, kinds: ['delegation'] });
-    expect(result).toMatchObject({ ok: true, status: 'cancelled', matchedCount: 1, cancelledCount: 1 });
-    expect(result.items[0]).toMatchObject({
-      status: 'cancelled',
-      phase: 'cancelled',
-      cancellationRequested: true,
-      controls: { canPause: false, canResume: false, canCancel: false },
-      evidence: { terminal: true, verification: 'unverified', reasonCode: 'background_task_cancelled' },
-    });
-    expect(getRuntimeWorkSnapshot(userId).activeCount).toBe(0);
-    resetBackgroundTasksForTest();
-  });
-
-  it('pauses and resumes queued work with exact ledger receipts', () => {
-    resetBackgroundTasksForTest({ markHydrated: true });
-    const userId = 'runtime-work-pause-test';
-    const task = registerBackgroundTask({ userId, title: 'pause test', prompt: 'test' });
-    expect(pauseRuntimeWork({ userId, taskId: task.id, kinds: ['delegation'] })).toMatchObject({
-      ok: true,
-      status: 'paused',
-      matchedCount: 1,
-      pausedCount: 1,
-    });
-    expect(getRuntimeWorkSnapshot(userId)).toMatchObject({ status: 'paused', activeCount: 0 });
-    expect(resumeRuntimeWork({ userId, taskId: task.id, kinds: ['delegation'] })).toMatchObject({
-      ok: true,
-      status: 'resumed',
-      matchedCount: 1,
-      resumedCount: 1,
-    });
-    expect(getRuntimeWorkSnapshot(userId)).toMatchObject({ status: 'active', activeCount: 1 });
-    resetBackgroundTasksForTest({ markHydrated: true });
-  });
-
-  it('fails exact controls when the requested runtime task does not exist', () => {
-    const input = {
-      userId: `runtime-work-missing-${Date.now()}-${Math.random()}`,
-      taskId: 'missing-task-id',
-      kinds: ['delegation'] as Array<'delegation'>,
-      scope: { domain: 'personal' as const },
-    };
-    expect(pauseRuntimeWork(input)).toMatchObject({
-      ok: false,
-      status: 'failed',
-      matchedCount: 0,
-      failedCount: 1,
-    });
-    expect(resumeRuntimeWork(input)).toMatchObject({
-      ok: false,
-      status: 'failed',
-      matchedCount: 0,
-      failedCount: 1,
-    });
-    expect(cancelRuntimeWork(input)).toMatchObject({
-      ok: false,
-      status: 'failed',
-      matchedCount: 0,
-      failedCount: 1,
-    });
-  });
-
-  it('rejects a work scope without an organization instead of reading personal work', () => {
-    resetBackgroundTasksForTest({ markHydrated: true });
-    const userId = `runtime-work-invalid-scope-${Date.now()}-${Math.random()}`;
-    const personal = registerBackgroundTask({
-      userId,
-      title: 'personal task must stay private',
-      prompt: 'test',
-      context: { domain: 'personal' },
-    });
-
-    const snapshot = getRuntimeWorkSnapshot(userId, ['delegation'], { domain: 'work' });
-    expect(snapshot).toMatchObject({
-      ok: false,
-      status: 'degraded',
-      degraded: true,
-      scope: { domain: 'work' },
-      diagnostics: [{ source: 'scope', code: 'runtime_work_invalid_scope' }],
-      items: [],
-    });
-    expect(cancelRuntimeWork({
-      userId,
-      taskId: personal.id,
-      kinds: ['delegation'],
-      scope: { domain: 'work' },
-    })).toMatchObject({ ok: false, status: 'failed', matchedCount: 0, failedCount: 1 });
-    expect(getRuntimeWorkSnapshot(userId, ['delegation'], { domain: 'personal' }).items)
-      .toEqual([expect.objectContaining({ id: personal.id })]);
-    resetBackgroundTasksForTest({ markHydrated: true });
-  });
-
-  it('preserves an invalid work scope at the runtime-tool boundary for diagnosis', async () => {
-    const registry = new ToolRegistry();
-    registerRuntimeWorkTools(registry);
-    const snapshot = JSON.parse(await registry.execute('runtime_work_status', {}, {
-      userId: `runtime-tool-invalid-scope-${Date.now()}-${Math.random()}`,
-      domain: 'work',
-    }));
-
-    expect(snapshot).toMatchObject({
-      ok: false,
-      status: 'degraded',
-      scope: { domain: 'work' },
-      diagnostics: [{ source: 'scope', code: 'runtime_work_invalid_scope' }],
-      items: [],
-    });
-  });
-
-  it('keeps bounded delivered and cancelled takeover history in the snapshot', () => {
-    const userId = `runtime-takeover-history-${Date.now()}-${Math.random()}`;
-    const active = createWorkTakeoverTask({
-      userId,
-      category: 'general_work',
-      title: 'active takeover',
-    });
-    const delivered = createWorkTakeoverTask({
-      userId,
-      category: 'general_work',
-      title: 'delivered takeover',
-      status: 'delivered',
-      metadata: {
-        workTakeoverVerification: {
-          passed: true,
-          status: 'verified',
-          checks: [{ passed: true }],
-        },
-      },
-    });
-    const cancelled = createWorkTakeoverTask({
-      userId,
-      category: 'general_work',
-      title: 'cancelled takeover',
-      status: 'cancelled',
-    });
-
-    const snapshot = getRuntimeWorkSnapshot(userId, ['takeover'], { domain: 'personal' });
-    expect(snapshot.items.map(item => item.id)).toEqual(expect.arrayContaining([
-      active.id,
-      delivered.id,
-      cancelled.id,
-    ]));
-    expect(snapshot.items.find(item => item.id === delivered.id)).toMatchObject({
-      phase: 'completed',
-      nextAction: '',
-      controls: { canPause: false, canResume: false, canCancel: false },
-    });
-    expect(snapshot.items.find(item => item.id === cancelled.id)).toMatchObject({
-      phase: 'cancelled',
-      nextAction: '',
-      controls: { canPause: false, canResume: false, canCancel: false },
-    });
-    expect(snapshot.items).toHaveLength(3);
-  });
-
-  it('projects an unverified delivered takeover as blocked attention, never completed idle', () => {
-    const userId = `runtime-takeover-unverified-${Date.now()}-${Math.random()}`;
-    const delivered = createWorkTakeoverTask({
-      userId,
-      category: 'general_work',
-      title: 'unverified delivered takeover',
-      status: 'delivered',
-      metadata: {
-        workTakeoverVerification: {
-          passed: false,
-          status: 'blocked',
-          checks: [{ passed: false }],
-        },
-      },
-    });
-
-    const snapshot = getRuntimeWorkSnapshot(userId, ['takeover'], { domain: 'personal' });
-    expect(snapshot).toMatchObject({ status: 'attention', activeCount: 0, blockedCount: 1 });
-    expect(snapshot.items.find(item => item.id === delivered.id)).toMatchObject({
-      phase: 'blocked',
-      blocker: expect.stringContaining('no verified terminal result'),
-      evidence: {
-        terminal: true,
-        verification: 'failed',
-        reasonCode: 'missing_verified_takeover_result',
-      },
-      completionFeedback: {
-        status: 'unknown',
-        incomplete: [expect.stringContaining('not verified complete')],
-      },
-    });
-  });
-
-  it('keeps blocked terminal work visible for diagnosis without making it active', () => {
-    resetBackgroundTasksForTest({ markHydrated: true });
-    const userId = 'runtime-work-blocked-test';
-    const task = registerBackgroundTask({ userId, title: 'blocked task', prompt: 'test' });
-    const claimed = claimBackgroundTask(task.id)!;
-    recordBackgroundTaskFailure(claimed.id, { error: 'permanent unrecoverable failure' }, claimed.leaseId);
-
-    const snapshot = getRuntimeWorkSnapshot(userId, ['delegation'], { domain: 'personal' });
-    expect(snapshot).toMatchObject({ status: 'attention', activeCount: 0, blockedCount: 1 });
-    expect(snapshot.items.find(item => item.id === task.id)).toMatchObject({
-      phase: 'failed',
-      nextAction: '',
-      controls: { canPause: false, canResume: false, canCancel: false },
-      evidence: { terminal: true, verification: 'failed' },
-    });
-    resetBackgroundTasksForTest({ markHydrated: true });
-  });
-
-  it('filters delegation scope before applying the bounded history window', () => {
-    resetBackgroundTasksForTest({ markHydrated: true });
-    const userId = `runtime-work-scope-window-${Date.now()}-${Math.random()}`;
-    const scoped = registerBackgroundTask({
-      userId,
-      title: 'older organization task',
-      prompt: 'test',
-      context: { domain: 'work', orgId: 'org-window' },
-    });
-    for (let index = 0; index < 55; index += 1) {
-      registerBackgroundTask({
-        userId,
-        title: `newer personal task ${index}`,
-        prompt: 'test',
-        context: { domain: 'personal' },
-      });
-    }
-
-    const snapshot = getRuntimeWorkSnapshot(
-      userId,
-      ['delegation'],
-      { domain: 'work', orgId: 'org-window' },
-    );
-    expect(snapshot.items.map(item => item.id)).toEqual([scoped.id]);
-    resetBackgroundTasksForTest({ markHydrated: true });
-  });
-
-  it('projects one scoped lifecycle with controls, progress, lineage, and evidence', () => {
-    resetBackgroundTasksForTest({ markHydrated: true });
-    const userId = 'runtime-work-lifecycle-test';
-    registerBackgroundTask({
-      userId,
-      title: 'personal task',
-      prompt: 'private payload must not be projected',
-      context: {
-        domain: 'personal',
-        conversationId: 'conversation-personal',
-        actionTaskId: 'action-personal',
-      },
-    });
-    registerBackgroundTask({
-      userId,
-      title: 'work task',
-      prompt: 'organization payload must not cross scope',
-      context: {
-        domain: 'work',
-        orgId: 'org-a',
-        conversationId: 'conversation-work',
-        actionTaskId: 'action-work',
-      },
-    });
-
-    const personal = getRuntimeWorkSnapshot(userId, ['delegation'], { domain: 'personal' });
-    expect(personal).toMatchObject({
-      ok: true,
-      status: 'active',
-      activeCount: 1,
-      pausedCount: 0,
-      blockedCount: 0,
-      scope: { domain: 'personal' },
-    });
-    expect(personal.items).toHaveLength(1);
-    expect(personal.items[0]).toMatchObject({
-      phase: 'queued',
-      conversationId: 'conversation-personal',
-      parentTaskId: 'action-personal',
-      controls: { canPause: true, canResume: false, canCancel: true },
-      evidence: { terminal: false, verification: 'pending' },
-      progress: { checkpoint: '', receiptCount: 0, toolCallCount: 0 },
-    });
-    expect(personal.items[0]).not.toHaveProperty('prompt');
-
-    const secretTask = registerBackgroundTask({
-      userId,
-      title: 'secret failure api_key=sk-title-secret-value',
-      prompt: 'test',
-      context: { domain: 'personal' },
-    });
-    const claimedSecretTask = claimBackgroundTask(secretTask.id)!;
-    recordBackgroundTaskFailure(claimedSecretTask.id, {
-      error: 'service unavailable; authorization: Bearer abcdefghijklmnop api_key=sk-super-secret-value',
-      toolRecords: [],
-    }, claimedSecretTask.leaseId);
-    const redacted = getRuntimeWorkSnapshot(userId, ['delegation'], { domain: 'personal' })
-      .items.find(item => item.id === secretTask.id);
-    expect(redacted?.blocker).not.toContain('abcdefghijklmnop');
-    expect(redacted?.blocker).not.toContain('sk-super-secret-value');
-    expect(redacted?.title).not.toContain('sk-title-secret-value');
-    expect(redacted?.blocker).toBe(
-      'Background task is blocked or failed. Inspect the local runtime logs before retrying.',
-    );
-    const publicPayload = JSON.stringify(redacted?.completionFeedback);
-    expect(publicPayload).not.toContain('sk-title-secret-value');
-    expect(publicPayload).not.toContain('sk-super-secret-value');
-    expect(publicPayload).toContain('[redacted]');
-
-    const work = getRuntimeWorkSnapshot(userId, ['delegation'], { domain: 'work', orgId: 'org-a' });
-    expect(work.items.map(item => item.title)).toEqual(['work task']);
-    expect(getRuntimeWorkSnapshot(userId, ['delegation'], { domain: 'work', orgId: 'org-b' }).items).toEqual([]);
-    resetBackgroundTasksForTest({ markHydrated: true });
-  });
-
-  it('keeps internal routing and evidence vocabulary out of user-visible failures', () => {
-    const blocker = summarizeActionContractBlocker(
-      buildActionContract('\u628a\u5f53\u524d\u7a97\u53e3\u6700\u5927\u5316'),
-      '',
-    );
-    expect(blocker).not.toMatch(/(?:\u4efb\u52a1\u7c7b\u578b|\u8fd8\u7f3a\u7684\u8bc1\u636e|appTarget|UI evidence|action contract)/i);
-
-    const finalized = finalizeLumiResponse({
-      taskText: '\u628a\u5f53\u524d\u7a97\u53e3\u6700\u5927\u5316',
-      responseText: 'appTarget=WPS; Required completion evidence: UI evidence; allowedTools missing.',
-      toolRecords: [],
-      source: 'voice',
-    });
-    expect(finalized.text).not.toMatch(/(?:appTarget|UI evidence|allowedTools|Required completion evidence)/i);
-  });
-});
-*/
-
 describe('receipt-backed current application control', () => {
-  it('uses one bounded process snapshot for a running-software question', async () => {
-    const quick = await matchQuickCommand('\u540e\u53f0\u6709\u591a\u5c11\u8f6f\u4ef6\u5728\u8fd0\u884c', 'process-test');
-    expect(quick?.toolCall).toEqual({ name: 'desktop_running_processes', arguments: { top: 50 } });
-    const reply = quick?.formatToolResult?.(JSON.stringify([
-      { name: 'chrome.exe' },
-      { name: 'chrome.exe' },
-      { name: 'WeChat.exe' },
-    ]));
-    expect(reply).toContain('3 \u4e2a\u8fdb\u7a0b\u6761\u76ee');
-    expect(reply).toContain('2 \u4e2a\u4e0d\u540c\u8fdb\u7a0b\u540d');
-    expect(reply).toContain('\u4e0d\u7b49\u540c\u4e8e\u6253\u5f00\u7684\u8f6f\u4ef6\u6570');
+
+  it('uses one bounded process snapshot for a running-software question', () => {
+    const text = '后台有多少软件在运行';
+    expect(buildDesktopObservationPlan(text)).toEqual([{ name: 'desktop_running_processes', arguments: { top: 20 } }]);
+    const reply = formatDesktopObservationResult([{
+      name: 'desktop_running_processes', arguments: { top: 20 },
+      result: JSON.stringify([{ name: 'chrome.exe' }, { name: 'chrome.exe' }, { name: 'WeChat.exe' }]),
+      terminalVerification: { status: 'verified', strategy: 'terminal_receipt', reason: 'Synthetic process snapshot' },
+    }], text);
+    expect(reply).toContain('3 个活跃进程条目');
+    expect(reply).toContain('2 个进程名称');
+    expect(reply).toContain('当前采样');
   });
 
   it('recovers a verified app target for a terse window command', async () => {
     const bridge = buildRecentActionContinuationBridge('\u6700\u5927\u5316', [], persistedWps);
-    expect(getRecoveredApplicationContinuationTarget(bridge)).toBe('WPS');
+    expect(bridge).toContain('- appTarget: WPS');
     expect(requestedDesktopWindowAction('\u6700\u5927\u5316')).toBe('maximize');
-    const quick = await matchQuickCommand('\u6700\u5927\u5316', 'window-test', { currentAppTarget: 'WPS' });
-    expect(quick?.toolCall).toEqual({
-      name: 'desktop_window_control',
-      arguments: { action: 'maximize', expectedTarget: 'WPS' },
-    });
+
   });
 
   it('requires the native verified window receipt', () => {
@@ -460,9 +74,10 @@ describe('receipt-backed current application control', () => {
     const instruction = '\u65b0\u5efa\u4e00\u4e2a\u7a7a\u767dWord\u6587\u6863';
     const bridge = buildRecentActionContinuationBridge(instruction, [], persistedWps);
     const taskText = `${instruction}\n\n${bridge}`;
-    expect(isRecoveredWpsCreateTask(taskText)).toBe(true);
+    expect(isWpsCreateTask(taskText, persistedWps.appTarget)).toBe(true);
     expect(guardCurrentAppToolCall({
       taskText,
+      currentAppTarget: persistedWps.appTarget,
       toolName: 'wps_create_document_with_text',
       arguments: { text: 'model invented text' },
       toolRecords: [],
@@ -481,7 +96,7 @@ describe('receipt-backed current application control', () => {
     const route = routeToolsForTurn(instruction, tools);
 
     expect(buildActionContract(instruction).kind).toBe('desktop_operation');
-    expect(isRecoveredWpsCreateTask(instruction)).toBe(true);
+    expect(isWpsCreateTask(instruction)).toBe(true);
     expect(route.toolNames).toContain('wps_create_document_with_text');
     expect(route.toolNames).not.toContain('create_docx');
     expect(guardCurrentAppToolCall({
@@ -496,7 +111,7 @@ describe('receipt-backed current application control', () => {
     const instruction = '\u65b0\u5efa\u6211\u7684\u6587\u6863';
     const bridge = buildRecentActionContinuationBridge(instruction, [], persistedWps);
     expect(bridge).toContain('Recent action continuation context');
-    expect(isRecoveredWpsCreateTask(`${instruction}\n\n${bridge}`)).toBe(true);
+    expect(isWpsCreateTask(`${instruction}\n\n${bridge}`, persistedWps.appTarget)).toBe(true);
   });
 
   it('reports verified partial progress instead of erasing a successful open', () => {

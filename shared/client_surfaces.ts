@@ -145,6 +145,25 @@ export const CLIENT_SETTINGS_SECTIONS: readonly ClientSettingsSectionDefinition[
 
 export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[] = [
   {
+    id: 'business', label: 'Social media workspace', target: 'business', actions: ['open_business'],
+    useWhen: 'Open Social media directly from the personal desktop for content creation, brand materials and digital people.',
+    launcherIds: ['business'],
+    // i18n-allow: Spoken and typed navigation aliases, not rendered copy.
+    navigationAliases: ['经营工作台', '社媒运营', 'social media', 'business workspace'], // i18n-allow: Designer navigation input aliases, not display copy.
+  },
+  {
+    id: 'business-ecommerce', label: 'Commerce workspace', target: 'business-ecommerce', actions: ['open_ecommerce_workspace'],
+    useWhen: 'Open Commerce directly from the personal desktop for store operations, products, sales and customer service.',
+    launcherIds: ['business-ecommerce'],
+    navigationAliases: ['电商运营', 'commerce workspace'], // i18n-allow: Designer navigation input aliases, not display copy.
+  },
+  {
+    id: 'business-finance', label: 'Finance workspace', target: 'business-finance', actions: ['open_finance_workspace'],
+    useWhen: 'Open Finance directly from the personal desktop for invoices, accounting, tax preparation and financial reports.',
+    launcherIds: ['business-finance'],
+    navigationAliases: ['财务管理', '财务', 'finance workspace'], // i18n-allow: Designer navigation input aliases, not display copy.
+  },
+  {
     id: 'home',
     label: 'Home / desktop shell',
     target: 'home',
@@ -165,7 +184,8 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     label: 'Nexus / central world',
     target: 'nexus',
     actions: ['open_nexus'],
-    useWhen: 'Open the full central-world view of the Lumi client.',
+    navigationAliases: ['灵息之境', 'breath realm'], // i18n-allow: Designer navigation input aliases, not display copy.
+    useWhen: 'Enter Breath Realm / 灵息之境 by scrolling up on the personal sphere or clear home background, and return by scrolling down; or ask Lumi to enter it; open Skill Hall from its left control area.',
     closeAfterUse: false,
     launcherIds: [],
   },
@@ -181,13 +201,13 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     id: 'command-center',
     label: 'Lumi command center',
     target: 'command-center',
-    navigationAliases: ['指挥中心', 'Lumi 指挥中心', 'Lumi指挥中心'],
+    navigationAliases: ['指挥中心', 'Lumi 指挥中心', 'Lumi指挥中心'], // i18n-allow: Designer navigation input aliases, not display copy.
     actions: ['open_command_center', 'open_chat'],
     commandCenterViewByAction: {
       open_command_center: 'office',
       open_chat: 'office',
     },
-    useWhen: 'Converse with Lumi, inspect persistent tasks and receipts, and enter the LumiCore workspace.',
+    useWhen: "Converse with Lumi and inspect persistent tasks and receipts. The right-side menu, top to bottom, is: Memory Territory / 记忆领地 (purple castle; private digital people and their conversations), Knowledge Base / 知识库 (cyan folder; import, read and search workspace materials), AI Creation / AI 创作 (amber sparkles; image, video and music creation). Enter Breath Realm / 灵息之境 by scrolling up on the personal sphere or clear home background or by voice; Skill Hall is inside Breath Realm. The calendar/planner is a separate button in the chat header. These are named destinations, not generic calendar/processing/files/automation categories.",
     // The command center is a permanent top-level navigation destination,
     // not a duplicated desktop/app-launcher icon.
     launcherIds: [],
@@ -204,7 +224,7 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     id: 'memory-avatar',
     label: 'Memory Territory',
     target: 'memory-avatar',
-    navigationAliases: ['memory territory', 'memory avatar', 'memory avatars', 'memory sanctuary', '记忆领地', '记忆化身', '记忆头像', '记忆空间'],
+    navigationAliases: ['memory territory', 'memory avatar', 'memory avatars', 'memory sanctuary', '记忆领地', '记忆化身', '记忆头像', '记忆空间'], // i18n-allow: Designer navigation input aliases, not display copy.
     actions: ['open_memory_avatar'],
     useWhen: 'Open Memory Territory to create private digital people, add source materials, and have text, voice, or video conversations. These personal companions cannot execute tools or autonomous tasks.',
     // Memory Avatar is entered from the Command Center switcher. It is still
@@ -230,10 +250,10 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
   },
   {
     id: 'devices',
-    label: 'Device sync center',
+    label: 'Device center',
     target: 'devices',
     actions: ['open_devices'],
-    useWhen: 'Inspect device pairing, synchronization, and connected-device state.',
+    useWhen: 'Inspect registered Lumi clients, observed USB ports and LAN services, and read supported device status.',
     launcherIds: ['devices', 'sync'],
   },
   {
@@ -267,8 +287,8 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     label: 'Skill Hall',
     target: 'skills',
     actions: ['open_skills'],
-    useWhen: 'Discover, install, enable, repair, and remove skills or MCP extensions, and inspect their health.',
-    launcherIds: [],
+    useWhen: 'Open Skill Hall from Breath Realm to discover, install, enable, repair, and remove skills or MCP extensions, and inspect their health.',
+    launcherIds: ['skills'],
   },
   {
     id: 'skill-generator',
@@ -284,13 +304,13 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     target: 'tools',
     actions: ['open_tools'],
     useWhen: 'Inspect executable tools, categories, status, and invocation surfaces.',
-    launcherIds: [],
+    launcherIds: ['tools'],
   },
   {
     id: 'design-project',
     label: 'Design project workspace',
     target: 'design-project',
-    navigationAliases: ['设计项目', '室内设计项目'],
+    navigationAliases: ['设计项目', '室内设计项目'], // i18n-allow: Designer navigation input aliases, not display copy.
     actions: ['open_design_project'],
     useWhen: 'Open the Designer project workspace and its current delivery-stage ledger.',
     launcherIds: ['design-project'],
@@ -299,7 +319,7 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     id: 'design-cad',
     label: 'CAD proposal workspace',
     target: 'design-cad',
-    navigationAliases: ['CAD 方案', 'CAD方案'],
+    navigationAliases: ['CAD 方案', 'CAD方案'], // i18n-allow: Designer navigation input aliases, not display copy.
     actions: ['open_design_cad'],
     useWhen: 'Open the CAD proposal workspace for source-grounded drawing preparation and verification.',
     launcherIds: ['design-cad'],
@@ -308,7 +328,7 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     id: 'design-visualization',
     label: 'Design visualization workspace',
     target: 'design-visualization',
-    navigationAliases: ['效果图', '设计效果图'],
+    navigationAliases: ['效果图', '设计效果图'], // i18n-allow: Designer navigation input aliases, not display copy.
     actions: ['open_design_visualization'],
     useWhen: 'Open the visualization workspace for reviewed interior-design image generation.',
     launcherIds: ['design-visualization'],
@@ -317,7 +337,7 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     id: 'design-presentation',
     label: 'Proposal presentation workspace',
     target: 'design-presentation',
-    navigationAliases: ['提案 PPT', '提案PPT', '设计提案'],
+    navigationAliases: ['提案 PPT', '提案PPT', '设计提案'], // i18n-allow: Designer navigation input aliases, not display copy.
     actions: ['open_design_presentation'],
     useWhen: 'Open the proposal presentation workspace for evidence-backed design decks.',
     launcherIds: ['design-presentation'],
@@ -326,7 +346,7 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     id: 'design-handoff',
     label: 'Design handoff workspace',
     target: 'design-handoff',
-    navigationAliases: ['交付中心', '设计交付'],
+    navigationAliases: ['交付中心', '设计交付'], // i18n-allow: Designer navigation input aliases, not display copy.
     actions: ['open_design_handoff'],
     useWhen: 'Open the handoff workspace for verified, archived design delivery packages.',
     launcherIds: ['design-handoff'],
@@ -495,11 +515,20 @@ export const PERSONAL_CLIENT_SURFACES: readonly PersonalClientSurfaceDefinition[
     launcherIds: [],
   },
   {
+    id: 'org-brand-design',
+    label: 'Brand and creative workspace',
+    target: 'org',
+    actions: ['open_organization_brand_design'],
+    organizationView: 'brand-design',
+    useWhen: 'Open organization brand, campaign, visual, and creative-delivery work.',
+    launcherIds: [],
+  },
+  {
     id: 'meeting',
     label: 'Meeting mode and notes',
     target: 'meeting',
     actions: ['start_meeting_mode', 'end_meeting_mode', 'open_meeting_notes'],
-    useWhen: 'Capture meeting transcription, notes, and reports after explicit user intent.',
+    useWhen: 'Open the meeting workspace with existing notes preserved. Recording begins only after Start recording is clicked.',
     closeAfterUse: false,
     launcherIds: [],
   },

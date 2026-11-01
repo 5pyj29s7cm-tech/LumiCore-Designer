@@ -1,3 +1,4 @@
+import { type ProviderGetters as SharedProviderGetters } from "../llm/provider_getters";
 import type { ModelRoutingTrace } from '../llm/model_routing_receipts';
 import type { LumiClientMode } from '../../shared/operation_modes';
 
@@ -5,6 +6,12 @@ export type ToolPermission = 'public' | 'user' | 'admin' | 'system';
 
 /** Security classification per tool — inspired by Claude Code's tier system */
 export type SecurityLevel = 'safe' | 'confirm' | 'forbidden';
+/** A complete server-validated choice binds one registered call; it grants no permission. */
+export interface ServerBoundCapabilitySelection {
+  toolName: string; capabilityId: string; capabilityContractHash: string; argumentsDigest: string;
+  sourceId: string; selectionText: string; targetIdentity: string;
+  scope: { userId: string; domain: 'personal' | 'work'; orgId: string };
+}
 export type CapabilitySource = 'builtin' | 'mcp' | 'skill' | 'adapter';
 export type CapabilityOperation = 'observe' | 'test' | 'mutate' | 'create' | 'communicate' | 'unknown';
 export type CapabilityMode = LumiClientMode;
@@ -200,7 +207,22 @@ export interface CapabilityManifestEntry {
   parameterNames: string[];
 }
 
-export interface ToolContext {
+/** Distinct server-owned identities; none may substitute for another. */
+export interface ToolExecutionIdentity {
+  /** Immutable semantic snapshot, not an action or task identity. */
+  resolutionId?: string;
+  taskId?: string;
+  requestId?: string;
+  /** Exact conversation_action_turns primary key, when durably admitted. */
+  turnRowId?: string;
+  /** Transport message identity, independent of the server request. */
+  externalMessageId?: string;
+  /** @deprecated Legacy compatibility; never infer requestId or turnRowId. */
+  turnId?: string;
+}
+
+export interface ToolContext extends ToolExecutionIdentity {
+  dataRoutingPolicy?: 'policy_scoped' | 'local_only';
   userId?: string;
   /** True only when an external principal was authenticated by the transport. */
   authenticated?: boolean;
@@ -255,8 +277,6 @@ export interface ToolContext {
   /** Owning Lumi conversation/personality for durable work. */
   conversationAgentId?: string;
   personalityId?: string;
-  turnId?: string;
-  requestId?: string;
   /** Exact reasoning route inherited by a durable LumiCore task. */
   modelRouting?: {
     provider?: string;
@@ -283,6 +303,8 @@ export interface ToolContext {
   domain?: 'personal' | 'work' | string;
   /** Organization id when domain is work. */
   orgId?: string;
+  /** Explicit case fact date supplied to a legal operation; never the generation date. */
+  factDate?: string;
   socketId?: string;
   cwd?: string;
   /** Actual native desktop host platform when it differs from the server. */
@@ -298,7 +320,8 @@ export interface ToolContext {
   /** Explicit personal-device relay used only for approved cross-workspace handoff, such as sending an organization file to the member's own WeChat. */
   personalDesktopRelay?: (toolName: string, args: Record<string, any>) => Promise<string>;
   /** Called when a tool requires confirmation. Returns true to proceed, false to abort. */
-  requestConfirmation?: (toolName: string, args: Record<string, any>) => Promise<boolean>;
+  requestConfirmation?: (toolName: string, args: Record<string, any>, capability?: CapabilityManifestEntry,
+    confirmationContext?: Pick<ToolContext, 'acceptedActionContract'>) => Promise<boolean>;
   /** Original user/task intent used to classify semantic risk for low-level actions. */
   actionIntent?: string;
   /**
@@ -307,6 +330,8 @@ export interface ToolContext {
    * manifest was visible to it.
    */
   currentTurnExecutionRequested?: boolean;
+  /** Server-only transient transcript scope for the primary model terminal report; never a grant or a second goal store. */
+  completionRequest?: { currentText: string; rootText?: string; history?: { id: string; argumentsVerified: boolean; record: ToolExecutionRecord }[] };
   /** Exact durable continuation proof produced by the shared execution pipeline. */
   trustedActionContinuation?: boolean;
   /**
@@ -315,10 +340,16 @@ export interface ToolContext {
    * visible user message, but it must not replace actionIntent for risk checks.
    */
   routedTaskText?: string;
+  /** Immutable completion requirements accepted by the shared turn pipeline. */
+  acceptedActionContract?: import('../cognition/turn_flow').LumiTurnFlow['acceptedActionContract'];
   /** Resolved once by the shared pipeline from authorized server state. */
   acceptedTaskTarget?: import('../conversation/task_target_anchor').AcceptedTaskTarget;
+  /** Server-resolved application reference; this does not grant execution authority. */
+  currentAppTarget?: string;
   /** True only after the registry's confirmation callback approved this tool call. */
   userConfirmed?: boolean;
+  /** Server-owned confirmed-step presentation lease; tool arguments cannot set it. */
+  desktopPresentationManaged?: boolean;
   /**
    * True when the current user turn explicitly asked Lumi to create/export/save a
    * local deliverable. This only relaxes medium-risk local file generation tools;
@@ -329,8 +360,8 @@ export interface ToolContext {
   localWriteIntentReason?: string;
   /**
    * True for foreground, user-present execution surfaces where Lumi can perform
-   * ordinary social/content commits (messages, comments, non-commercial posts)
-   * without a separate confirmation popup. High-consequence actions still gate.
+   * ordinary social/content preparation. External commits still require the
+   * exact destination/payload confirmation enforced by the Action Constitution.
    */
   supervisedExternalCommits?: boolean;
   /** Personality's tool policy for security level resolution */
@@ -368,14 +399,16 @@ export interface ToolContext {
   isCancelled?: () => boolean;
   /** Progress callback for long-running tools (computer_use) — reports each step */
   onProgress?: (step: string) => void;
+  /** Server-owned audit binding for an actual registered selection; creates no execution grant. */
+  prepareSelectedToolCall?: () => Promise<{ taskId: string; turnRowId?: string } & Pick<ToolContext, 'desktopRelay' | 'personalDesktopRelay'>>;
   /** Lifecycle callback fired immediately before an LLM-selected tool begins. */
-  onToolStart?: (call: { id?: string; name: string; arguments: Record<string, any> }) => void;
+  onToolStart?: (call: { id?: string; idempotencyKey?: string; name: string; arguments: Record<string, any> }) => void;
   /** Observation only: the canonical receipt is available before execution returns. */
   onToolRecord?: (record: ToolExecutionRecord) => void;
   /** Observation only: releases a started-call observer, including durable lifecycle failures. */
   onToolFinished?: (call: { id?: string; name: string; recorded: boolean }) => void;
   /** Fired only after policy/confirmation checks, immediately before an adapter handler starts. */
-  onAdapterStart?: (call: { name: string; attempt: number; idempotencyKey?: string }) => void | Promise<void>;
+  onAdapterStart?: (call: { name: string; attempt: number; idempotencyKey?: string; arguments: Readonly<Record<string, unknown>>; capability: Pick<CapabilityManifestEntry, 'operation' | 'sideEffects'> }) => void | Promise<void>;
   /**
    * Fired only after the exact adapter handler promise has genuinely settled.
    * A timeout requests cooperative cancellation but does not synthesize this
@@ -385,20 +418,7 @@ export interface ToolContext {
   /** Cooperative cancellation signal owned by the registry for this attempt. */
   executionSignal?: AbortSignal;
   /** LLM provider getters for tools that need to call vision/text models internally */
-  llmGetters?: {
-    getDeepSeek: () => any;
-    getGemini: () => any;
-    getOpenAI?: () => any;
-    getAnthropic?: () => any;
-    getQwen?: () => any;
-    getArk?: () => any;
-    getOllama?: () => any;
-    getLmStudio?: () => any;
-    getXiaomi?: () => any;
-    getKimi?: () => any;
-    getGlm?: () => any;
-    getRelay?: () => any;
-  };
+  llmGetters?: SharedProviderGetters;
   /** True when the tool is being used by background autonomous work. */
   autonomous?: boolean;
   /** Surface that initiated the tool call, such as chat, voice, runtime-log, meeting, or mcp. */
@@ -516,6 +536,8 @@ export interface NormalizedLLMResponse {
   toolCalls: ParsedToolCall[] | null;
   reasoningContent?: string | null;
   usage?: LLMUsage;
+  /** Provider termination status, retained for text as well as tool calls. */
+  finishReason?: 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'unknown';
   /** The provider produced usable output but stopped delivering stream frames before a terminal frame. */
   streamIncomplete?: boolean;
   /** Exact model route used for this call, including explicit fallback evidence. */
@@ -529,11 +551,8 @@ export interface NormalizedLLMResponse {
   };
 }
 
-export interface ToolExecutionRecord {
+export interface ToolExecutionRecord extends ToolExecutionIdentity {
   id?: string;
-  taskId?: string;
-  turnId?: string;
-  requestId?: string;
   /** Exact persisted model call whose output selected this tool invocation. */
   modelRoutingReceiptId?: string;
   /** Runtime-owned decision boundary that selected this exact invocation. */
@@ -596,7 +615,7 @@ export type ToolExecutionEnvelopeStatus =
   | 'target_mismatch';
 
 /** Canonical result projected from every legacy/new tool record. */
-export interface ToolExecutionEnvelope<T = unknown> {
+export interface ToolExecutionEnvelope<T = unknown> extends ToolExecutionIdentity {
   version: 1;
   status: ToolExecutionEnvelopeStatus;
   toolName: string;

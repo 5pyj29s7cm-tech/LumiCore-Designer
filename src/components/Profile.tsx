@@ -1,37 +1,33 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useId, useState } from 'react';
 import { motion } from 'motion/react';
-import { User, Shield, Cpu, Rocket, Ghost, Activity, Wallet, Zap, Key, CheckCircle, AlertCircle, BarChart3 } from 'lucide-react';
+import { User, Activity, Wallet, Zap, Key, CheckCircle, AlertCircle } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { useApp } from '../contexts/AppContext';
 import { GlassCard } from './SharedUI';
 import { apiFetch } from '../services/apiClient';
+import { profileAvailabilityCopy } from '../i18n/locales/profileAvailability';
+import { settingsRecoveryCopy } from '../i18n/locales/settingsRecovery';
+import { useRecoverableRead } from '../hooks/useRecoverableRead';
 
 export function Profile({ t }: { t: any }) {
   const { user } = useApp();
-  const [health, setHealth] = useState<any>(null);
+  const availability = profileAvailabilityCopy(t?.langCode === 'zh' ? 'zh' : 'en');
+  const paymentStatusId = useId();
+  const recovery = settingsRecoveryCopy(t?.langCode);
+  const healthRead = useRecoverableRead<any>(JSON.stringify([user?.uid, user?.role]), async signal => {
+    let response = await apiFetch('/api/health?details=1', { signal });
+    if (response.status === 401 || response.status === 403) response = await apiFetch('/api/health', { signal });
+    if (!response.ok) throw new Error('Health read failed');
+    const data = await response.json();
+    if (!data || !['ok', 'degraded', 'error'].includes(data.status)) throw new Error('Invalid health response');
+    return data;
+  });
+  const health = healthRead.error ? null : healthRead.data;
   const [passwords, setPasswords] = useState({ current: '', next: '' });
   const [status, setStatus] = useState<{ type: 'success' | 'error' | null, message: string }>({ type: null, message: '' });
   const [isUpdating, setIsUpdating] = useState(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    const loadHealth = async () => {
-      try {
-        let response = await apiFetch('/api/health?details=1');
-        if (response.status === 401 || response.status === 403) {
-          response = await apiFetch('/api/health');
-        }
-        if (!response.ok) throw new Error(`Health fetch failed (${response.status})`);
-        const data = await response.json();
-        if (!cancelled) setHealth(data);
-      } catch (err) {
-        console.error('Health fetch failed:', err);
-      }
-    };
-    void loadHealth();
-    return () => { cancelled = true; };
-  }, []);
 
   const uptimeSec = Number(health?.process?.uptimeSec);
   const uptimeLabel = Number.isFinite(uptimeSec)
@@ -77,6 +73,8 @@ export function Profile({ t }: { t: any }) {
 
   return (
     <div className="max-w-4xl mx-auto space-y-12">
+      {healthRead.loading && <p role="status">{recovery.loading}</p>}
+      {healthRead.error && <div role="alert">{recovery.failed} <button onClick={() => void healthRead.refresh()}>{recovery.retry}</button></div>}
       <div className="flex flex-col md:flex-row items-center gap-8">
         <div className="relative w-32 h-32 md:w-48 md:h-48 rounded-full overflow-hidden border-4 border-celestial-saturn/20 shadow-[0_0_50px_rgba(255,204,0,0.1)]">
           {user.photoURL ? (
@@ -95,9 +93,7 @@ export function Profile({ t }: { t: any }) {
             <p className="text-white/40 font-mono text-sm">{t.nodeId || 'Node ID'}: {user.uid.slice(0, 6)}...{user.uid.slice(-4)}</p>
           </div>
           <div className="flex flex-wrap justify-center md:justify-start gap-3">
-            <Badge icon={<Shield size={12} />} label={t.verifiedNode || 'Verified Node'} color="text-green-500 bg-green-500/10" />
-            <Badge icon={<Cpu size={12} />} label={t.levelArchitect || 'Level 12 Architect'} color="text-celestial-saturn bg-celestial-saturn/10" />
-            <Badge icon={<Rocket size={12} />} label={t.earlyExplorer || 'Early Explorer'} color="text-celestial-mars bg-celestial-mars/10" />
+            <Badge icon={<User size={12} />} label={availability.account} color="text-white/65 bg-white/5" />
           </div>
         </div>
       </div>
@@ -115,21 +111,22 @@ export function Profile({ t }: { t: any }) {
                 <Zap size={32} fill="currentColor" />
                 {user.balance || 0}
               </div>
-              <div className="text-xs text-white/45">{t.earnCredits || 'Earn by Contributing Node Power'}</div>
+              <div className="text-xs text-white/45">{availability.balanceDetail}</div>
             </div>
             <div className="grid grid-cols-2 gap-4">
-              <Button className="rounded-xl bg-white/5 border border-white/10 text-xs h-10">{t.withdraw || 'Withdraw'}</Button>
-              <Button className="rounded-xl bg-celestial-saturn text-black font-bold text-xs h-10">{t.topUp || 'Top Up'}</Button>
+              <Button disabled aria-describedby={paymentStatusId} className="rounded-xl bg-white/5 border border-white/10 text-xs h-10">{t.withdraw || 'Withdraw'}</Button>
+              <Button disabled aria-describedby={paymentStatusId} className="rounded-xl bg-celestial-saturn text-black font-bold text-xs h-10">{t.topUp || 'Top Up'}</Button>
             </div>
+            <p id={paymentStatusId} className="text-xs text-white/50">{availability.paymentsUnavailable}</p>
           </div>
         </GlassCard>
 
         <GlassCard className="p-8 rounded-[3rem] space-y-6" hoverEffect={false}>
           <h3 className="text-xl font-bold tracking-tighter">{t.nodeStats || 'Node Stats'}</h3>
           <div className="grid grid-cols-2 gap-4">
-            <StatBox label={t.totalData || 'Total Data'} value="1.2 TB" />
+            <StatBox label={t.totalData || 'Total Data'} value={availability.notCollected} />
             <StatBox label={t.uptime || 'Uptime'} value={uptimeLabel} />
-            <StatBox label={t.nodePower || 'Node Power'} value="850 GFLOPS" />
+            <StatBox label={t.nodePower || 'Node Power'} value={availability.notCollected} />
             <StatBox label={t.interactions || 'Interactions'} value={interactionCount} />
           </div>
         </GlassCard>
@@ -223,25 +220,6 @@ function Badge({ icon, label, color }: { icon: React.ReactNode; label: string; c
     <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-xs font-bold uppercase tracking-widest ${color}`}>
       {icon}
       {label}
-    </div>
-  );
-}
-
-function AgentItem({ name, type, status }: { name: string; type: string; status: string }) {
-  return (
-    <div className="flex items-center justify-between p-4 bg-white/5 rounded-2xl border border-white/5">
-      <div className="flex items-center gap-3">
-        <div className="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center text-celestial-saturn">
-          <Ghost size={20} />
-        </div>
-        <div className="space-y-0.5">
-          <div className="font-bold text-sm">{name}</div>
-          <div className="text-xs text-white/40 uppercase tracking-widest">{type}</div>
-        </div>
-      </div>
-      <div className={`text-xs font-bold uppercase tracking-widest ${status === 'Online' ? 'text-green-500' : status === 'Standby' ? 'text-celestial-saturn' : 'text-white/45'}`}>
-        {status}
-      </div>
     </div>
   );
 }

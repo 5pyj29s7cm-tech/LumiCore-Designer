@@ -6,23 +6,31 @@ const read = (relativePath: string) => fs.readFileSync(path.join(process.cwd(), 
 
 describe('Designer desktop shell', () => {
   it('exposes the five outcome workspaces on the primary desktop', () => {
-    const desktop = read('src/components/DesktopUI.tsx');
+    const desktop = read('src/components/desktop/desktop_windows_view.tsx');
+    const registry = read('shared/client_surfaces.ts');
+    const icons = read('src/components/desktop/state/use_desktop_capture_and_identity.tsx');
     const copy = read('src/i18n/locales/interiorDesign.ts');
 
     for (const id of ['design-project', 'design-cad', 'design-visualization', 'design-presentation', 'design-handoff']) {
-      expect(desktop).toContain(`id: '${id}'`);
+      expect(registry).toContain(`id: '${id}'`);
     }
     for (const label of ['设计项目', 'CAD 方案', '效果图', '提案 PPT', '交付中心']) {
       expect(copy).toContain(label);
     }
     expect(desktop).toContain('<DesignHub initialView=');
+    expect(icons).toContain('interiorDesignMessage(label');
+    expect(icons).toContain('business-finance');
+    expect(icons).toContain('business-ecommerce');
+    expect(read('src/components/desktop/shell_chrome_view.tsx')).toContain('{PRODUCT_VARIANT.runtime.productName}');
   });
 
   it('opens the existing task-backed DesignHub instead of a prompt-only placeholder', () => {
     const hub = read('src/components/org/DesignHub.tsx');
-    expect(hub).toContain('startIndustryWorkflow');
+    const hook = read('src/hooks/useDesignChat.ts');
+    expect(hook).toContain('startIndustryWorkflow');
+    expect(hook).toContain('executeIndustryWorkflow');
     expect(hub).toContain('workflowTaskId');
-    expect(hub).toContain("'x-lumi-desktop-session': desktopSessionProof");
+    expect(read('src/services/apiClient.ts')).toContain("next.set('x-lumi-desktop-session', desktopSessionProof)");
     expect(hub).toContain("initialView = 'project'");
   });
 
@@ -49,7 +57,7 @@ describe('Designer desktop shell', () => {
     const client = read('src/lib/interiorProjects.ts');
 
     expect(hub).toContain("activeProject?.id || 'standalone'");
-    expect(hub).toContain("source: workflow.projectId ? 'designer_project_workspace' : 'designer_standalone_workspace'");
+    expect(read('src/hooks/useDesignChat.ts')).toContain("source: workflow.projectId ? 'designer_project_workspace' : 'designer_standalone_workspace'");
     expect(hub).toContain('project={activeProject}');
     expect(panel).toContain("m('standaloneTask')");
     expect(client).toContain("'/api/personal/interior/projects'");

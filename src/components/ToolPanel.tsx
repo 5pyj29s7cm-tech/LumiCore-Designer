@@ -1,8 +1,10 @@
-import { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
-import { Wrench, Shield, AlertTriangle, CheckCircle, Loader2, Eye, EyeOff } from 'lucide-react';
+import { Wrench, AlertTriangle, CheckCircle, Loader2, EyeOff } from 'lucide-react';
 import { toast } from 'sonner';
 import { useApp } from '@/contexts/AppContext';
+import { apiJson } from '@/services/apiClient';
+import { useRecoverableRead } from '@/hooks/useRecoverableRead';
+import { settingsRecoveryCopy } from '@/i18n/locales/settingsRecovery';
 
 interface ToolInfo {
   name: string;
@@ -18,17 +20,18 @@ const SECURITY_COLORS: Record<string, { bg: string; border: string; text: string
 };
 
 export function ToolPanel({ t }: { t?: any }) {
-  const { toolOverrides, setToolOverride } = useApp();
-  const [tools, setTools] = useState<ToolInfo[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    fetch('/api/tools')
-      .then(r => r.json())
-      .then(data => setTools(data || []))
-      .catch(() => toast.error(t?.failedToLoadTools || 'Failed to load tools'))
-      .finally(() => setLoading(false));
-  }, []);
+  const { toolOverrides, setToolOverride, user, workDomain, orgConnection } = useApp();
+  const copy = settingsRecoveryCopy(t?.langCode);
+  const failureMessage = t?.failedToLoadTools || 'Failed to load tools';
+  const read = useRecoverableRead<ToolInfo[]>(JSON.stringify([user?.uid, user?.role, workDomain, orgConnection?.orgId]), async signal => {
+        const data = await apiJson<unknown>('/api/tools', { signal });
+        if (!Array.isArray(data) || !data.every(tool => tool && typeof tool.name === 'string'
+          && ['safe', 'confirm', 'forbidden'].includes(tool.securityLevel))) {
+          throw new Error('Invalid tools response');
+        }
+        return data;
+  });
+  const tools = read.data || [], loading = read.loading, failed = Boolean(read.error);
 
   const safeTools = tools.filter(t => t.securityLevel === 'safe');
   const confirmTools = tools.filter(t => t.securityLevel === 'confirm');
@@ -70,9 +73,10 @@ export function ToolPanel({ t }: { t?: any }) {
           <div className="flex items-center justify-center py-12 text-white/55">
             <Loader2 size={24} className="animate-spin mr-2" /> {t?.loadingTools || 'Loading tools...'}
           </div>
+        ) : failed ? (
+          <div role="alert" className="lumi-panel px-4 py-3 text-sm text-red-300">{failureMessage} <button onClick={() => void read.refresh()}>{copy.retry}</button></div>
         ) : (
           sections.map(section => {
-            const colorKey = section.color as keyof typeof SECURITY_COLORS;
             return (
               <div key={section.label} className="space-y-2">
                 <div className="flex items-center gap-2">
@@ -110,6 +114,7 @@ export function ToolPanel({ t }: { t?: any }) {
                           <p className="text-xs text-white/55 mt-0.5 truncate">{tool.description}</p>
                         </div>
                         <button
+                          aria-label={tool.name}
                           onClick={() => toggleTool(tool.name)}
                           className={`flex-shrink-0 w-9 h-5 rounded-full p-0.5 transition-colors ${
                             isEnabled(tool.name) ? 'bg-emerald-500/60' : 'bg-white/10'

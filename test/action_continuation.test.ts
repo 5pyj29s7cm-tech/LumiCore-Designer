@@ -5,8 +5,7 @@ import {
   classifyConversationActionFollowupIntent,
   classifyRecentActionFollowupIntent,
   extractRecentActionContinuationState,
-  getRecoveredApplicationContinuationTarget,
-  isRecoveredCurrentAppEditingContinuation,
+  isCurrentAppEditingRequest,
   needsRecentActionContinuationContext,
   pendingRuntimeCancellationRecheck,
   prepareConversationActionTaskState,
@@ -788,8 +787,8 @@ describe('recent action continuation', () => {
 
     expect(needsRecentActionContinuationContext(text)).toBe(true);
     expect(classifyRecentActionFollowupIntent(text)).toBe('execute');
-    expect(getRecoveredApplicationContinuationTarget(routeText)).toBe('WPS');
-    expect(isRecoveredCurrentAppEditingContinuation(routeText)).toBe(true);
+    expect(extractRecentActionContinuationState(history).appTarget).toBe('WPS');
+    expect(isCurrentAppEditingRequest(routeText)).toBe(true);
   });
 
   it('keeps the original unfinished CAD goal across repeated pressure follow-ups', () => {
@@ -1006,7 +1005,7 @@ describe('recent action continuation', () => {
       goal: '打开 WPS。',
       latestInstruction: '在这里面写“我好想你”',
       appTarget: 'WPS',
-      unfinished: false,
+      unfinished: true,
     });
     expect(written?.evidenceTools).toEqual(['desktop_open', 'wps_create_document']);
     expect(checked).toMatchObject({

@@ -81,13 +81,13 @@ describe('industry workflow contracts', () => {
     expect(JSON.stringify(actionTask)).not.toContain('PRIVATE_SOURCE_VALUE_4417');
   });
 
-  it('rejects entries from another product and cross-user task access', () => {
+  it('rejects unknown entries and cross-user task access', () => {
     expect(() => startIndustryWorkflow({
       userId: 'industry_wrong_entry_user',
       domain: 'personal',
       orgId: '',
       entryId: 'not-an-entry',
-    })).toThrow(/not available/i);
+    })).toThrow(/Unknown business workflow/i);
 
     const started = startIndustryWorkflow({
       userId: 'industry_owner_user',
@@ -126,7 +126,7 @@ describe('industry workflow contracts', () => {
     ))).toBe(false);
   });
 
-  it('settles the linked action ledger only after the canonical verification tool passes', async () => {
+  it('does not let generic verification bypass required design receipts', async () => {
     const userId = 'industry_canonical_verifier_user';
     const entryId = EXPECTED_ENTRY_IDS[PRODUCT_VARIANT.productLine][0];
     const contract = getIndustryWorkflowContract(PRODUCT_VARIANT.productLine, entryId)!;
@@ -168,15 +168,16 @@ describe('industry workflow contracts', () => {
       orgId: '',
     } as any);
     const result = JSON.parse(raw);
-    expect(result.verification.passed).toBe(true);
-    expect(result.task.status).toBe('delivered');
+    expect(result.verification.passed).toBe(false);
+    expect(result.verification.checks).toContainEqual(expect.objectContaining({id:'required_domain_tool_evidence',passed:false}));
+    expect(result.task.status).not.toBe('delivered');
 
     const db = readDB();
     const actionTask = db.conversationActionTasks.find((task: any) => task.id === started.conversationTaskId);
-    expect(actionTask.status).toBe('completed');
+    expect(actionTask.status).not.toBe('completed');
     expect(db.conversationActionReceipts.some((receipt: any) => (
       receipt.taskId === started.conversationTaskId && receipt.outcome === 'verified_success'
-    ))).toBe(true);
+    ))).toBe(false);
   });
 
   it('requires a real accepted file for file-mandatory workflows', () => {

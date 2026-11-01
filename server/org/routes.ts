@@ -6,6 +6,7 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { mountInteriorProjectRoutes } from '../design/project_routes';
 import jwt from 'jsonwebtoken';
 import { requireAuth, requireOrgRole, requireOrgMember, optionalAuth } from '../middleware/auth';
 import * as Org from './org';
@@ -13,13 +14,13 @@ import * as EDB from './db';
 import * as KB from './kb';
 import * as LegalCases from './legal_cases';
 import * as Audit from './audit';
+import { AuditPageError, queryAuditPage } from './audit_pagination';
 import * as WorkRouting from './work_routing';
 import * as ResourceACL from './resource_acl';
-import * as InteriorProjects from '../design/projects';
-import * as InteriorProjectAssets from '../design/project_assets';
-import { getInteriorProjectWorkflow } from '../design/project_workflow';
 import { Server as SocketIOServer } from 'socket.io';
 import { getJwtSecret } from '../config/local_identity';
+import { getAuthCookieOptions } from '../middleware/client_origin';
+import { durableOrganizationRouter, afterOrganizationSave } from './durable_routes';
 
 function respondResourceAuthorizationError(res: Response, error: unknown): void {
   const status = error instanceof ResourceACL.OrganizationResourceAuthorizationError
@@ -45,30 +46,19 @@ function canReadOrganizationResource(input: {
   }).allowed;
 }
 
-function respondInteriorProjectError(res: Response, error: unknown): boolean {
-  if (
-    error instanceof InteriorProjects.InteriorProjectValidationError
-    || error instanceof InteriorProjectAssets.InteriorProjectAssetValidationError
-  ) {
-    res.status(error.statusCode).json({ error: error.message });
-    return true;
-  }
-  return false;
+export function mountOrgRoutes(baseRouter: Router, io?: SocketIOServer) {
+  const router = durableOrganizationRouter(baseRouter);
+  mountInteriorProjectRoutes(baseRouter);
+  mountOrganizationIdentityRoutes(router);
+  mountOrganizationWorkRoutingRoutes(router);
+  mountOrganizationResourceRoutes(router);
+  mountOrganizationKnowledgeRoutes(router);
+  mountOrganizationLegalRoutes(router);
+  mountOrganizationInvitationRoutes(io, router);
+  mountOrganizationAuditRoutes(io, router);
 }
 
-function requirePersonalInteriorContext(req: Request, res: Response): string | null {
-  if (!req.user) {
-    res.status(401).json({ error: 'Authentication required' });
-    return null;
-  }
-  if (req.user.orgId) {
-    res.status(409).json({ error: 'Personal design projects require the personal Lumi workspace.' });
-    return null;
-  }
-  return InteriorProjects.personalInteriorProjectScope(req.user.uid);
-}
-
-export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
+function mountOrganizationIdentityRoutes(router: ReturnType<typeof durableOrganizationRouter>) {
   // ── Health / status ──────────────────────────────────────────────────
 
   router.get('/org/status', optionalAuth, (_req: Request, res: Response) => {
@@ -79,280 +69,6 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
       orgId: _req.user?.orgId || null,
       orgRole: _req.user?.orgRole || null,
     });
-  });
-
-  // ── Spatial and interior projects ───────────────────────────────────
-
-  // Personal design projects share the durable project model while remaining
-  // isolated by authenticated user and independent from organization setup.
-  router.get('/personal/interior/projects', requireAuth, (req: Request, res: Response) => {
-    const scopeId = requirePersonalInteriorContext(req, res);
-    if (!scopeId) return;
-    res.json({
-      projects: InteriorProjects.listInteriorProjects(scopeId, {
-        includeArchived: req.query.includeArchived === 'true',
-      }),
-    });
-  });
-
-  router.get('/personal/interior/projects/active', requireAuth, (req: Request, res: Response) => {
-    const scopeId = requirePersonalInteriorContext(req, res);
-    if (!scopeId) return;
-    res.json({ project: InteriorProjects.getActiveInteriorProject(scopeId, req.user!.uid) });
-  });
-
-  router.put('/personal/interior/projects/active', requireAuth, (req: Request, res: Response) => {
-    const scopeId = requirePersonalInteriorContext(req, res);
-    if (!scopeId) return;
-    try {
-      const projectId = req.body?.projectId == null ? null : String(req.body.projectId);
-      res.json({ project: InteriorProjects.setActiveInteriorProject(scopeId, req.user!.uid, projectId) });
-    } catch (error) {
-      if (!respondInteriorProjectError(res, error)) throw error;
-    }
-  });
-
-  router.get('/personal/interior/projects/:projectId', requireAuth, (req: Request, res: Response) => {
-    const scopeId = requirePersonalInteriorContext(req, res);
-    if (!scopeId) return;
-    const project = InteriorProjects.getInteriorProject(scopeId, req.params.projectId);
-    if (!project) {
-      res.status(404).json({ error: 'Interior project not found' });
-      return;
-    }
-    res.json(project);
-  });
-
-  router.post('/personal/interior/projects', requireAuth, (req: Request, res: Response) => {
-    const scopeId = requirePersonalInteriorContext(req, res);
-    if (!scopeId) return;
-    try {
-      const project = InteriorProjects.createInteriorProject(scopeId, req.user!.uid, req.body || {});
-      InteriorProjects.setActiveInteriorProject(scopeId, req.user!.uid, project.id);
-      res.status(201).json(project);
-    } catch (error) {
-      if (!respondInteriorProjectError(res, error)) throw error;
-    }
-  });
-
-  router.get('/personal/interior/projects/:projectId/workflow', requireAuth, (req: Request, res: Response) => {
-    const scopeId = requirePersonalInteriorContext(req, res);
-    if (!scopeId) return;
-    const workflow = getInteriorProjectWorkflow(scopeId, req.params.projectId);
-    if (!workflow || !InteriorProjects.getInteriorProject(scopeId, req.params.projectId)) {
-      res.status(404).json({ error: 'Interior project not found' });
-      return;
-    }
-    res.json({ workflow });
-  });
-
-  router.put('/personal/interior/projects/:projectId', requireAuth, (req: Request, res: Response) => {
-    const scopeId = requirePersonalInteriorContext(req, res);
-    if (!scopeId) return;
-    try {
-      const project = InteriorProjects.updateInteriorProject(scopeId, req.params.projectId, req.body || {});
-      if (!project) {
-        res.status(404).json({ error: 'Interior project not found' });
-        return;
-      }
-      res.json(project);
-    } catch (error) {
-      if (!respondInteriorProjectError(res, error)) throw error;
-    }
-  });
-
-  router.get('/personal/interior/projects/:projectId/assets', requireAuth, (req: Request, res: Response) => {
-    const scopeId = requirePersonalInteriorContext(req, res);
-    if (!scopeId) return;
-    if (!InteriorProjects.getInteriorProject(scopeId, req.params.projectId)) {
-      res.status(404).json({ error: 'Interior project not found' });
-      return;
-    }
-    res.json({ assets: InteriorProjectAssets.listInteriorProjectAssets(scopeId, req.params.projectId) });
-  });
-
-  router.put('/personal/interior/projects/:projectId/assets/:assetId', requireAuth, (req: Request, res: Response) => {
-    const scopeId = requirePersonalInteriorContext(req, res);
-    if (!scopeId) return;
-    try {
-      const asset = InteriorProjectAssets.updateInteriorProjectAsset(
-        scopeId,
-        req.params.projectId,
-        req.params.assetId,
-        req.body || {},
-      );
-      if (!asset) {
-        res.status(404).json({ error: 'Interior project asset not found' });
-        return;
-      }
-      res.json(asset);
-    } catch (error) {
-      if (!respondInteriorProjectError(res, error)) throw error;
-    }
-  });
-
-  router.delete('/personal/interior/projects/:projectId/assets/:assetId', requireAuth, (req: Request, res: Response) => {
-    const scopeId = requirePersonalInteriorContext(req, res);
-    if (!scopeId) return;
-    const asset = InteriorProjectAssets.removeInteriorProjectAsset(
-      scopeId,
-      req.params.projectId,
-      req.params.assetId,
-    );
-    if (!asset) {
-      res.status(404).json({ error: 'Interior project asset not found' });
-      return;
-    }
-    res.json({ success: true, asset, fileRetained: true });
-  });
-
-  router.get('/org/interior/projects', requireAuth, requireOrgMember, (req: Request, res: Response) => {
-    const projects = InteriorProjects.listInteriorProjects(req.user!.orgId!, {
-      includeArchived: req.query.includeArchived === 'true',
-    });
-    res.json({ projects });
-  });
-
-  router.get('/org/interior/projects/active', requireAuth, requireOrgMember, (req: Request, res: Response) => {
-    res.json({
-      project: InteriorProjects.getActiveInteriorProject(req.user!.orgId!, req.user!.uid),
-    });
-  });
-
-  router.put('/org/interior/projects/active', requireAuth, requireOrgMember, (req: Request, res: Response) => {
-    try {
-      const projectId = req.body?.projectId == null ? null : String(req.body.projectId);
-      res.json({
-        project: InteriorProjects.setActiveInteriorProject(req.user!.orgId!, req.user!.uid, projectId),
-      });
-    } catch (error) {
-      if (!respondInteriorProjectError(res, error)) throw error;
-    }
-  });
-
-  router.get('/org/interior/projects/:projectId', requireAuth, requireOrgMember, (req: Request, res: Response) => {
-    const project = InteriorProjects.getInteriorProject(req.user!.orgId!, req.params.projectId);
-    if (!project) {
-      res.status(404).json({ error: 'Interior project not found' });
-      return;
-    }
-    res.json(project);
-  });
-
-  router.post('/org/interior/projects', requireAuth, requireOrgRole('owner', 'admin', 'member'), (req: Request, res: Response) => {
-    try {
-      const project = InteriorProjects.createInteriorProject(req.user!.orgId!, req.user!.uid, req.body || {});
-      InteriorProjects.setActiveInteriorProject(req.user!.orgId!, req.user!.uid, project.id);
-      EDB.logAudit({
-        orgId: req.user!.orgId!,
-        userId: req.user!.uid,
-        action: 'interior_project.created',
-        resourceType: 'interior_project',
-        resourceId: project.id,
-        details: { name: project.name, projectType: project.projectType },
-        ipAddress: req.ip,
-        userAgent: req.get('user-agent'),
-      });
-      res.status(201).json(project);
-    } catch (error) {
-      if (!respondInteriorProjectError(res, error)) throw error;
-    }
-  });
-
-  router.get('/org/interior/projects/:projectId/workflow', requireAuth, requireOrgMember, (req: Request, res: Response) => {
-    const project = InteriorProjects.getInteriorProject(req.user!.orgId!, req.params.projectId);
-    if (!project) {
-      res.status(404).json({ error: 'Interior project not found' });
-      return;
-    }
-    res.json({ workflow: getInteriorProjectWorkflow(project.orgId, project.id) });
-  });
-
-  router.put('/org/interior/projects/:projectId', requireAuth, requireOrgRole('owner', 'admin', 'member'), (req: Request, res: Response) => {
-    try {
-      const project = InteriorProjects.updateInteriorProject(
-        req.user!.orgId!,
-        req.params.projectId,
-        req.body || {},
-      );
-      if (!project) {
-        res.status(404).json({ error: 'Interior project not found' });
-        return;
-      }
-      EDB.logAudit({
-        orgId: req.user!.orgId!,
-        userId: req.user!.uid,
-        action: project.status === 'archived' ? 'interior_project.archived' : 'interior_project.updated',
-        resourceType: 'interior_project',
-        resourceId: project.id,
-        details: { name: project.name, projectType: project.projectType, status: project.status },
-        ipAddress: req.ip,
-        userAgent: req.get('user-agent'),
-      });
-      res.json(project);
-    } catch (error) {
-      if (!respondInteriorProjectError(res, error)) throw error;
-    }
-  });
-
-  router.get('/org/interior/projects/:projectId/assets', requireAuth, requireOrgMember, (req: Request, res: Response) => {
-    const project = InteriorProjects.getInteriorProject(req.user!.orgId!, req.params.projectId);
-    if (!project) {
-      res.status(404).json({ error: 'Interior project not found' });
-      return;
-    }
-    res.json({ assets: InteriorProjectAssets.listInteriorProjectAssets(req.user!.orgId!, project.id) });
-  });
-
-  router.put('/org/interior/projects/:projectId/assets/:assetId', requireAuth, requireOrgRole('owner', 'admin', 'member'), (req: Request, res: Response) => {
-    try {
-      const asset = InteriorProjectAssets.updateInteriorProjectAsset(
-        req.user!.orgId!,
-        req.params.projectId,
-        req.params.assetId,
-        req.body || {},
-      );
-      if (!asset) {
-        res.status(404).json({ error: 'Interior project asset not found' });
-        return;
-      }
-      EDB.logAudit({
-        orgId: req.user!.orgId!,
-        userId: req.user!.uid,
-        action: 'interior_project.asset_updated',
-        resourceType: 'interior_project_asset',
-        resourceId: asset.id,
-        details: { projectId: asset.projectId, fileId: asset.fileId, category: asset.category },
-        ipAddress: req.ip,
-        userAgent: req.get('user-agent'),
-      });
-      res.json(asset);
-    } catch (error) {
-      if (!respondInteriorProjectError(res, error)) throw error;
-    }
-  });
-
-  router.delete('/org/interior/projects/:projectId/assets/:assetId', requireAuth, requireOrgRole('owner', 'admin', 'member'), (req: Request, res: Response) => {
-    const asset = InteriorProjectAssets.removeInteriorProjectAsset(
-      req.user!.orgId!,
-      req.params.projectId,
-      req.params.assetId,
-    );
-    if (!asset) {
-      res.status(404).json({ error: 'Interior project asset not found' });
-      return;
-    }
-    EDB.logAudit({
-      orgId: req.user!.orgId!,
-      userId: req.user!.uid,
-      action: 'interior_project.asset_removed',
-      resourceType: 'interior_project_asset',
-      resourceId: asset.id,
-      details: { projectId: asset.projectId, fileId: asset.fileId, fileRetained: true },
-      ipAddress: req.ip,
-      userAgent: req.get('user-agent'),
-    });
-    res.json({ success: true, asset, fileRetained: true });
   });
 
   // ── Organization CRUD ────────────────────────────────────────────────
@@ -369,6 +85,7 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
       return;
     }
     const org = Org.createOrganization(name, slug, req.user!.uid);
+    res.locals.organizationMutationScope = org.id;
     // Re-sign JWT with orgId so the user's current session picks it up immediately
     const JWT_SECRET = getJwtSecret();
     const newToken = jwt.sign(
@@ -376,7 +93,7 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
       JWT_SECRET,
       { expiresIn: '24h' },
     );
-    res.cookie('token', newToken, { httpOnly: true, secure: false, sameSite: 'lax', maxAge: 24 * 60 * 60 * 1000 });
+    res.cookie('token', newToken, getAuthCookieOptions());
     res.status(201).json({ ...org, token: newToken, orgRole: 'owner' });
   });
 
@@ -424,6 +141,12 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
     res.json(orgs);
   });
 
+  router.post('/org/org/:orgId/ownership', requireAuth, requireOrgRole('owner'), (req: Request, res: Response) => {
+    const newOwnerId = String(req.body?.newOwnerUserId || '').trim();
+    if (!newOwnerId) { res.status(400).json({ error: 'newOwnerUserId is required' }); return; }
+    res.json(Org.transferOrganizationOwnership(req.params.orgId, req.user!.uid, newOwnerId));
+  });
+
   // ── Members ──────────────────────────────────────────────────────────
 
   router.get('/org/org/:orgId/members', requireAuth, requireOrgMember, (req: Request, res: Response) => {
@@ -463,7 +186,9 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
     }
     res.json(m);
   });
+}
 
+function mountOrganizationWorkRoutingRoutes(router: ReturnType<typeof durableOrganizationRouter>) {
   // ── Departments ──────────────────────────────────────────────────────
 
   router.get('/org/org/:orgId/departments', requireAuth, requireOrgMember, (req: Request, res: Response) => {
@@ -648,7 +373,9 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
     }
     res.json(result);
   });
+}
 
+function mountOrganizationResourceRoutes(router: ReturnType<typeof durableOrganizationRouter>) {
   // ── Knowledge Base ───────────────────────────────────────────────────
 
   router.get('/org/org/:orgId/resources/:resourceType/:resourceId/policy', requireAuth, requireOrgRole('owner', 'admin'), (req: Request, res: Response) => {
@@ -756,7 +483,9 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
       respondResourceAuthorizationError(res, error);
     }
   });
+}
 
+function mountOrganizationKnowledgeRoutes(router: ReturnType<typeof durableOrganizationRouter>) {
   router.get('/org/kb/stats', requireAuth, requireOrgMember, (req: Request, res: Response) => {
     const visible = new Set(KB.listArticles(req.user!.orgId!, undefined, req.user!.uid)
       .filter(article => canReadOrganizationResource({
@@ -822,7 +551,7 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
       req.user!.orgId!,
       req.user!.uid,
       { title, content, category, tags, status },
-      { index: req.body?.index !== false },
+      { index: false },
     );
     if (req.body?.access) {
       try {
@@ -841,6 +570,13 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
         respondResourceAuthorizationError(res, error);
         return;
       }
+    }
+    if (req.body?.index !== false) {
+      afterOrganizationSave(res, () => {
+        void KB.indexArticle(req.user!.orgId!, article.id, req.user!.uid).catch(error => {
+          console.error('[Organization] Committed article indexing failed:', error);
+        });
+      });
     }
     res.status(201).json({
       ...article,
@@ -867,10 +603,17 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
       respondResourceAuthorizationError(res, error);
       return;
     }
-    const article = KB.updateArticle(req.user!.orgId!, req.user!.uid, req.params.articleId, req.body);
+    const article = KB.updateArticle(req.user!.orgId!, req.user!.uid, req.params.articleId, req.body, { index: false });
     if (!article) {
       res.status(404).json({ error: 'Article not found' });
       return;
+    }
+    if (req.body.content || req.body.title || req.body.category || req.body.tags) {
+      afterOrganizationSave(res, () => {
+        void KB.indexArticle(req.user!.orgId!, article.id, req.user!.uid).catch(error => {
+          console.error('[Organization] Committed article re-indexing failed:', error);
+        });
+      });
     }
     res.json({
       ...article,
@@ -888,7 +631,7 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
   });
 
   router.post('/org/kb/articles/:articleId/index', requireAuth, requireOrgRole('owner', 'admin'), (req: Request, res: Response) => {
-    KB.indexArticle(req.user!.orgId!, req.params.articleId, req.user!.uid).then(count => {
+    return KB.indexArticle(req.user!.orgId!, req.params.articleId, req.user!.uid).then(count => {
       res.json({
         success: true,
         indexedChunks: count,
@@ -904,7 +647,7 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
       res.status(400).json({ error: 'cases must contain at least one golden question with a reference answer and expected chunk indexes' });
       return;
     }
-    KB.verifyArticleKnowledge(
+    return KB.verifyArticleKnowledge(
       req.user!.orgId!,
       req.params.articleId,
       req.user!.uid,
@@ -943,7 +686,9 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
       res.status(500).json({ error: err.message });
     });
   });
+}
 
+function mountOrganizationLegalRoutes(router: ReturnType<typeof durableOrganizationRouter>) {
   router.get('/org/legal/cases', requireAuth, requireOrgMember, (req: Request, res: Response) => {
     const query = String(req.query.query || '');
     const limit = Math.min(parseInt(String(req.query.limit || '50'), 10) || 50, 200);
@@ -1072,7 +817,9 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
     }
     res.status(201).json(material);
   });
+}
 
+function mountOrganizationInvitationRoutes(io: SocketIOServer | undefined, router: ReturnType<typeof durableOrganizationRouter>) {
   // ── Invitations ──────────────────────────────────────────────────────
 
   router.post('/org/org/:orgId/invitations', requireAuth, requireOrgRole('owner', 'admin'), (req: Request, res: Response) => {
@@ -1111,23 +858,40 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
     }
     // Emit member.joined event via WebSocket if available
     if (io) {
-      io.to(`org:${result.orgId}`).emit('member:joined', {
+      afterOrganizationSave(res, () => io.to(`org:${result.orgId}`).emit('member:joined', {
         userId: req.user!.uid,
         username: req.user!.username,
         orgId: result.orgId,
-      });
+      }));
     }
     res.json({ success: true, orgId: result.orgId, membership: result.membership });
   });
+}
 
+function mountOrganizationAuditRoutes(io: SocketIOServer | undefined, router: ReturnType<typeof durableOrganizationRouter>) {
   // ── Audit Log (admin only) ───────────────────────────────────────────
 
   router.get('/org/audit', requireAuth, requireOrgRole('owner', 'admin'), (req: Request, res: Response) => {
+    if (req.query.pagination === 'cursor') {
+      const keys = ['userId', 'action', 'resourceType', 'resourceId', 'from', 'to', 'cursor', 'limit'] as const;
+      if (keys.some(key => req.query[key] !== undefined && typeof req.query[key] !== 'string')) {
+        res.status(400).json({ error: 'Invalid audit pagination parameters' }); return;
+      }
+      try {
+        const filters = Object.fromEntries(keys.slice(0, 6).map(key => [key, req.query[key]]));
+        res.json(queryAuditPage(req.user!.orgId!, req.user!.uid, filters,
+          req.query.limit === undefined ? 100 : Number(req.query.limit), (req.query.cursor as string) || ''));
+      } catch (error) {
+        if (!(error instanceof AuditPageError)) throw error;
+        res.status(error.statusCode).json({ error: error.message });
+      }
+      return;
+    }
     const limit = parseInt(req.query.limit as string) || 50;
     const offset = parseInt(req.query.offset as string) || 0;
 
     // If filter params are present, use queryAuditLog
-    const hasFilters = req.query.userId || req.query.action || req.query.resourceType || req.query.from || req.query.to;
+    const hasFilters = req.query.userId || req.query.action || req.query.resourceType || req.query.resourceId || req.query.from || req.query.to;
     if (hasFilters) {
       const entries = Audit.queryAuditLog(req.user!.orgId!, {
         userId: req.query.userId as string,
@@ -1173,10 +937,10 @@ export function mountOrgRoutes(router: Router, io?: SocketIOServer) {
       return;
     }
     if (io) {
-      io.to(`org:${req.params.orgId}`).emit('member:left', {
+      afterOrganizationSave(res, () => io.to(`org:${req.params.orgId}`).emit('member:left', {
         userId: req.params.userId,
         orgId: req.params.orgId,
-      });
+      }));
     }
     res.json({ success: true });
   });

@@ -1,3 +1,5 @@
+import { ChatViewWorkRegistry } from '../../lib/chatViewWork';
+import { useConversationAttachments } from '../../hooks/useConversationAttachments';
 import React, { useCallback, useState, useRef, useEffect } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { BrainCircuit, Building2, Send, Loader2, User, Bot, Settings, Paperclip, FileText, Mic, Image as ImageIcon, XCircle, Upload, Briefcase } from 'lucide-react';
@@ -10,6 +12,7 @@ import { useApp } from '../../contexts/AppContext';
 import { useSocket } from '../../hooks/useSocket';
 import { useT } from '../../lib/useT';
 import { formatUiMessage, uiMessage } from '../../i18n/uiMessages';
+import { organizationRecoveryCopy } from '../../i18n/locales/organizationRecovery';
 import {
   isTerminalAgentStatus,
   sanitizeAgentResponseTextForDisplay,
@@ -19,13 +22,12 @@ import {
 } from '../../lib/agentResponseDelivery';
 import {
   MAX_CHAT_ATTACHMENTS,
-  createChatAttachmentReference,
-  mergeChatAttachmentReferences,
-  parseChatAttachmentContext,
-  serializeChatAttachmentContext,
+  serializeChatAttachment, CHAT_ATTACHMENT_ACCEPT,
+  mergeChatAttachmentReferences, mergePendingChatAttachments, mapImportedChatAttachments,
   type ChatAttachmentReference,
 } from '../../lib/chatAttachmentReferences';
 import { shouldReloadPersistedConversation } from '../../lib/conversationSync';
+import { organizationRemediationCopy } from '../../i18n/locales/organizationRemediation';
 
 type ChatAttachment = ChatAttachmentReference;
 
@@ -47,49 +49,6 @@ interface LumiModelPreference {
 
 function makeMessageId(prefix = 'org-msg') {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-const CHAT_ATTACHMENT_ACCEPT = [
-  '.png,.jpg,.jpeg,.webp,.gif,.bmp,.tif,.tiff',
-  '.mp3,.mpeg,.wav,.m4a,.ogg,.oga,.flac,.aac,.wma,.webm',
-  '.txt,.md,.json,.csv,.pdf,.docx,.xlsx,.xls,.pptx,.ppt,.rtf,.ts,.tsx,.js,.jsx,.py,.html,.css,.yaml,.yml,.xml,.log',
-].join(',');
-
-function isImageFileName(name: string, mimeType?: string): boolean {
-  return Boolean(mimeType?.startsWith('image/')) || /\.(png|jpe?g|webp|bmp|gif|tiff?)$/i.test(name || '');
-}
-
-function isAudioFileName(name: string, mimeType?: string): boolean {
-  return Boolean(mimeType?.startsWith('audio/')) || /\.(mp3|mpeg|wav|m4a|ogg|oga|flac|aac|wma|webm)$/i.test(name || '');
-}
-
-function extractAudioTranscript(value?: string | null): string | null {
-  const raw = String(value || '').trim();
-  if (!raw) return null;
-  const marker = 'transcript:';
-  const index = raw.toLowerCase().indexOf(marker);
-  const transcript = index >= 0 ? raw.slice(index + marker.length).trim() : raw;
-  return transcript || null;
-}
-
-function serializeChatAttachment(item: ChatAttachment): ChatAttachment {
-  return {
-    id: item.id,
-    fileName: item.fileName,
-    path: item.path,
-    content: item.content || null,
-    preview: item.preview || null,
-    mimeType: item.mimeType || '',
-    size: item.size || 0,
-    kind: item.kind,
-    fileId: item.fileId || '',
-    downloadUrl: item.downloadUrl,
-    transcript: item.transcript || null,
-    transcriptionStatus: item.transcriptionStatus || '',
-    transcriptionError: item.transcriptionError || null,
-    transcriptionProvider: item.transcriptionProvider || '',
-    transcriptionModel: item.transcriptionModel || '',
-  };
 }
 
 function normalizeHistoryMessage(item: any, language: 'zh' | 'en'): Message | null {
@@ -115,6 +74,13 @@ function normalizeHistoryMessage(item: any, language: 'zh' | 'en'): Message | nu
 }
 
 export function CentralLumiChat() {
+  const { user, workDomain, orgConnection } = useApp();
+  const scope = JSON.stringify([user?.uid || user?.username, user?.role, workDomain, orgConnection?.orgId, orgConnection?.orgRole]);
+  return <CentralLumiChatView key={scope} />;
+}
+
+function useCentralChatAttachmentsAndHistory() {
+
   const [previewFile, setPreviewFile] = useState<ChatPreviewFile | null>(null);
   const t = useT();
   const socket = useSocket();
@@ -128,17 +94,34 @@ export function CentralLumiChat() {
     timestamp: Date.now(),
     source: 'system',
   }), []);
-  const [messages, setMessages] = useState<Message[]>(() => [greeting()]);
+  const [messages, setMessageState] = useState<Message[]>(() => [greeting()]);
+  const messagesRef = useRef(messages);
+  const historyReadRef = useRef<AbortController | null>(null);
+  const historyDiscoveryRef = useRef<AbortController | null>(null);
+  const [historyError, setHistoryError] = useState(false);
+  const [olderCursor, setOlderCursor] = useState('');
+  const [conversationList, setConversationList] = useState<Array<{ id: string; displayTitle?: string }>>([]);
+  const [conversationMore, setConversationMore] = useState(false);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const historyBusyRef = useRef(false);
+  const navigationOwner = useRef<AbortController | null>(null);
+  useEffect(() => { const owner = new AbortController(); navigationOwner.current = owner; return () => owner.abort(); }, []);
+  const setMessages = useCallback((update: React.SetStateAction<Message[]>) => {
+    const next = typeof update === 'function' ? update(messagesRef.current) : update;
+    messagesRef.current = next;
+    setMessageState(next);
+  }, []);
   const [input, setInput] = useState('');
   const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([]);
   const pendingAttachmentsRef = useRef<ChatAttachment[]>([]);
-  const [conversationAttachments, setConversationAttachments] = useState<ChatAttachment[]>([]);
-  const conversationAttachmentsRef = useRef<ChatAttachment[]>([]);
-  const attachmentConversationIdRef = useRef('');
-  const [attachmentContextStorageKey, setAttachmentContextStorageKey] = useState('');
   const [dragActive, setDragActive] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const chatViewWorkRef = useRef(new ChatViewWorkRegistry());
+  const uploadWorkRef = useRef<ReturnType<ChatViewWorkRegistry['begin']> | null>(null);
   const [loading, setLoading] = useState(false);
+  const [requestActive, setRequestActive] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const cancelWorkRef = useRef<{ requestId: string; timer: ReturnType<typeof setTimeout> | null } | null>(null);
   const [requestNotice, setRequestNotice] = useState('');
   const [modelPreference, setModelPreference] = useState<LumiModelPreference | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
@@ -147,43 +130,19 @@ export function CentralLumiChat() {
   const streamingMessageIdRef = useRef<string | null>(null);
   const streamingRawTextRef = useRef('');
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const nativeDropHandledAtRef = useRef(0);
   const attachmentContextStoragePrefix = `lumi_org_chat_attachment_context:${user?.uid || user?.username || 'anonymous'}:${orgConnection?.orgId || 'unbound'}`;
-  const bindAttachmentContextToConversation = useCallback((
-    conversationId: string,
-    options: { carryCurrent?: boolean } = {},
-  ) => {
-    const nextConversationId = String(conversationId || '').trim();
-    if (attachmentConversationIdRef.current !== nextConversationId) setPreviewFile(null);
-    if (!nextConversationId) {
-      attachmentConversationIdRef.current = '';
-      setAttachmentContextStorageKey('');
-      conversationAttachmentsRef.current = [];
-      setConversationAttachments([]);
-      return;
-    }
-    if (attachmentConversationIdRef.current === nextConversationId) return;
-    const nextStorageKey = `${attachmentContextStoragePrefix}:${nextConversationId}`;
-    let nextAttachments = options.carryCurrent ? conversationAttachmentsRef.current : [];
-    if (!options.carryCurrent) {
-      try {
-        nextAttachments = parseChatAttachmentContext(localStorage.getItem(nextStorageKey));
-        if (nextAttachments.length === 0) localStorage.removeItem(nextStorageKey);
-      } catch {
-        nextAttachments = [];
-      }
-    }
-    attachmentConversationIdRef.current = nextConversationId;
-    setAttachmentContextStorageKey(nextStorageKey);
-    conversationAttachmentsRef.current = nextAttachments;
-    setConversationAttachments(nextAttachments);
-    if (options.carryCurrent && nextAttachments.length > 0) {
-      try {
-        localStorage.setItem(nextStorageKey, serializeChatAttachmentContext(nextAttachments));
-      } catch {}
-    }
-  }, [attachmentContextStoragePrefix]);
-
+  const resetAttachmentConversationView = useCallback(() => {
+    chatViewWorkRef.current.invalidate();
+    historyReadRef.current?.abort();
+    uploadWorkRef.current = null;
+    setUploading(false);
+    pendingAttachmentsRef.current = [];
+    setPendingAttachments([]);
+    setPreviewFile(null);
+  }, []);
+  const { conversationAttachments, conversationAttachmentsRef, attachmentConversationIdRef,
+    bindAttachmentContextToConversation, rememberConversationAttachments, clearConversationAttachments: clearStoredAttachments,
+  } = useConversationAttachments(attachmentContextStoragePrefix, resetAttachmentConversationView);
   useEffect(() => {
     pendingAttachmentsRef.current = pendingAttachments;
   }, [pendingAttachments]);
@@ -194,35 +153,29 @@ export function CentralLumiChat() {
       // deliberate conversation boundary and old extracted text is discarded.
       localStorage.removeItem(attachmentContextStoragePrefix);
     } catch {}
-    bindAttachmentContextToConversation('');
-    pendingAttachmentsRef.current = [];
-    setPendingAttachments([]);
-  }, [attachmentContextStoragePrefix, bindAttachmentContextToConversation]);
-
-  useEffect(() => {
-    const onConversationClosed = (event: Event) => {
-      const closedConversationId = String((event as CustomEvent<{ conversationId?: string }>).detail?.conversationId || '');
-      if (!closedConversationId || closedConversationId !== attachmentConversationIdRef.current) return;
-      try {
-        localStorage.removeItem(`${attachmentContextStoragePrefix}:${closedConversationId}`);
-      } catch {}
-      bindAttachmentContextToConversation('');
-    };
-    window.addEventListener('lumi:conversation-closed', onConversationClosed);
-    return () => window.removeEventListener('lumi:conversation-closed', onConversationClosed);
-  }, [attachmentContextStoragePrefix, bindAttachmentContextToConversation]);
+  }, [attachmentContextStoragePrefix]);
 
   const clearActiveRequest = useCallback(() => {
+    if (cancelWorkRef.current?.timer) clearTimeout(cancelWorkRef.current.timer);
+    cancelWorkRef.current = null;
+    setCancelling(false);
     if (timeoutRef.current) {
       clearTimeout(timeoutRef.current);
       timeoutRef.current = null;
     }
     activeRequestIdRef.current = null;
+    setRequestActive(false);
     streamingMessageIdRef.current = null;
     streamingRawTextRef.current = '';
     setLoading(false);
     setRequestNotice('');
   }, []);
+  useEffect(() => () => {
+    chatViewWorkRef.current.invalidate();
+    historyDiscoveryRef.current?.abort();
+    historyReadRef.current?.abort();
+    clearActiveRequest();
+  }, [clearActiveRequest]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -273,76 +226,28 @@ export function CentralLumiChat() {
     window.dispatchEvent(new CustomEvent('lumi:client-state-refresh'));
   }, [orgConnection?.orgId]);
 
-  const rememberConversationAttachments = useCallback((attachments: ChatAttachment[]) => {
-    const merged = mergeChatAttachmentReferences(conversationAttachmentsRef.current, attachments).attachments;
-    conversationAttachmentsRef.current = merged;
-    setConversationAttachments(merged);
-    if (attachmentContextStorageKey) {
-      try {
-        localStorage.setItem(attachmentContextStorageKey, serializeChatAttachmentContext(merged));
-      } catch {}
-    }
-  }, [attachmentContextStorageKey]);
-
   const clearConversationAttachments = useCallback(() => {
-    conversationAttachmentsRef.current = [];
-    setConversationAttachments([]);
-    if (attachmentContextStorageKey) {
-      try { localStorage.removeItem(attachmentContextStorageKey); } catch {}
-    }
+    clearStoredAttachments();
     toast.success(uiMessage('agent-chat-page.session-materials-cleared.53bea199b2'));
-  }, [attachmentContextStorageKey]);
+  }, [clearStoredAttachments]);
 
   const appendPendingAttachments = useCallback((incoming: ChatAttachment[]) => {
-    const occupied = mergeChatAttachmentReferences(
-      conversationAttachmentsRef.current,
-      pendingAttachmentsRef.current,
-    ).attachments;
-    const availability = mergeChatAttachmentReferences(occupied, incoming);
-    const pendingMerge = mergeChatAttachmentReferences(pendingAttachmentsRef.current, availability.added);
-    if (pendingMerge.added.length > 0) {
-      pendingAttachmentsRef.current = pendingMerge.attachments;
-      setPendingAttachments(pendingMerge.attachments);
+    const result = mergePendingChatAttachments(conversationAttachmentsRef.current, pendingAttachmentsRef.current, incoming);
+    if (result.added.length > 0) {
+      pendingAttachmentsRef.current = result.attachments;
+      setPendingAttachments(result.attachments);
     }
-    if (availability.duplicateCount > 0) {
+    if (result.duplicateCount > 0) {
       toast.info(uiMessage('agent-chat-page.file-already-attached.24544e870a'));
     }
-    if (availability.overflowCount > 0) {
+    if (result.overflowCount > 0) {
       toast.error(formatUiMessage('agent-chat-page.up-to-value0-files-can.349aa29325', { value0: MAX_CHAT_ATTACHMENTS }));
     }
-    return pendingMerge.added;
-  }, []);
-
-  const mapImportedAttachments = useCallback((files: any[]): ChatAttachment[] => files.map(file => {
-    const fileName = file.name || file.displayName || file.id || 'attachment';
-    const mimeType = file.mimeType || '';
-    const kind: ChatAttachment['kind'] =
-      file.kind === 'image' || isImageFileName(fileName, mimeType) ? 'image' :
-      file.kind === 'audio' || isAudioFileName(fileName, mimeType) ? 'audio' :
-      'file';
-    const transcript = kind === 'audio'
-      ? extractAudioTranscript(file.transcript || file.content || file.preview || null)
-      : null;
-    return createChatAttachmentReference({
-      fileId: file.id || fileName,
-      fileName,
-      path: file.path,
-      content: file.content || null,
-      preview: file.preview || null,
-      mimeType,
-      rawSize: file.rawSize || file.size || 0,
-      kind,
-      downloadUrl: file.id ? scopedFileUrl(`/api/files/download/${encodeURIComponent(file.id)}?inline=1`) : undefined,
-      transcript,
-      transcriptionStatus: file.extractionStatus || (transcript ? 'indexed' : ''),
-      transcriptionError: file.extractionError || file.syncError || null,
-      transcriptionProvider: file.extractionProvider || undefined,
-      transcriptionModel: file.extractionModel || undefined,
-    });
-  }), [scopedFileUrl]);
+    return result.added;
+  }, [conversationAttachmentsRef]);
 
   const acceptImportedAttachments = useCallback((files: any[], skippedCount = 0) => {
-    const uploadedAttachments = mapImportedAttachments(files);
+    const uploadedAttachments = mapImportedChatAttachments(files, scopedFileUrl);
     const added = appendPendingAttachments(uploadedAttachments);
     notifyKnowledgeUpdated(uploadedAttachments.map(item => ({
       id: item.fileId || item.path || item.fileName,
@@ -355,115 +260,52 @@ export function CentralLumiChat() {
     if (skippedCount > 0) {
       toast.info(formatUiMessage('agent-chat-page.some-dropped-files-skipped.d3df0abf37', { value0: skippedCount }));
     }
-  }, [appendPendingAttachments, mapImportedAttachments, notifyKnowledgeUpdated]);
+  }, [appendPendingAttachments, scopedFileUrl, notifyKnowledgeUpdated]);
 
-  const uploadChatAttachments = useCallback(async (files: FileList | null) => {
-    const selectedFiles = Array.from(files || []);
-    if (selectedFiles.length === 0 || uploading) return;
+  const runAttachmentImport = useCallback(async (sources: File[]) => {
+    if (sources.length === 0 || uploadWorkRef.current) return;
     if (!orgConnection?.orgId) {
       toast.error('Please connect an organization workspace first.');
       return;
     }
-
-    const occupiedCount = mergeChatAttachmentReferences(
-      conversationAttachmentsRef.current,
-      pendingAttachmentsRef.current,
+    const remainingSlots = MAX_CHAT_ATTACHMENTS - mergeChatAttachmentReferences(
+      conversationAttachmentsRef.current, pendingAttachmentsRef.current,
     ).attachments.length;
-    const remainingSlots = MAX_CHAT_ATTACHMENTS - occupiedCount;
     if (remainingSlots <= 0) {
       toast.error(formatUiMessage('agent-chat-page.up-to-value0-files-can.349aa29325', { value0: MAX_CHAT_ATTACHMENTS }));
       return;
     }
+    const work = chatViewWorkRef.current.begin();
+    uploadWorkRef.current = work;
     setUploading(true);
     try {
+      const selected = sources.slice(0, remainingSlots);
       const formData = new FormData();
-      selectedFiles.slice(0, remainingSlots).forEach(file => formData.append('files', file));
+      selected.forEach(file => formData.append('files', file));
       formData.append('domain', 'work');
       formData.append('orgId', orgConnection.orgId);
-
-      const res = await fetch('/api/files/upload', {
-        method: 'POST',
-        body: formData,
-        credentials: 'include',
-      });
+      const res = await fetch('/api/files/upload', { method: 'POST', body: formData, credentials: 'include', signal: work.signal });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data.error || `Upload failed (${res.status})`);
-      }
-
-      const uploadedFiles = Array.isArray(data.files) ? data.files : [];
-      if (uploadedFiles.length === 0) {
-        throw new Error('No files were returned by upload.');
-      }
-      acceptImportedAttachments(uploadedFiles, Math.max(0, selectedFiles.length - remainingSlots));
+      if (!work.isCurrent()) return;
+      if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`);
+      const files = Array.isArray(data.files) ? data.files : [];
+      if (files.length === 0) throw new Error('No files were returned by upload.');
+      acceptImportedAttachments(files, Math.max(0, sources.length - selected.length));
     } catch (err: any) {
-      toast.error(err?.message || 'Upload failed.');
+      if (work.isCurrent()) toast.error(err?.message || 'Upload failed.');
     } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
+      if (work.isCurrent()) {
+        uploadWorkRef.current = null;
+        setUploading(false);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+      }
+      work.finish();
     }
-  }, [acceptImportedAttachments, orgConnection?.orgId, uploading]);
+  }, [conversationAttachmentsRef, acceptImportedAttachments, orgConnection?.orgId]);
 
-  const importChatAttachmentPaths = useCallback(async (paths: string[]) => {
-    const uniquePaths = [...new Set(paths.map(item => String(item || '').trim()).filter(Boolean))];
-    if (uniquePaths.length === 0 || uploading || !orgConnection?.orgId) return;
-    const occupiedCount = mergeChatAttachmentReferences(
-      conversationAttachmentsRef.current,
-      pendingAttachmentsRef.current,
-    ).attachments.length;
-    const remainingSlots = MAX_CHAT_ATTACHMENTS - occupiedCount;
-    if (remainingSlots <= 0) {
-      toast.error(formatUiMessage('agent-chat-page.up-to-value0-files-can.349aa29325', { value0: MAX_CHAT_ATTACHMENTS }));
-      return;
-    }
-    setUploading(true);
-    try {
-      const importPaths = uniquePaths.slice(0, remainingSlots);
-      const res = await fetch(scopedFileUrl('/api/files/import-paths'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Lumi-Desktop-Import': 'file-drop' },
-        body: JSON.stringify({ paths: importPaths }),
-        credentials: 'include',
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Upload failed.');
-      acceptImportedAttachments(data.files || [], (data.skipped || []).length + Math.max(0, uniquePaths.length - importPaths.length));
-    } catch (err: any) {
-      toast.error(err?.message || 'Upload failed.');
-    } finally {
-      setUploading(false);
-    }
-  }, [acceptImportedAttachments, orgConnection?.orgId, scopedFileUrl, uploading]);
-
-  useEffect(() => {
-    if (typeof window === 'undefined' || !(window as any).__TAURI_INTERNALS__) return;
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    const setup = async () => {
-      try {
-        const { getCurrentWindow } = await import('@tauri-apps/api/window');
-        if (cancelled) return;
-        unlisten = await getCurrentWindow().onDragDropEvent((event: any) => {
-          const payload = event?.payload;
-          if (payload?.type === 'enter' || payload?.type === 'over') {
-            setDragActive(true);
-            return;
-          }
-          if (payload?.type === 'drop') {
-            nativeDropHandledAtRef.current = Date.now();
-            setDragActive(false);
-            void importChatAttachmentPaths(Array.isArray(payload.paths) ? payload.paths : []);
-            return;
-          }
-          setDragActive(false);
-        });
-        if (cancelled) unlisten?.();
-      } catch {}
-    };
-    void setup();
-    return () => { cancelled = true; unlisten?.(); };
-  }, [importChatAttachmentPaths]);
-
+  const uploadChatAttachments = useCallback((files: FileList | null) => (
+    runAttachmentImport(Array.from(files || []))
+  ), [runAttachmentImport]);
   const removePendingAttachment = useCallback((id: string) => {
     setPendingAttachments(prev => {
       const next = prev.filter(item => item.id !== id);
@@ -472,70 +314,147 @@ export function CentralLumiChat() {
     });
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    const loadConversation = async () => {
+  const loadConversationMessages = useCallback(async (conversationId: string, before = '') => {
+    historyReadRef.current?.abort();
+    const controller = new AbortController();
+    historyReadRef.current = controller;
+    const visibleMessages = messagesRef.current;
+    const ownsRead = () => !controller.signal.aborted && historyReadRef.current === controller
+      && conversationId === attachmentConversationIdRef.current
+      && visibleMessages === messagesRef.current && !activeRequestIdRef.current;
+    setHistoryError(false);
+    try {
+      const res = await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/messages?domain=work&limit=80&page=1${before ? '&before=' + encodeURIComponent(before) : ''}`, {
+        credentials: 'include', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]),
+      });
+      const body = await res.json();
+      if (!ownsRead()) return;
+      if (!res.ok || !Array.isArray(body.messages)) throw new Error('Conversation history unavailable');
+      const history = body.messages.map((item: any) => normalizeHistoryMessage(item, locale)).filter(Boolean) as Message[];
+      streamingMessageIdRef.current = null;
+      streamingRawTextRef.current = '';
+      setOlderCursor(body.hasMore === true && typeof body.nextCursor === 'string' ? body.nextCursor : '');
+      setMessages(before ? [...history.filter(item => !visibleMessages.some(existing => existing.id === item.id)), ...visibleMessages] : history.length > 0 ? history : [greeting()]);
+    } catch { if (ownsRead()) setHistoryError(true); } finally {
+      if (historyReadRef.current === controller) historyReadRef.current = null;
+    }
+  }, [attachmentConversationIdRef, greeting, locale, setMessages]);
+
+  const browseConversations = async (more = false) => {
+    if (historyBusyRef.current || activeRequestIdRef.current) return;
+    const owner = navigationOwner.current; if (!owner || owner.signal.aborted) return;
+    historyBusyRef.current = true; setHistoryBusy(true); setHistoryError(false);
+    const ownsView = chatViewWorkRef.current.capture();
+    try {
+      const res = await fetch(`/api/conversations?domain=work&agentId=lumi&limit=20&offset=${more ? conversationList.length : 0}`, { credentials: 'include', signal: AbortSignal.any([owner.signal, AbortSignal.timeout(15000)]) });
+      const body = await res.json();
+      if (!ownsView()) return;
+      if (!res.ok || !Array.isArray(body.conversations) || !body.conversations.every((item: any) => typeof item?.id === 'string')) throw new Error('Invalid conversation list');
+      setConversationList(current => more ? [...current, ...body.conversations.filter((item: any) => !current.some(existing => existing.id === item.id))] : body.conversations);
+      setConversationMore(body.hasMore === true);
+    } catch { if (ownsView()) setHistoryError(true); }
+    finally { if (ownsView()) { historyBusyRef.current = false; setHistoryBusy(false); } }
+  };
+  const chooseConversation = async (id: string) => {
+    if (historyBusyRef.current || activeRequestIdRef.current) return;
+    const owner = navigationOwner.current; if (!owner || owner.signal.aborted) return;
+    historyBusyRef.current = true; setHistoryBusy(true); setHistoryError(false);
+    const ownsView = chatViewWorkRef.current.capture();
+    try {
+      const res = await fetch(`/api/conversations/${encodeURIComponent(id)}/activate`, { method: 'POST', credentials: 'include', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ domain:'work', agentId:'lumi' }), signal: AbortSignal.any([owner.signal, AbortSignal.timeout(15000)]) });
+      const body = await res.json();
+      if (!ownsView()) return;
+      if (!res.ok || body.conversation?.id !== id) throw new Error('Conversation activation failed');
+      bindAttachmentContextToConversation(id); setOlderCursor('');
+      await loadConversationMessages(id);
+    } catch { if (ownsView()) setHistoryError(true); }
+    finally { if (!owner.signal.aborted) { historyBusyRef.current = false; setHistoryBusy(false); } }
+  };
+
+  const retryHistory = useCallback(async () => {
+    if (activeRequestIdRef.current) return;
+    historyDiscoveryRef.current?.abort();
+    const controller = new AbortController();
+    historyDiscoveryRef.current = controller;
+    const ownsView = chatViewWorkRef.current.capture(), visibleMessages = messagesRef.current;
+    const ownsRead = () => !controller.signal.aborted && historyDiscoveryRef.current === controller && ownsView()
+      && visibleMessages === messagesRef.current && !activeRequestIdRef.current;
+    setHistoryError(false);
       try {
-        const activeRes = await fetch('/api/conversations/active?domain=work&agentId=lumi', {
-          credentials: 'include',
-        });
-        const activeData = await activeRes.json().catch(() => ({}));
-        const conversationId = activeData.activeConversation?.id;
-        if (!activeRes.ok || !conversationId) {
-          if (!cancelled) setMessages(prev => (prev.length ? prev : [greeting()]));
-          return;
-        }
+        const res = await fetch('/api/conversations/active?domain=work&agentId=lumi', { credentials: 'include', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) });
+        const body = await res.json();
+        if (!ownsRead()) return;
+        if (!res.ok || !body || !('activeConversation' in body)) throw new Error('Conversation discovery unavailable');
+        const conversationId = body.activeConversation?.id;
+        if (body.activeConversation != null && (typeof conversationId !== 'string' || !conversationId)) throw new Error('Invalid active conversation');
+        if (!conversationId) return;
         bindAttachmentContextToConversation(conversationId);
-        const messagesRes = await fetch(`/api/conversations/${conversationId}/messages?domain=work&limit=80`, {
-          credentials: 'include',
-        });
-        const messagesData = await messagesRes.json().catch(() => ({}));
-        if (!messagesRes.ok) return;
-        const history = Array.isArray(messagesData.messages)
-          ? messagesData.messages.map((item: any) => normalizeHistoryMessage(item, locale)).filter(Boolean) as Message[]
-          : [];
-        if (!cancelled) setMessages(history.length > 0 ? history : [greeting()]);
-      } catch {
-        if (!cancelled) setMessages(prev => (prev.length ? prev : [greeting()]));
-      }
-    };
-    loadConversation();
-    return () => { cancelled = true; };
-  }, [bindAttachmentContextToConversation, greeting, locale, orgConnection?.orgId, user?.uid, user?.username]);
+        await loadConversationMessages(conversationId);
+      } catch { if (ownsRead()) setHistoryError(true); }
+  }, [bindAttachmentContextToConversation, loadConversationMessages]);
+  useEffect(() => {
+    void retryHistory();
+    return () => { historyDiscoveryRef.current?.abort(); historyReadRef.current?.abort(); };
+  }, [retryHistory]);
+  return {
+    socket, activeRequestIdRef, setMessages, streamingMessageIdRef, setLoading, setRequestNotice,
+    streamingRawTextRef, locale, clearActiveRequest, attachmentConversationIdRef,
+    bindAttachmentContextToConversation, loadConversationMessages, setDragActive,
+    uploadChatAttachments, input, pendingAttachments, conversationAttachmentsRef, loading, requestActive, setRequestActive, uploadWorkRef,
+    orgConnection, messages, timeoutRef, setInput, pendingAttachmentsRef, setPendingAttachments,
+    rememberConversationAttachments, previewFile, isZh, setPreviewFile, dragActive, t, modelPreferenceValue,
+    modelPreferenceLabel, openModelSettings, endRef, fileInputRef, requestNotice, conversationAttachments,
+    clearConversationAttachments, removePendingAttachment, uploading, historyError, retryHistory, cancelling, setCancelling, cancelWorkRef,
+    olderCursor, conversationList, conversationMore, historyBusy, historyBusyRef, browseConversations, chooseConversation
+  } as const;
+}
+
+function useCentralChatEventsAndView(previousBindings: ReturnType<typeof useCentralChatAttachmentsAndHistory>) {
+  const { socket, activeRequestIdRef, setMessages, streamingMessageIdRef, setLoading, setRequestNotice, streamingRawTextRef, locale, clearActiveRequest, attachmentConversationIdRef, bindAttachmentContextToConversation, loadConversationMessages, setDragActive, uploadChatAttachments, input, pendingAttachments, conversationAttachmentsRef, loading, requestActive, setRequestActive, uploadWorkRef, orgConnection, messages, timeoutRef, setInput, pendingAttachmentsRef, setPendingAttachments, rememberConversationAttachments, previewFile, isZh, setPreviewFile, dragActive, t, modelPreferenceValue, modelPreferenceLabel, openModelSettings, endRef, fileInputRef, requestNotice, conversationAttachments, clearConversationAttachments, removePendingAttachment, uploading } = previousBindings;
+  const { historyError, retryHistory, cancelling, setCancelling, cancelWorkRef } = previousBindings;
+  const { olderCursor, conversationList, conversationMore, historyBusy, historyBusyRef, browseConversations, chooseConversation } = previousBindings;
+  const recovery = organizationRecoveryCopy(locale);
+
 
   useEffect(() => {
     if (!socket) return;
+    let listening = true;
 
     const isCurrent = (data?: { requestId?: string }) => {
-      return Boolean(activeRequestIdRef.current && data?.requestId === activeRequestIdRef.current);
+      return listening && Boolean(activeRequestIdRef.current && data?.requestId === activeRequestIdRef.current);
     };
 
-    const onChunk = (data: { text?: string; agentName?: string; requestId?: string }) => {
-      if (!isCurrent(data) || !data.text) return;
-      setLoading(false);
-      setRequestNotice('');
-      streamingRawTextRef.current += data.text;
-      const publicText = sanitizeAgentStreamingTextForDisplay(streamingRawTextRef.current, locale);
-      if (!publicText) return;
+    const updateReply = (content: string, details: Pick<Message, 'fileArtifacts' | 'conversationId'> = {}) => {
       setMessages(prev => {
         const streamingId = streamingMessageIdRef.current;
         if (streamingId) {
           return prev.map(message => (
             message.id === streamingId
-              ? { ...message, content: publicText }
+              ? { ...message, content: content || message.content, ...details }
               : message
           ));
         }
-        const nextId = makeMessageId('org-stream');
+        if (!content) return prev;
+        const nextId = makeMessageId('org-response');
         streamingMessageIdRef.current = nextId;
         return [...prev, {
           id: nextId,
           role: 'assistant',
-          content: publicText,
+          content,
+          ...details,
           timestamp: Date.now(),
           source: 'socket',
         }];
       });
+    };
+
+    const onChunk = (data: { text?: string; agentName?: string; requestId?: string }) => {
+      if (!isCurrent(data) || !data.text) return;
+      setLoading(false);
+      if (!cancelWorkRef.current) setRequestNotice('');
+      streamingRawTextRef.current += data.text;
+      const publicText = sanitizeAgentStreamingTextForDisplay(streamingRawTextRef.current, locale);
+      if (publicText) updateReply(publicText);
     };
 
     const onResponse = (data: AgentResponseDelivery & { requestId?: string; fileArtifacts?: ChatArtifact[]; conversationId?: string }) => {
@@ -550,26 +469,7 @@ export function CentralLumiChat() {
         clearActiveRequest();
         return;
       }
-      setMessages(prev => {
-        const streamingId = streamingMessageIdRef.current;
-        if (streamingId) {
-          return prev.map(message => (
-            message.id === streamingId
-              ? { ...message, content: finalText || message.content, fileArtifacts: data.fileArtifacts, conversationId: data.conversationId }
-              : message
-          ));
-        }
-        if (!finalText) return prev;
-        return [...prev, {
-          id: makeMessageId('org-response'),
-          role: 'assistant',
-          content: finalText,
-          fileArtifacts: data.fileArtifacts,
-          conversationId: data.conversationId,
-          timestamp: Date.now(),
-          source: 'socket',
-        }];
-      });
+      updateReply(finalText, { fileArtifacts: data.fileArtifacts, conversationId: data.conversationId });
       clearActiveRequest();
     };
 
@@ -577,7 +477,7 @@ export function CentralLumiChat() {
       if (!isCurrent(data)) return;
       if (data.status === 'thinking' || data.status === 'responding') {
         setLoading(true);
-        setRequestNotice('');
+        if (!cancelWorkRef.current) setRequestNotice('');
       }
       if (data.status && isTerminalAgentStatus(data.status)) {
         const streamingId = streamingMessageIdRef.current;
@@ -612,7 +512,7 @@ export function CentralLumiChat() {
       rolledOver?: boolean;
       previousConversationId?: string;
     }) => {
-      if (data.agentId !== 'lumi' || !data.conversationId) return;
+      if (!listening || data.agentId !== 'lumi' || !data.conversationId) return;
       const currentConversationId = attachmentConversationIdRef.current;
       const shouldReload = shouldReloadPersistedConversation({
         event: data,
@@ -626,20 +526,7 @@ export function CentralLumiChat() {
           carryCurrent: data.rolledOver === true || !currentConversationId,
         });
       }
-      streamingMessageIdRef.current = null;
-      streamingRawTextRef.current = '';
-      fetch(`/api/conversations/${data.conversationId}/messages?domain=work&limit=80`, {
-        credentials: 'include',
-      })
-        .then(response => response.json().then(body => ({ ok: response.ok, body })))
-        .then(({ ok, body }) => {
-          if (!ok || !Array.isArray(body.messages)) return;
-          const history = body.messages
-            .map((item: any) => normalizeHistoryMessage(item, locale))
-            .filter(Boolean) as Message[];
-          setMessages(history.length > 0 ? history : [greeting()]);
-        })
-        .catch(() => {});
+      void loadConversationMessages(data.conversationId);
     };
 
     socket.on('agent:chunk', onChunk);
@@ -649,14 +536,14 @@ export function CentralLumiChat() {
     socket.on('chat:conversation_updated', onConversationUpdated);
 
     return () => {
+      listening = false;
       socket.off('agent:chunk', onChunk);
       socket.off('agent:response', onResponse);
       socket.off('agent:status', onStatus);
       socket.off('agent:error', onError);
       socket.off('chat:conversation_updated', onConversationUpdated);
-      clearActiveRequest();
     };
-  }, [bindAttachmentContextToConversation, clearActiveRequest, greeting, locale, socket]);
+  }, [attachmentConversationIdRef, bindAttachmentContextToConversation, clearActiveRequest, loadConversationMessages, locale, setMessages, socket]);
 
   const handleDragOver = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -673,7 +560,6 @@ export function CentralLumiChat() {
     event.preventDefault();
     event.stopPropagation();
     setDragActive(false);
-    if (Date.now() - nativeDropHandledAtRef.current < 700) return;
     void uploadChatAttachments(event.dataTransfer.files);
   };
 
@@ -684,7 +570,9 @@ export function CentralLumiChat() {
       conversationAttachmentsRef.current.map(serializeChatAttachment),
       directAttachments,
     ).attachments;
-    if ((!text && directAttachments.length === 0) || loading || uploading) return;
+    // Streaming and the slow-response notice end the spinner, not the request.
+    // The ref also rejects duplicate submissions before React can rerender.
+    if ((!text && directAttachments.length === 0) || activeRequestIdRef.current || loading || uploadWorkRef.current || historyBusyRef.current) return;
     setRequestNotice('');
     if (!socket) {
       setMessages(prev => [...prev, {
@@ -727,6 +615,7 @@ export function CentralLumiChat() {
     };
 
     activeRequestIdRef.current = requestId;
+    setRequestActive(true);
     streamingMessageIdRef.current = null;
     streamingRawTextRef.current = '';
     if (timeoutRef.current) clearTimeout(timeoutRef.current);
@@ -755,6 +644,58 @@ export function CentralLumiChat() {
       source: 'org-chat',
       requestId,
     });
+  };
+
+  const handleStop = () => {
+    const requestId = activeRequestIdRef.current;
+    if (!socket || !requestId || cancelWorkRef.current) return;
+    const work = { requestId, timer: null as ReturnType<typeof setTimeout> | null };
+    cancelWorkRef.current = work;
+    setCancelling(true); setRequestNotice(recovery.cancelling);
+    const current = () => cancelWorkRef.current === work && activeRequestIdRef.current === requestId;
+    const failed = (message: string) => {
+      if (!current()) return;
+      if (work.timer) clearTimeout(work.timer);
+      cancelWorkRef.current = null; setCancelling(false); setRequestNotice(message);
+    };
+    work.timer = setTimeout(() => failed(recovery.cancelUnknown), 8000);
+    const scope = {
+      requestId, source: 'org-chat', domain: 'work', orgId: orgConnection?.orgId || null,
+      conversationId: attachmentConversationIdRef.current || undefined,
+    };
+    try {
+      socket.emit('agent:abort_chat', scope, (result?: { ok?: boolean; requestId?: string; status?: string; error?: string }) => {
+        if (!current()) return;
+        if (result?.ok !== true || result.requestId !== requestId) { failed(result?.error || recovery.cancelFailed); return; }
+        if (work.timer) clearTimeout(work.timer);
+        work.timer = null;
+        if (result.status === 'completed' || (result.status && isTerminalAgentStatus(result.status))) {
+          // A terminal abort ACK carries no transcript. Request the existing
+          // scoped replay and let the normal terminal handlers render it.
+          setRequestNotice(recovery.recovering);
+          work.timer = setTimeout(() => failed(recovery.recoveryFailed), 8000);
+          try {
+            socket.emit('agent:execution_resume', scope, (resumed?: {
+              ok?: boolean; error?: string;
+              snapshot?: { requestId?: string; source?: string; conversationId?: string; terminal?: boolean };
+            }) => {
+              if (!current()) return;
+              const snapshot = resumed?.snapshot;
+              if (resumed?.ok !== true || snapshot?.requestId !== requestId || snapshot.source !== scope.source || !snapshot.terminal
+                || (scope.conversationId && snapshot.conversationId !== scope.conversationId)) {
+                failed(resumed?.error || recovery.recoveryFailed);
+              }
+              // Keep the deadline until the replay arrives: a successful ACK
+              // alone must not leave the stop control disabled indefinitely.
+            });
+          } catch { failed(recovery.recoveryFailed); }
+          return;
+        }
+        // An accepted abort is not a terminal result. The original request stays
+        // active until its normal response/status/error settles it.
+        setRequestNotice(recovery.cancelling);
+      });
+    } catch { failed(recovery.cancelFailed); }
   };
 
   return (
@@ -814,6 +755,18 @@ export function CentralLumiChat() {
       </div>
 
       {/* Messages */}
+      <div className="space-y-2 px-6 py-2">
+        <button type="button" disabled={requestActive || historyBusy} onClick={() => void browseConversations()}>{organizationRemediationCopy(locale).conversations}</button>
+        {conversationList.map(item => <button className="ml-3" type="button" key={item.id} disabled={requestActive || historyBusy} onClick={() => void chooseConversation(item.id)}>{item.displayTitle || item.id}</button>)}
+        {conversationMore && <button type="button" disabled={requestActive || historyBusy} onClick={() => void browseConversations(true)}>{organizationRemediationCopy(locale).moreConversations}</button>}
+        {olderCursor && <button type="button" disabled={requestActive || historyBusy} onClick={() => void loadConversationMessages(attachmentConversationIdRef.current!, olderCursor)}>{organizationRemediationCopy(locale).older}</button>}
+      </div>
+      {historyError && (
+        <div role="alert" className="mx-6 mt-3 rounded-xl border border-amber-300/20 bg-amber-300/10 p-3 text-sm text-amber-100">
+          <p>{recovery.historyError}</p>
+          <button type="button" disabled={requestActive} onClick={() => void retryHistory()} className="mt-2 rounded-lg border border-white/15 px-3 py-1 disabled:opacity-40">{recovery.retryHistory}</button>
+        </div>
+      )}
       <div className="flex-1 overflow-y-auto p-6 space-y-6">
         {messages.map((msg) => (
           <motion.div
@@ -978,13 +931,19 @@ export function CentralLumiChat() {
           />
           <button
             onClick={handleSend}
-            disabled={(!input.trim() && pendingAttachments.length === 0) || loading || uploading}
+            disabled={(!input.trim() && pendingAttachments.length === 0) || requestActive || loading || uploading}
             className="p-3 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-30 disabled:cursor-not-allowed text-white transition-colors"
           >
             {loading ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
           </button>
+          {requestActive && <button type="button" disabled={cancelling} onClick={handleStop} className="rounded-xl border border-rose-300/25 px-3 py-2 text-sm text-rose-100 disabled:opacity-40">{recovery.stop}</button>}
         </div>
       </div>
     </div>
   );
+}
+
+function CentralLumiChatView() {
+  const state0 = useCentralChatAttachmentsAndHistory();
+  return useCentralChatEventsAndView(state0);
 }

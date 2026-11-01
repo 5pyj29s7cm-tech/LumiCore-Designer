@@ -14,8 +14,9 @@ import { ToolRegistry } from '../server/tools/registry';
 import { readDB, writeDB } from '../db_layer';
 import { getIndustryWorkflowTask } from '../server/industry/workflow_service';
 import { getOrCreateActiveConversation } from '../server/conversation/manager';
-import { ensureBackgroundConversationActionTask } from '../server/conversation/action_ledger';
-import { bindIndustryWorkflowToolPolicy } from '../server/routes/chat_routes';
+import { ensureBackgroundConversationActionTask } from '../server/conversation/ledger/background';
+import { bindIndustryWorkflowToolPolicy } from '../server/industry/execution_policy';
+import { createOrganization } from '../server/org/org';
 
 beforeAll(async () => {
   const { initDatabase } = await import('../db_layer');
@@ -118,7 +119,9 @@ describe('industry capability profile and channel routing', () => {
           'industry_workflow_complete',
         ]));
         expect(pipeline.execution.promptOverlay).toContain(`entryId=${scenario.entryId}`);
-        expect(pipeline.capabilityPlan.taskLedgerRequired).toBe(false);
+        // The current flag is the task-center/resumption ceiling, not proof
+        // that a scoped workflow has (or has not) acquired its durable ledger.
+        expect(pipeline.capabilityPlan.taskLedgerRequired).toBe(channel === 'task');
       }
     }
   });
@@ -151,7 +154,7 @@ describe('industry capability profile and channel routing', () => {
     }
   });
 
-  it('retains the organization ledger so department and member routing can bind the same industry work', () => {
+  it('retains organization scope and industry routing without mislabeling ordinary chat as task-center entry', () => {
     const registry = createRegistry();
     const scenario = SCENARIOS[PRODUCT_VARIANT.productLine][0];
     const pipeline = buildLumiExecutionPipeline({
@@ -163,7 +166,10 @@ describe('industry capability profile and channel routing', () => {
       source: 'feishu_bot',
     });
     expect(pipeline.turnIntent.flow.industryWorkflowEntryId).toBe(scenario.entryId);
-    expect(pipeline.capabilityPlan.taskLedgerRequired).toBe(true);
+    expect(pipeline.turnIntent.surface).toBe('work');
+    expect(pipeline.turnIntent.boundary).toBe('tool_action');
+    expect(pipeline.capabilityPlan.taskLedgerRequired).toBe(false);
+    expect(pipeline.execution.toolPolicy.allowedTools).toContain('industry_workflow_start');
   });
 
   it('starts exactly one durable workflow on idempotent retry without leaking raw input into arguments or task rows', async () => {
@@ -207,7 +213,7 @@ describe('industry capability profile and channel routing', () => {
     const registry = createRegistry();
     const scenario = SCENARIOS[PRODUCT_VARIANT.productLine][0];
     const userId = `industry_org_bind_${PRODUCT_VARIANT.productLine}`;
-    const orgId = `industry_org_bind_${PRODUCT_VARIANT.productLine}`;
+    const orgId = createOrganization('Fixture industry organization', `industry-org-bind-${PRODUCT_VARIANT.productLine}`, userId).id;
     const conversation = getOrCreateActiveConversation(userId, '', 'work', orgId);
     const conversationTaskId = `industry_org_action_${PRODUCT_VARIANT.productLine}`;
     const db = readDB();
@@ -288,8 +294,19 @@ describe('industry capability profile and channel routing', () => {
 
     const reused = JSON.parse(await registry.execute('industry_workflow_start', { entryId: scenario.entryId }, context));
     expect(reused.task.id).toBe(started.task.id);
-    await expect(registry.execute('industry_workflow_complete', { taskId: 'wt_task_foreign' }, context))
-      .rejects.toThrow(/task mismatch/i);
+    const other = JSON.parse(await registry.execute('industry_workflow_start', { entryId: scenario.entryId }, {
+      ...context, industryWorkflowTaskId: undefined,
+      requestId: `${context.requestId}-other`, idempotencyKey: `${context.idempotencyKey}-other`,
+    }));
+    expect(other.task.id).not.toBe(started.task.id);
+    await expect(registry.execute('industry_workflow_complete', { taskId: other.task.id }, context))
+      .rejects.toThrow(/does not match the bound industry workflow/i);
+    // A separate attempted call gets its own idempotency key; otherwise the
+    // generic fence correctly rejects changed arguments before this owner.
+    await expect(registry.execute('industry_workflow_complete', { taskId: 'wt_task_foreign' }, {
+      ...context, requestId: `${context.requestId}-missing`, idempotencyKey: `${context.idempotencyKey}-missing`,
+    }))
+      .rejects.toThrow(/does not match the bound industry workflow/i);
   });
 
   it('restricts a bound workflow continuation to its persisted execution contract', () => {

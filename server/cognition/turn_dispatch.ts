@@ -11,7 +11,6 @@ export type LumiTurnBoundary =
   | 'conversation'
   | 'client_action'
   | 'self_repair'
-  | 'skill_workflow'
   | 'work_takeover'
   | 'task_center'
   | 'tool_action';
@@ -34,7 +33,6 @@ function classifyBoundary(flow: LumiTurnFlow): LumiTurnBoundary {
   if (flow.conceptualCapabilityQuestion) return 'conversation';
   if (flow.clientActionOnlyTurn) return 'client_action';
   if (flow.selfRepairTurn) return 'self_repair';
-  if (flow.specialWorkflow) return 'skill_workflow';
   if (flow.workTakeover.shouldResumeTask) return 'work_takeover';
   if (flow.allowToolUseForTurn) return 'tool_action';
   return 'conversation';
@@ -46,14 +44,12 @@ function boundaryRule(boundary: LumiTurnBoundary): string {
       return 'This turn only changes or inspects Lumi client state. Keep it on the client surface and do not drift into external tools.';
     case 'self_repair':
       return 'This turn is about Lumi fixing or inspecting itself. Inspect state first, make one safe recovery when possible, then verify.';
-    case 'skill_workflow':
-      return 'This turn may use a learned skill workflow. Parameterize it from the user wording; do not behave like a fixed demo script.';
     case 'work_takeover':
       return 'This turn continues an existing task. Bind follow-ups to the task center, preserve blockers/artifacts, and verify before claiming completion.';
     case 'task_center':
       return 'This turn entered through the task center. Treat it as persistent work with state, artifacts, blockers, and a concise user-facing result.';
     case 'tool_action':
-      return 'This turn asks for action. Choose the lightest fitting tool/skill/desktop path and keep Lumi as the single owner of the result.';
+      return 'Choose whether to answer or act from the newest user request. If work is requested, use the lightest fitting declared tool and keep Lumi as the single owner of the result.';
     case 'conversation':
     default:
       return 'This turn is conversation-first. Answer naturally and do not force tools or task continuation without a clear action signal.';
@@ -93,5 +89,33 @@ export function buildLumiTurnDispatch(input: LumiTurnDispatchInput): LumiTurnDis
   return {
     ...dispatchWithoutPrompt,
     promptOverlay: buildDispatchOverlay(dispatchWithoutPrompt),
+  };
+}
+
+export function restrictLumiDispatchToUnboundConversation(dispatch: LumiTurnDispatch): LumiTurnDispatch {
+  const flow = {
+    ...dispatch.flow,
+    operationMode: 'chat' as const,
+    effectiveOperationMode: 'chat' as const,
+    requestedMode: null,
+    autoPromoteToAssistant: false,
+    allowToolUseForTurn: false,
+    selfRepairTurn: false,
+    clientActionOnlyTurn: false,
+    promptOverlay: [
+      '## Lumi Turn Flow',
+      'Channel: chat. Surface: chat. Mode: chat -> chat. Tool access: chat-only.',
+      'This remote sender is not identity-bound. Keep the turn conversational and do not expose private, local, organization, client, or desktop tools.',
+    ].join('\n'),
+  };
+  return {
+    ...dispatch,
+    boundary: 'conversation',
+    flow,
+    promptOverlay: [
+      '## Lumi Unified Turn Dispatch',
+      `Entry channel: chat. Source: ${dispatch.source}. Surface: chat. Boundary: conversation.`,
+      'Identity boundary: this sender is not bound to a Lumi user, so this turn cannot control or inspect a private Lumi client.',
+    ].join('\n'),
   };
 }

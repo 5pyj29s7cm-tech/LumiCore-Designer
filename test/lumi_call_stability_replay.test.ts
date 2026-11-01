@@ -1,18 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeActionIntent } from '../server/cognition/normalized_action_intent';
-import { matchQuickCommand } from '../server/cognition/quick_commands';
 import { buildActionContract } from '../server/cognition/action_contract';
-import { buildForegroundWeChatReadArgs, buildForegroundWeChatSendArgs } from '../server/agents/nl_chainer';
-import {
-  findConversationActionTask,
-  formatConversationActionLedgerStatus,
-  getConversationActionStateFromLedger,
-  repairContradictoryConversationActionReceipts,
-  syncConversationActionTaskLedger,
-} from '../server/conversation/action_ledger';
+import { buildForegroundWeChatSendArgs } from '../server/regions/packs/cn/foreground_wechat_intent';
+import { findConversationActionTask, getConversationActionStateFromLedger } from "../server/conversation/ledger/queries";
+import { formatConversationActionLedgerStatus } from "../server/conversation/ledger/status";
+import { repairContradictoryConversationActionReceipts } from "../server/conversation/ledger/recovery";
+import { syncConversationActionTaskLedger } from "../server/conversation/ledger/task_lifecycle";
 import type { ConversationActionContinuationState } from '../server/cognition/action_continuation';
 import { ToolRegistry } from '../server/tools/registry';
-import { formatCnToolFailureDetail } from '../server/regions/packs/cn/voice_fast_path_messages';
+import { formatCnToolFailureDetail } from "../server/regions/messages/voice_fast_path_messages";
 
 const CUSTOMER_INTERNAL_EXECUTION_COPY = /(?:^|\n)\s*(?:\u72b6\u6001|\u8bc1\u636e|\u5177\u4f53\u963b\u585e|\u6267\u884c\u56de\u9988)\s*[:\uff1a]|\u56de\u6267|target_mismatch|terminalVerification|\b(?:taskId|requestId|desktop_open|client_action|desktop_execution_plan_receipt|verified|blocked|failed)\b|No successful current-turn tool execution/iu;
 
@@ -87,7 +83,13 @@ describe('Lumi field-call stability replay', () => {
 
   it('reports desktop relay timeouts as actionable Chinese instead of an opaque failure', () => {
     expect(formatCnToolFailureDetail('Desktop tool "desktop_open" timed out (60s)'))
-      .toContain('窗口回执时超时');
+      .toContain('等待结果超时');
+  });
+
+  it('does not describe video generation timeout as a desktop operation', () => {
+    const message = formatCnToolFailureDetail('Lumi Official API video generation timed out. Task: queued-video');
+    expect(message).toContain('尚不能确认服务端是否仍在处理');
+    expect(message).not.toMatch(/桌面|窗口|重复打开|queued-video/u);
   });
 
   it.each([
@@ -124,9 +126,18 @@ describe('Lumi field-call stability replay', () => {
         target: '张勇',
         sideEffectClass: 'none',
       });
-      expect(buildForegroundWeChatReadArgs(text)).toMatchObject({ contact: '张勇', useSearch: true });
       expect(buildForegroundWeChatSendArgs(text)).toBeNull();
     }
+  });
+
+  it.each([
+    ['打开微信看看我和阿陆最近的聊天内容', '阿陆'],
+    ['总结我和方天明的聊天记录', '方天明'],
+    ['查看张勇的聊天记录', '张勇'],
+    ['查看微信聊天记录', ''],
+  ])('resolves the same read contact in the active normalizer: %s', (text, target) => {
+    expect(normalizeActionIntent(text)).toMatchObject({ kind: 'messaging_read', operation: 'read', target, sideEffectClass: 'none' });
+    expect(buildForegroundWeChatSendArgs(text)).toBeNull();
   });
 
   it('requires an exact recipient and payload before constructing a send', () => {
@@ -145,8 +156,6 @@ describe('Lumi field-call stability replay', () => {
       operation: 'navigate',
       clientAction: 'open_chat',
     });
-    const quick = await matchQuickCommand('打开聊天界面', 'field-replay', { surface: 'voice' });
-    expect(quick?.toolCall).toEqual({ name: 'client_action', arguments: { action: 'open_chat' } });
   });
 
   it('classifies an angry correction as explanation-only and executes no quick tool', async () => {
@@ -158,7 +167,6 @@ describe('Lumi field-call stability replay', () => {
       relation: 'correction',
     });
     expect(buildActionContract(text)).toMatchObject({ applies: false, kind: 'none' });
-    expect(await matchQuickCommand(text, 'field-replay', { surface: 'chat' })).toBeNull();
   });
 
   it('keeps completed CAD receipts queryable after the legacy pointer disappears', () => {

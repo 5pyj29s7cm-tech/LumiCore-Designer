@@ -100,7 +100,7 @@ describe('industry workflow server autocomplete', () => {
       ok: true,
       status: 'verified',
       persisted: true,
-      task: { id: setup.started.task.id, status: 'delivered', entryId: 'project' },
+      task: { id: setup.started.task.id, status: 'delivered', metadata: { industryWorkflow: {entryId: 'project'} } },
       verification: { passed: true },
     });
     expect(getInteriorProjectWorkflow(setup.scopeId, setup.project.id)?.stages.project.status).toBe('completed');
@@ -169,6 +169,8 @@ describe('industry workflow server autocomplete', () => {
       verifiedRecord('mcp_design-studio-pack_space_planning_checklist', PROJECT_RESULT, setup.started),
     ];
     const priorFailedCompletion: ToolExecutionRecord = {
+      taskId: setup.started.conversationTaskId,
+      requestId: setup.started.requestId,
       name: 'industry_workflow_complete',
       arguments: { taskId: setup.started.task.id },
       result: '',

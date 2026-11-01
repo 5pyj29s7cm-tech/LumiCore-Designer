@@ -27,11 +27,21 @@ import {
   requiresExternalAiHistory,
   requiresArtifactPostWriteReadback,
 } from '../server/cognition/action_contract';
+import { compositeNavigationInstructions } from '../server/cognition/normalized_action_intent';
 import type { TaskCapsuleV1 } from '../server/conversation/task_capsule';
 import {
   recordsToTaskReceipts,
   taskCompletionFromReceipts,
 } from '../server/cognition/task_execution_ledger';
+
+function nativeDisplayedBrowserResult(target: string, title = 'Observed page') {
+  return { target, opened: true, ok: true, status: 'verified', navigationVerified: true,
+    pageLoadVerified: true, pageLoadState: 'document_observed', actualUrl: target, pageTitle: title,
+    actualTarget: { processId: 42, nativeWindowHandle: 84, processName: 'chrome.exe', title },
+    pageObservation: { source: 'windows-uia', observedAt: '2026-10-28T12:00:00.000Z', url: target, title,
+      documentPresent: true, textSample: 'Observed page content.', loadingState: 'unknown',
+      processId: 42, nativeWindowHandle: 84, processName: 'chrome.exe', windowTitle: title } };
+}
 
 describe('Lumi action contract', () => {
   it('keeps delimiter-free long Chinese context classification bounded', () => {
@@ -201,7 +211,7 @@ describe('Lumi action contract', () => {
 
   it('accepts native semantic text writes with a later same-path readback', () => {
     const target = 'C:\\Users\\me\\Desktop\\note.txt';
-    const task = `After creating the file, read it back and verify the exact content. Target: ${target}`;
+    const task = `Create ${target}; then read it back and verify the exact content.`;
     const contract = buildActionContract(task);
     const write = {
       name: 'desktop_write_text_file',
@@ -234,6 +244,17 @@ describe('Lumi action contract', () => {
     expect(contract.kind).toBe('artifact_work');
     expect(hasCoreActionEvidence(contract, [read, write], task)).toBe(false);
     expect(hasCoreActionEvidence(contract, [write, read], task)).toBe(true);
+  });
+
+  it.each([
+    'After creating the file, read it back and verify the exact content. Target: C:\\Users\\me\\Desktop\\note.txt',
+    'Do not create C:\\Users\\me\\Desktop\\note.txt.',
+    'If requested, create C:\\Users\\me\\Desktop\\note.txt.',
+    'Explain the sentence "Create C:\\Users\\me\\Desktop\\note.txt".',
+  ])('does not turn a temporal premise or non-command into file creation: %s', task => {
+    const contract = buildActionContract(task);
+    expect(contract.kind).toBe('none');
+    expect(contract.preferredTools).not.toContain('desktop_write_text_file');
   });
 
   it('requires both exact launch and matching active-window evidence for launch verification', () => {
@@ -297,7 +318,7 @@ describe('Lumi action contract', () => {
     expect(contract.preferredTools).toContain('computer_use');
   });
 
-  it('keeps the exact recovered-WPS create-and-type phrase on the strong desktop contract', () => {
+  it('keeps current-app editing but does not trust a WPS name embedded in prompt metadata', () => {
     const task = [
       '\u5728\u8fd9\u91cc\u9762\u65b0\u5efa\u4e00\u4e2a\u7a7a\u767d\u6587\u6863\u5e76\u5199\u5165\uff1aLumi\u7aef\u5230\u7aef\u56de\u5f52\u6d4b\u8bd5\u3002',
       '## Recent action continuation context',
@@ -308,7 +329,7 @@ describe('Lumi action contract', () => {
 
     const contract = buildActionContract(task);
     expect(requiresCurrentAppUiMutation(task)).toBe(true);
-    expect(extractCurrentAppTarget(task)).toBe('WPS Office');
+    expect(extractCurrentAppTarget(task)).toBe('');
     expect(contract.kind).toBe('desktop_operation');
     expect(contract.preferredTools).toContain('desktop_ui_type');
     expect(contract.preferredTools).not.toContain('write_file');
@@ -421,6 +442,25 @@ describe('Lumi action contract', () => {
         result: '{"root":{"name":"Lumi\u7aef\u5230\u7aef\u56de\u5f52\u6d4b\u8bd5.docx - WPS Office"}}',
       },
     ], task)).toBe(true);
+  });
+
+  it.each([
+    ['matching source and readback', 'hello', 'hello', true],
+    ['wrong supplied text', 'other', 'hello', false],
+    ['wrong readback text', 'hello', 'other', false],
+    ['missing readback text', 'hello', '', false],
+  ])('binds a saved WPS automation receipt to the requested text: %s', (_label, supplied, readBack, expected) => {
+    const task = 'In WPS create a new document and type "hello".';
+    const receipt = {
+      name: 'wps_create_document_with_text', arguments: { text: supplied },
+      result: JSON.stringify({ ok: true, status: 'verified', automation: 'KWPS.Application',
+        visible: true, documentCreated: true, exactTextMatch: true,
+        processName: 'wps.exe', processId: 43210, attachmentMode: 'newVisibleInstance',
+        attachedExisting: false, newVisibleInstance: true, documentName: 'note.docx',
+        windowTitle: 'note.docx - WPS Office', saved: true, savePath: 'C:/fixtures/note.docx',
+        bodyTextWithoutTerminalParagraph: readBack }),
+    };
+    expect(hasCurrentAppSaveEvidence([receipt], task)).toBe(expected);
   });
 
   it('uses a geometry-receipt contract for extraction-only desktop images', () => {
@@ -556,7 +596,7 @@ describe('Lumi action contract', () => {
       id: 'open-wenshu',
       name: 'browser_open_task',
       arguments: { url: 'https://wenshu.court.gov.cn/', open: true },
-      result: JSON.stringify({ opened: true, result: 'Opened: https://wenshu.court.gov.cn/' }),
+      result: JSON.stringify(nativeDisplayedBrowserResult('https://wenshu.court.gov.cn/', '中国裁判文书网')),
     }], task)).toBe(true);
   });
 
@@ -579,7 +619,7 @@ describe('Lumi action contract', () => {
     expect(hasCoreActionEvidence(buildActionContract(browserTask), [{
       name: 'browser_open_task',
       arguments: { url: 'https://www.google.com', open: true },
-      result: JSON.stringify({ opened: true, url: 'https://www.google.com' }),
+      result: JSON.stringify(nativeDisplayedBrowserResult('https://www.google.com')),
     }], browserTask)).toBe(true);
   });
 
@@ -704,7 +744,7 @@ describe('Lumi action contract', () => {
     expect(buildActionContract('\u89c6\u9891\u7f51\u7ad9\u81ea\u52a8\u8bc4\u8bba').kind).toBe('public_post');
     expect(buildActionContract('CAD\u81ea\u52a8\u753b\u56fe').kind).toBe('cad_drafting');
     expect(buildActionContract('\u5e2e\u6211\u76ef\u76d8\u80a1\u7968').kind).toBe('stock_monitor');
-    expect(buildActionContract('\u5f8b\u5e08\u7684\u4ee3\u7406\u8bcd').kind).toBe('legal_document');
+    expect(buildActionContract('\u5f8b\u5e08\u7684\u4ee3\u7406\u8bcd').kind).toBe('none');
     const legalMeeting = buildActionContract('\u628a\u8fd9\u6b21\u529e\u6848\u4f1a\u8bae\u6574\u7406\u6210\u6848\u4ef6\u4f1a\u8bae\u7eaa\u8981');
     expect(legalMeeting.kind).toBe('legal_document');
     expect(legalMeeting.preferredTools).toContain('legal_meeting_minutes_to_case');
@@ -715,9 +755,7 @@ describe('Lumi action contract', () => {
     expect(legalReasoning.preferredTools).toContain('legal_case_reasoning_matrix');
     expect(legalReasoning.verificationTools).toContain('legal_case_reasoning_matrix');
     const legalAssetTrace = buildActionContract('\u67e5\u88ab\u6267\u884c\u4eba\u8d22\u4ea7\u7ebf\u7d22\u548c\u80a1\u6743\u7a7f\u900f');
-    expect(legalAssetTrace.kind).toBe('legal_document');
-    expect(legalAssetTrace.preferredTools).toContain('legal_trace_assets');
-    expect(legalAssetTrace.preferredTools).toContain('legal_equity_penetration');
+    expect(legalAssetTrace.kind).toBe('none');
     const legalRemoteIntake = buildActionContract('\u98de\u4e66\u53d1\u7ed9 Lumi bot \u7684\u6cd5\u9662\u77ed\u4fe1\u94fe\u63a5\uff0c\u81ea\u52a8\u5165\u6848');
     expect(legalRemoteIntake.kind).toBe('legal_document');
     expect(legalRemoteIntake.preferredTools).toContain('legal_message_intake_to_case');
@@ -1516,7 +1554,7 @@ describe('Lumi action contract', () => {
     expect(hasCoreActionEvidence(contract, [search, visual], text)).toBe(true);
   });
 
-  it('recognizes the observed Aliyun page when the process-name verifier reports target mismatch', () => {
+  it('does not turn a browser title after target mismatch into verified page navigation', () => {
     const text = '\u6253\u5f00\u963f\u91cc\u4e91\u5b98\u7f51';
     const records = [{
       name: 'desktop_open',
@@ -1538,8 +1576,8 @@ describe('Lumi action contract', () => {
       },
     }];
 
-    expect(hasRequestedDesktopOpenEvidence(records, text)).toBe(true);
-    expect(hasCoreActionEvidence(buildActionContract(text), records, text)).toBe(true);
+    expect(hasRequestedDesktopOpenEvidence(records, text)).toBe(false);
+    expect(hasCoreActionEvidence(buildActionContract(text), records, text)).toBe(false);
   });
 
   it('requires observed playing state after a generic NetEase key dispatch', () => {
@@ -1640,5 +1678,89 @@ describe('Lumi action contract', () => {
     expect(prompt).toContain('Core action');
     expect(prompt).toContain('Preparation is not completion');
     expect(prompt).toContain('Required completion evidence');
+  });
+});
+
+
+describe('completion evidence retains a later external final action', () => {
+  it('keeps the existing navigation decomposition independent of the later negative clause', () => {
+    expect(compositeNavigationInstructions('打开 Lumi 设置页面，然后打开 AutoCAD，不要发送消息。')).toHaveLength(2);
+  });
+  it.each([
+    'Read the file D:/work/source.txt and show its complete contents. Then sign the contract.',
+    '读取 D:/work/source.txt 并完整显示内容，然后签署合同。',
+    'Read the file D:/work/source.txt and show its complete contents. Then please sign the contract.',
+  ])('does not let the read receipt complete every obligation: %s', text => {
+    const accepted = buildActionContract(text);
+    const contract = buildActionEvidenceContract(text, undefined, { taskText: text, contract: accepted });
+    expect(contract.components).toHaveLength(2);
+    expect(contract.components?.[1].contract.kind).toBe('external_commit');
+    expect(buildActionContract(text)).toEqual(accepted);
+    expect(hasCoreActionEvidence(contract, [{ name: 'read_file', arguments: { path: 'D:/work/source.txt' },
+      result: 'Complete source body', terminalVerification: { status: 'verified', strategy: 'terminal_receipt', reason: 'Exact source read.' } }], text)).toBe(false);
+  });
+
+  it.each([
+    'Read the file D:/work/design-contract.txt and show its complete contents.',
+    'Read the file D:/work/source.txt. The document contains a signature clause.',
+    'Read the file D:/work/source.txt. The layout design includes holiday toys.',
+    'Read the file D:/work/source.txt. Never sign the contract.',
+    'Read the file D:/work/source.txt and show its complete contents. Do not sign the contract.',
+    '读取 D:/work/source.txt 并完整显示内容，不要签署合同。',
+    'Can you read the file D:/work/source.txt? Can you sign the contract?',
+    'Read the file D:/work/source.txt. If appropriate, sign the contract.',
+    'Create D:/work/notes.txt with the following content: Read the file. Then sign the contract.',
+  ])('does not invent an affirmative commit from a plain read, boundary, question or data: %s', text => {
+    const accepted = buildActionContract(text);
+    const evidence = buildActionEvidenceContract(text, undefined, { taskText: text, contract: accepted });
+    expect(evidence.components?.some(item => item.contract.kind === 'external_commit')).not.toBe(true);
+    expect(buildActionContract(text)).toEqual(accepted);
+  });
+});
+
+describe('procedural questions do not invent message delivery', () => {
+  it.each(['这个文件在其他文件夹，我怎么找到它并发给你', '我如何通过微信把文件发给你？', 'How can I send this file to you?'])('has no sending contract for %s', text => {
+    expect(buildActionContract(text)).toMatchObject({ applies: false, kind: 'none' });
+  });
+  it('does not let a question override the following search instruction', () => {
+    expect(buildActionContract('我怎么找到文件并发给你？请先帮我搜索桌面的文件')).not.toMatchObject({ kind: 'messaging_send' });
+  });
+  it.each(['我怎么发附件？请把桌面的报价单.pdf发给张三', '给张三发送操作说明：怎么找文件'])('retains real third-party delivery for %s', text => {
+    expect(buildActionContract(text)).toMatchObject({ applies: true, kind: 'messaging_send' });
+  });
+});
+
+
+describe('canonical messaging and navigation contracts', () => {
+  it.each([
+    '请查看局域网发现给出的端点状态。',
+    '按监控系统发现给出的节点地址读取当前状态。',
+    "请实际读取打印队列“Fixture Network Queue”的当前状态（准确名称以本机列表为准），再读取测试网络打印机的实际IPP状态。刚才同一轮局域网发现给出的端点是10.42.0.25、端口631、路径/ipp/print。分别报告Windows队列和设备本身的观察结果及来源，不要混为一谈。仅读取，不打印、不取消或恢复任何任务、不修改设置。",
+  ])('does not invent message delivery from descriptive source prose: %s', text => {
+    expect(buildActionContract(text).kind).not.toBe('messaging_send');
+  });
+
+  it.each([
+    ["请用系统浏览器打开 https://www.python.org/ ，停在首页，告诉我实际打开的结果。不登录、不下载、不提交任何表单。", 'https://www.python.org/'],
+    ['打开 https://example.org/status ，停在首页。不要登录、下载或提交表单。', 'https://example.org/status'],
+  ])('uses the accepted pure navigation intent without adding account work: %s', (text, target) => {
+    const intent = { kind: 'desktop_operation', operation: 'navigate', subject: 'user', target,
+      payload: '', sideEffectClass: 'none', relation: 'new', confidence: 1, rule: 'explicit-local-desktop-operation' } as const;
+    const contract = buildActionContract(text, intent);
+    expect(contract).toMatchObject({ kind: 'desktop_operation', label: 'Desktop target launch/open' });
+    expect(contract.requiredEvidence.join(' ')).not.toMatch(/logged.in|account|session/i);
+    expect(contract.preferredTools).not.toContain('web_login_run');
+    expect(hasCoreActionEvidence(contract, [{ name: 'browser_open_task', arguments: { url: target, open: true },
+      result: JSON.stringify(nativeDisplayedBrowserResult(target)) }], text)).toBe(true);
+  });
+});
+
+
+describe('messaging contract follows the requested operation', () => {
+  it('separates drafting a future message from sending a draft', () => {
+    expect(buildActionContract('先写一条给林森发送的消息草稿：下午三点开会').kind).not.toBe('messaging_send');
+    const send = buildActionContract('给林森发送这份草稿');
+    expect(send.kind).toBe('messaging_send');
+    expect(hasCoreActionEvidence(send, [], '给林森发送这份草稿')).toBe(false);
   });
 });

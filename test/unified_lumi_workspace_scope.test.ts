@@ -80,7 +80,7 @@ describe('one Lumi with isolated personal and organization workspaces', () => {
     expect(normalizeOrganizationWorkspaceView('company-lumi')).toBe('chat');
     expect(normalizeOrganizationWorkspaceView('law firm')).toBe('legal');
     expect(normalizeOrganizationWorkspaceView('interior_design')).toBe('spatial-design');
-    expect(normalizeOrganizationWorkspaceView('brand_design')).toBeNull();
+    expect(normalizeOrganizationWorkspaceView('brand_design')).toBe('brand-design');
     expect(canAccessOrganizationWorkspaceView('viewer', 'messaging')).toBe(false);
     expect(canAccessOrganizationWorkspaceView(undefined, 'messaging')).toBe(false);
     expect(canAccessOrganizationWorkspaceView('viewer', 'audit')).toBe(false);
@@ -96,6 +96,6 @@ describe('one Lumi with isolated personal and organization workspaces', () => {
       'legal',
       'spatial-design',
     ]));
-    expect(listOrganizationWorkspaceViewsForRole('owner')).not.toContain('brand-design');
+    expect(listOrganizationWorkspaceViewsForRole('owner')).toContain('brand-design');
   });
 });

@@ -1,9 +1,10 @@
+import { readImplementationSource } from './implementation_source';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 function readRepoFile(relativePath: string): string {
-  return readFileSync(path.join(process.cwd(), relativePath), 'utf8');
+  return readImplementationSource(path.join(process.cwd(), relativePath), 'utf8');
 }
 
 describe('core capability boundaries', () => {
@@ -11,7 +12,6 @@ describe('core capability boundaries', () => {
     const coreSources = [
       'server/socket/chat.ts',
       'server/socket/voice.ts',
-      'server/socket/task.ts',
       'server/cognition/turn_flow.ts',
       'server/cognition/turn_dispatch.ts',
       'server/cognition/capability_selection.ts',
@@ -42,11 +42,4 @@ describe('core capability boundaries', () => {
     expect(cadSkill).not.toContain('cad_generate_simple_dxf');
   });
 
-  it('keeps the operating kernel explicit about skill and adapter reuse', () => {
-    const kernel = readRepoFile('server/cognition/operating_kernel.ts');
-
-    expect(kernel).toContain('Industry work stays in reusable skills, adapters, task records, and learned routes');
-    expect(kernel).toContain('Do not bake one-off demo scripts into the chat/voice/task core');
-    expect(kernel).toContain('never treat a generated local coordination artifact as proof of external completion');
-  });
 });

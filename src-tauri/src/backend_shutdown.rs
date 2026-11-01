@@ -89,7 +89,7 @@ fn parse_save_receipt(raw: &[u8], expected_pid: u32) -> Result<(), String> {
 /// Uses the existing native proof exchange, never a browser-supplied token or
 /// arbitrary URL. The caller additionally binds expected_pid to its own Child.
 pub fn request_backend_save(expected_pid: u32) -> Result<(), String> {
-    let identity = crate::local_bootstrap::bootstrap_local_identity(None)?;
+    let identity = crate::local_bootstrap::bootstrap_identity(None, None)?;
     let token = identity
         .get("token")
         .and_then(Value::as_str)
@@ -135,16 +135,14 @@ pub fn request_backend_save(expected_pid: u32) -> Result<(), String> {
         .and_then(|_| stream.flush())
         .map_err(|error| format!("Cannot send backend save request: {error}"))?;
     let mut response = Vec::new();
-    stream
-        .take(65_537)
-        .read_to_end(&mut response)
-        .map_err(|error| {
-            format!("Still waiting for backend save confirmation; closing was cancelled: {error}")
-        })?;
+    let read_error = stream.take(65_537).read_to_end(&mut response).err();
     if response.len() > 65_536 {
         return Err("Backend save receipt exceeded its limit".into());
     }
-    parse_save_receipt(&response, expected_pid)
+    parse_save_receipt(&response, expected_pid).map_err(|error| match read_error {
+        Some(read_error) => format!("{error}: {read_error}"),
+        None => error,
+    })
 }
 
 #[cfg(test)]

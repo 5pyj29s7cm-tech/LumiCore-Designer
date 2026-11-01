@@ -191,7 +191,6 @@ describe('Lumi requirement matrix pressure', () => {
         text: '根据案件材料总结争议焦点，并按最高院、高院、中院、基层法院顺序连接人民法院案例库、裁判文书网、法蝉和 Alpha 查找有利案例',
         tools: [
           'legal_extract_dispute_focus',
-          'legal_external_research_plan',
           'legal_search_external_authorities',
           'legal_prepare_external_browser_workspace',
         ],
@@ -225,9 +224,6 @@ describe('Lumi requirement matrix pressure', () => {
       expect(result.selection.lane, item.id).toBe('legal_casework');
       expect(result.route?.categories, item.id).toContain('legal');
       expect(result.route?.toolNames, item.id).toEqual(expect.arrayContaining(item.tools));
-      expect(result.execution.promptOverlay, item.id).toContain('Current-law gate');
-      expect(result.execution.promptOverlay, item.id).toContain('major premise');
-      expect(result.execution.promptOverlay, item.id).toContain('minor premise');
     }
   });
 

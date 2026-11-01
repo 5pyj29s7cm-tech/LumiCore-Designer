@@ -1,9 +1,12 @@
+import { type ProviderGetters as SharedProviderGetters } from "../llm/provider_getters";
+import { mountIndustryWorkflowRoutes } from '../routes/industry_workflow_routes';
 // Route aggregator — mounts all shared routes on the API router
 import { Router } from "express";
 import { Server } from "socket.io";
 import { mountPersonalityRoutes } from "../routes/personality_routes";
 import { mountMcpRoutes } from "../routes/mcp_routes";
 import { mountDeviceRoutes } from "../routes/device_routes";
+import { mountXiaozhiDeviceRoutes } from '../routes/xiaozhi_device_routes';
 import { mountSystemRoutes } from "../routes/system_routes";
 import { mountChatRoutes } from "../routes/chat_routes";
 import { mountPreferencesRoutes } from "../routes/preferences_routes";
@@ -12,6 +15,7 @@ import { mountAuthRoutes } from "../routes/auth";
 import { mountMemoryRoutes } from "../routes/memory_routes";
 import { mountConversationRoutes } from "../routes/conversations";
 import { mountCreativeRoutes } from '../routes/creative_routes';
+import { mountChatSongRoutes } from '../routes/chat_song_routes';
 import { mountMemoryAvatarRoutes } from '../routes/memory_avatar_routes';
 import { mountSkillRoutes } from "../routes/skill_routes";
 import { mountMarketplaceRoutes } from "../routes/marketplace_routes";
@@ -29,10 +33,7 @@ import { mountPrivacyRoutes } from '../routes/privacy_routes';
 interface RouteContext {
   apiRouter: Router;
   jwtSecret: string;
-  llm: {
-    getDeepSeek: any; getGemini: any; getOpenAI: any; getAnthropic: any; getQwen: any; getArk: any; getGlm: any;
-    getOllama?: any; getLmStudio?: any; getXiaomi?: any; getKimi?: any; getRelay?: any;
-  };
+  llm: SharedProviderGetters & Required<Pick<SharedProviderGetters, 'getOpenAI' | 'getAnthropic' | 'getQwen' | 'getArk' | 'getGlm'>>;
   getCookieOptions: () => { httpOnly: true; secure: boolean; sameSite: "none" | "lax"; maxAge: number };
   io: Server;
 }
@@ -57,6 +58,7 @@ export function mountAllRoutes({ apiRouter, jwtSecret, llm, getCookieOptions, io
   mountPersonalityRoutes(apiRouter, jwtSecret, llmGetters);
   mountMcpRoutes(apiRouter);
   mountDeviceRoutes(apiRouter, jwtSecret);
+  mountXiaozhiDeviceRoutes(apiRouter);
 
   // System routes (health, tools, llm, settings, stats, ecosystem, modules)
   mountSystemRoutes(apiRouter, jwtSecret, io, llm);
@@ -64,12 +66,14 @@ export function mountAllRoutes({ apiRouter, jwtSecret, llm, getCookieOptions, io
 
   // AI Chat
   mountChatRoutes(apiRouter, jwtSecret, llmGetters);
+  mountIndustryWorkflowRoutes(apiRouter);
 
   // Auth
   mountAuthRoutes(apiRouter, jwtSecret, getCookieOptions);
 
   // Creative generation
   mountCreativeRoutes(apiRouter, jwtSecret, llmGetters);
+  mountChatSongRoutes(apiRouter, llmGetters);
   // Personal Memory Avatars are single-persona and tool-free; they are not
   // part of the retired local Agent/team runtime.
   mountMemoryAvatarRoutes(apiRouter, llmGetters);

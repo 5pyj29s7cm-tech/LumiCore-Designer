@@ -8,7 +8,9 @@
  * Endpoint paths are overridable for a deployment whose gateway exposes a
  * namespaced route, while the defaults follow the OpenAI-compatible contract.
  */
+import crypto from 'crypto';
 import { requireNotStrict } from '../config/privacy';
+import { LUMI_OFFICIAL_DEFAULT_MODELS } from '../../shared/model_provider_capabilities';
 import {
   relayApiKey,
   relayBaseUrl,
@@ -45,11 +47,37 @@ export interface OfficialApiModelDescriptor {
   ownedBy: string;
   /** Informational upstream label; requests must still use the gateway id. */
   upstreamModel?: string;
+  contextWindow?: number;
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
 }
 
 export interface OfficialApiModelCatalog {
   models: OfficialApiModelDescriptor[];
   byRole: Record<string, string[]>;
+}
+
+let latestModelCatalog: { scope: string; catalog: OfficialApiModelCatalog } | undefined;
+
+function modelCatalogScope(): string {
+  return crypto.createHash('sha256').update(relayBaseUrl() + '\0' + relayApiKey()).digest('hex');
+}
+
+/** Only reuse metadata fetched for the currently configured gateway identity. */
+export function getCachedOfficialApiModelDescriptor(modelId: string): OfficialApiModelDescriptor | undefined {
+  if (!latestModelCatalog || latestModelCatalog.scope !== modelCatalogScope()) return undefined;
+  const model = latestModelCatalog.catalog.models.find(candidate => candidate.id === modelId);
+  return model ? { ...model, ...(model.capabilities ? { capabilities: [...model.capabilities] } : {}) } : undefined;
+}
+
+function catalogModelLimits(raw: Record<string, unknown>): Pick<OfficialApiModelDescriptor, 'contextWindow' | 'maxInputTokens' | 'maxOutputTokens'> {
+  const result: Pick<OfficialApiModelDescriptor, 'contextWindow' | 'maxInputTokens' | 'maxOutputTokens'> = {};
+  for (const [name, aliases] of Object.entries({ contextWindow: ['context_window', 'contextWindow', 'context_length'],
+    maxInputTokens: ['max_input_tokens', 'maxInputTokens'], maxOutputTokens: ['max_output_tokens', 'maxOutputTokens'] })) {
+    const value = aliases.map(alias => raw[alias]).find(candidate => typeof candidate === 'number' && Number.isSafeInteger(candidate) && candidate > 0);
+    if (typeof value === 'number') (result as Record<string, number>)[name] = value;
+  }
+  return result;
 }
 
 const OFFICIAL_MODEL_CAPABILITY_ROLES: Readonly<Record<string, readonly string[]>> = {
@@ -164,16 +192,26 @@ function errorMessage(body: any, response: Response, credential = relayApiKey())
 
 /** Only an actual gateway response can prove rejection; timeouts cannot. */
 export class OfficialApiHttpError extends Error {
-  constructor(readonly status: number, readonly requestPath: string, message: string) {
+  videoSubmissionRejected = false;
+  constructor(readonly status: number, readonly requestPath: string, message: string, readonly responseBody?: unknown) {
     super(message);
     this.name = 'OfficialApiHttpError';
   }
 }
 
+const DEFINITE_SUBMISSION_REJECTION_STATUSES = new Set([400, 401, 403, 404, 413, 415, 422, 429]);
+
 export function isDefiniteOfficialImageRejection(error: unknown): boolean {
   return error instanceof OfficialApiHttpError
     && /(?:^|\/)images\/(?:generations|edits)$/.test(error.requestPath)
-    && [400, 401, 403, 404, 413, 415, 422, 429].includes(error.status);
+    && DEFINITE_SUBMISSION_REJECTION_STATUSES.has(error.status);
+}
+
+/** Branded only at the first video submission, before any provider task exists. */
+export function isDefiniteOfficialVideoRejection(error: unknown): boolean {
+  return error instanceof OfficialApiHttpError
+    && error.videoSubmissionRejected === true
+    && DEFINITE_SUBMISSION_REJECTION_STATUSES.has(error.status);
 }
 
 /** Preserve the gateway's FastAPI error detail through OpenAI SDK parsing. */
@@ -230,7 +268,7 @@ export async function officialApiRequest<T = any>(
     });
     const body = await readBody(response);
     if (!response.ok) throw new OfficialApiHttpError(response.status, path,
-      `Lumi Official API request failed (${response.status}): ${errorMessage(body, response)}`);
+      `Lumi Official API request failed (${response.status}): ${errorMessage(body, response)}`, body);
     return { response, body: body as T };
   } catch (error: any) {
     if (error?.name === 'AbortError' && !callerSignal?.aborted) {
@@ -251,13 +289,16 @@ export async function officialApiRequest<T = any>(
 export async function listOfficialApiModels(
   options: Pick<OfficialApiRequestOptions, 'fetchImpl' | 'signal' | 'timeoutMs'> = {},
 ): Promise<OfficialApiModelCatalog> {
+  const scope = modelCatalogScope();
   const { body } = await officialApiRequest<any>('/models', {
     method: 'GET',
     fetchImpl: options.fetchImpl,
     signal: options.signal,
     timeoutMs: options.timeoutMs || 15_000,
   });
-  return parseOfficialApiModelCatalog(body);
+  const catalog = parseOfficialApiModelCatalog(body);
+  latestModelCatalog = { scope, catalog };
+  return catalog;
 }
 
 /** Accept both authenticated OpenAI lists and the documented console catalog. */
@@ -275,6 +316,7 @@ export function parseOfficialApiModelCatalog(body: unknown): OfficialApiModelCat
     // Console rows have numeric database ids. Only route_id is callable.
     const id = catalogString(raw.route_id, 200) || catalogString(raw.id, 200);
     const upstreamModel = catalogString(raw.provider_model_name, 200);
+    const limits = catalogModelLimits(raw);
     const rawCapabilities: unknown[] = [];
     for (const value of [raw.capability, raw.capabilities]) {
       if (Array.isArray(value)) rawCapabilities.push(...value);
@@ -293,6 +335,9 @@ export function parseOfficialApiModelCatalog(body: unknown): OfficialApiModelCat
       if (!existing.ownedBy) existing.ownedBy = catalogString(raw.owned_by, 120)
         || catalogString(raw.ownedBy, 120) || catalogString(raw.provider, 120);
       if (!existing.upstreamModel && upstreamModel) existing.upstreamModel = upstreamModel;
+      for (const name of ['contextWindow', 'maxInputTokens', 'maxOutputTokens'] as const) {
+        if (limits[name] !== undefined) existing[name] = existing[name] === undefined ? limits[name] : Math.min(existing[name]!, limits[name]!);
+      }
       continue;
     }
     modelsById.set(id, {
@@ -302,6 +347,7 @@ export function parseOfficialApiModelCatalog(body: unknown): OfficialApiModelCat
       endpoint: catalogString(raw.endpoint, 240),
       ownedBy: catalogString(raw.owned_by, 120) || catalogString(raw.ownedBy, 120) || catalogString(raw.provider, 120),
       ...(upstreamModel ? { upstreamModel } : {}),
+      ...limits,
     });
   }
   const models = [...modelsById.values()];
@@ -312,7 +358,7 @@ export function parseOfficialApiModelCatalog(body: unknown): OfficialApiModelCat
       capability === 'video_generation'
         ? (/(?:^|[\/_-])i2v(?:[\/_-]|$)|image[-_]?to[-_]?video/i.test(model.id)
           ? ['image_to_video']
-          : ['video_generation'])
+          : ['video_generation', ...([LUMI_OFFICIAL_DEFAULT_MODELS.image_to_video, 'aliyun/wan3.0-video-prime'].includes(model.id) ? ['image_to_video'] : [])])
         : OFFICIAL_MODEL_CAPABILITY_ROLES[capability] || []
     ));
     for (const role of roles) {

@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { readDB, writeDB } from '../../db_layer';
+import { readDatabaseTables, commitDatabaseTables } from '../../db_layer';
 import { getInteriorProject } from './projects';
 
 export const INTERIOR_ASSET_CATEGORIES = [
@@ -72,7 +72,7 @@ function cloneAsset(asset: InteriorProjectAsset): InteriorProjectAsset {
 
 export function listInteriorProjectAssets(orgId: string, projectId: string): InteriorProjectAsset[] {
   if (!getInteriorProject(orgId, projectId)) return [];
-  return assetRows(readDB())
+  return assetRows(readDatabaseTables(['interiorProjectAssets']))
     .filter(asset => asset.orgId === orgId && asset.projectId === projectId && asset.status === 'active')
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
     .map(cloneAsset);
@@ -95,7 +95,7 @@ export function createInteriorProjectAsset(input: {
     error.statusCode = 404;
     throw error;
   }
-  const db = readDB();
+  const db = readDatabaseTables(['interiorProjectAssets']);
   const fileId = requiredText(input.fileId, 'fileId', 512);
   const existing = assetRows(db).find(asset => (
     asset.orgId === input.orgId
@@ -107,7 +107,7 @@ export function createInteriorProjectAsset(input: {
   if (existing) {
     existing.category = normalizeInteriorAssetCategory(input.category);
     existing.updatedAt = timestamp;
-    writeDB(db);
+    commitDatabaseTables(db);
     return cloneAsset(existing);
   }
 
@@ -129,7 +129,7 @@ export function createInteriorProjectAsset(input: {
     updatedAt: timestamp,
   };
   assetRows(db).push(asset);
-  writeDB(db);
+  commitDatabaseTables(db);
   return cloneAsset(asset);
 }
 
@@ -139,7 +139,7 @@ export function updateInteriorProjectAsset(
   assetId: string,
   input: { category?: unknown },
 ): InteriorProjectAsset | null {
-  const db = readDB();
+  const db = readDatabaseTables(['interiorProjectAssets']);
   const asset = assetRows(db).find(item => (
     item.id === assetId
     && item.orgId === orgId
@@ -151,7 +151,7 @@ export function updateInteriorProjectAsset(
     asset.category = normalizeInteriorAssetCategory(input.category);
   }
   asset.updatedAt = new Date().toISOString();
-  writeDB(db);
+  commitDatabaseTables(db);
   return cloneAsset(asset);
 }
 
@@ -160,7 +160,7 @@ export function removeInteriorProjectAsset(
   projectId: string,
   assetId: string,
 ): InteriorProjectAsset | null {
-  const db = readDB();
+  const db = readDatabaseTables(['interiorProjectAssets']);
   const asset = assetRows(db).find(item => (
     item.id === assetId
     && item.orgId === orgId
@@ -170,6 +170,6 @@ export function removeInteriorProjectAsset(
   if (!asset) return null;
   asset.status = 'removed';
   asset.updatedAt = new Date().toISOString();
-  writeDB(db);
+  commitDatabaseTables(db);
   return cloneAsset(asset);
 }

@@ -1,9 +1,16 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { readImplementationSource } from './implementation_source';
+import { packetDraftFixture } from './legal_packet_fixture';
+import { sdkCompletion } from './legal_bid_fixture';
+import {afterAll,beforeAll,beforeEach,describe,expect,it,vi} from 'vitest';
+import {installCivilCodeFixture,installMetadataOnlyFixtures,resetAuthorityFixture} from './fixtures/legal_authority_fixture';
+beforeEach(()=>{resetAuthorityFixture();installCivilCodeFixture();});
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { makeApp } from './helpers';
 import { ToolRegistry } from '../server/tools/registry';
+import { legalToolDefinitions } from '../server/regions/packs/cn/legal_tools';
+import { decodeToolResult } from '../server/tools/result_envelope';
 import { getWebLoginSitePreset, listWebLoginSitePresets } from '../server/web_login/legal_presets';
 
 let cleanup = () => {};
@@ -32,6 +39,60 @@ function createLegalRegistry() {
   return registry;
 }
 
+async function packetModelContext() {
+  const { upsertUserPreferredLLM } = await import('../server/llm/user_preferences');
+  upsertUserPreferredLLM('vitest', { provider: 'relay', model: 'synthetic-packet-positive', selectionMode: 'pinned' });
+  const create = vi.fn((request: any, options: any) => {
+    const prompt = String(request.messages.find((message: any) => message.role === 'user')?.content || '');
+    const content = prompt.includes('## 当前文书\n')
+      ? packetDraftFixture(prompt, { baseName: JSON.parse(prompt.split('## 当前文书\n')[1]).baseName, markdown: '仅作给定材料的条件分析；合同关系、实际交付与付款、主体及日期均尚待核验；未提供不代表没有约定或事实不存在，完整法律依据仍待核验。' })
+      : { documents: JSON.parse(prompt.split('文书列表：')[1]).map((document: any) => ({ baseName: document.baseName, complete: true, unresolved: [], corrections: [] })) };
+    return sdkCompletion(request, { choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] }, 0, options.signal);
+  });
+  return { create, context: { userId: 'vitest', authenticated: true, authRole: 'user', localExecution: true, executionBoundary: 'trusted_local' as const,
+    source: 'legal-direct-tool', llmGetters: { getDeepSeek: () => null, getGemini: () => null, getRelay: () => ({ chat: { completions: { create } } }) } } };
+}
+
+async function reasoningModelContext() {
+  const { upsertUserPreferredLLM } = await import('../server/llm/user_preferences');
+  upsertUserPreferredLLM('vitest', { provider: 'relay', model: 'synthetic-source-reasoning-positive', selectionMode: 'pinned' });
+  const create = vi.fn((request: any, options: any) => {
+    const prompt = String(request.messages.find((message: any) => message.role === 'user')?.content || '');
+    const statement = '需核实原件、付款条件与质量主张，证据尚待补证并由律师核验；不以陈述代替已证事实。';
+    let content: any;
+    if (prompt.includes('你是法律适用复核者')) {
+      const entries = JSON.parse(prompt.split('\n待复核分析：')[1]);
+      content = { reviews: entries.map((entry: any) => ({ index: entry.index, ruleId: entry.ruleId, checks: entry.checks })), uncoveredIssues: [] };
+    } else if (prompt.includes('你在编写供律师复核的法律分析')) {
+      const rules = JSON.parse(prompt.match(/^法条（同条各parts按原文次序合读）：(.+)$/m)![1]);
+      const sources = JSON.parse(prompt.split('\n材料：')[1]);
+      content = { entries: [{ issue: '争议焦点及法律分析：付款条件与质量主张核对', ruleId: rules[0].id,
+        checks: rules[0].parts.map((part: any) => ({ partId: part.id, sourceIds: sources.map((source: any) => source.id),
+          status: 'conditional', application: statement, conclusion: statement, missingPremises: ['原件及本案付款、质量对应关系尚待核实'] })) }] };
+    } else {
+      const sources = JSON.parse(prompt.split('\n材料：')[1]);
+      content = { entries: [{ issue: '待核实原告付款主张及被告质量异议所涉问题', sourceIds: sources.map((source: any) => source.id) }] };
+    }
+    return sdkCompletion(request, { choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] }, 0, options.signal);
+  });
+  return { create, context: { userId: 'vitest', authenticated: true, authRole: 'user', localExecution: true,
+    executionBoundary: 'trusted_local' as const, source: 'legal-direct-tool',
+    llmGetters: { getDeepSeek: () => null, getGemini: () => null, getRelay: () => ({ chat: { completions: { create } } }) } } };
+}
+
+async function traceableDeliveryInput(orgId: string, conclusion: string, caseId?: string, caseName = '有来源的交付测试案') {
+  const cases = await import('../server/org/legal_cases');
+  const { verifyCitation } = await import('../server/legal/kb');
+  const caseFile = caseId ? cases.getCase(orgId, caseId)! : cases.createCase(orgId, 'vitest', { title: caseName });
+  const source = cases.addMaterial(orgId, 'vitest', caseFile.id, { type: 'evidence', title: '虚构原始合同及签收记录', source: 'manual',
+    content: '虚构合同及签收记录记载原告已经供货，被告签收后尚未支付剩余货款，违约金需要另行核算。' })!;
+  return { caseId: caseFile.id, factDate: '2026-01-15', reasoningLinks: [{ issue: '虚构交易欠付款项与违约金的审查', ruleCitation: '《民法典》第五百八十五条',
+    ruleQuote: verifyCitation('《民法典》第五百八十五条').sourceText!, fact: source.content,
+    evidence: [{ materialId: source.id, quote: source.content, locator: '测试材料第1段' }],
+    application: '需要结合合同约定及实际损失核算，付款及违约责任须以完整证据核实为条件。', conclusion,
+    limitations: '仅测试关联来源，不判断法律适用或证据真实性；实际意见需要律师复核。' }] };
+}
+
 describe('semi-automated legal workflows', () => {
   it('drafts plaintiff litigation packets with manual filing gates', async () => {
     const registry = createLegalRegistry();
@@ -56,7 +117,11 @@ describe('semi-automated legal workflows', () => {
     expect(output).toMatch(/律师|人工|确认/);
     expect(output).toContain('法律成果预检');
     expect(output).toContain('现行有效法律预检');
-    expect(output).toContain('web_login_run');
+    expect(output).toContain('人民法院在线服务');
+    expect(output).toContain('https://zxfw.court.gov.cn/');
+    expect(output).toMatch(/律师人工核对/);
+    expect(output).not.toMatch(/web_login_run|web_login_profile_save_from_preset|已提交|立案成功/);
+    expect(decodeToolResult(output).receipt).toMatchObject({ ok: false, status: 'partial', persisted: false });
   });
 
   it('drafts defendant response packets without auto-submitting anything', async () => {
@@ -87,6 +152,7 @@ describe('semi-automated legal workflows', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi_legal_litigation_packet_'));
     const caseName = '诉讼文书包文件输出测试案';
 
+    const sdk = await packetModelContext();
     try {
       const output = await registry.execute('legal_generate_litigation_packet', {
         orgId,
@@ -100,7 +166,7 @@ describe('semi-automated legal workflows', () => {
         facts: '被告收货后未付剩余货款。',
         evidence: '买卖合同；送货单；签收单；银行流水。',
         outputDir: dir,
-      });
+      }, sdk.context);
 
       const packetPath = path.join(dir, '00_litigation-packet.md');
       const filingChecklistPath = path.join(dir, '01_filing-material-checklist.md');
@@ -116,16 +182,16 @@ describe('semi-automated legal workflows', () => {
       const manifestPath = path.join(dir, '99_manifest.md');
 
       expect(output).toContain('诉讼文书包文件输出');
-      expect(output).toContain('文书包总稿文件');
-      expect(output).toContain('立案材料清单文件');
-      expect(output).toContain('授权委托手续清单文件');
-      expect(output).toContain('证据目录与三性矩阵文件');
-      expect(output).toContain('独立文书清单文件');
+      for (const file of [packetPath, filingChecklistPath, authorizationChecklistPath, evidenceCatalogPath, manifestPath]) expect(output).toContain(file);
+      expect(decodeToolResult(output).receipt).toMatchObject({ ok: true, status: 'generated', persisted: true });
+      expect(sdk.create).toHaveBeenCalledTimes(4);
+      expect(fs.readdirSync(dir).filter(name => name.endsWith('.md'))).toHaveLength(11);
+      expect(fs.readdirSync(dir).filter(name => name.endsWith('.docx'))).toHaveLength(11);
       expect(output).toContain('DOCX 生成：全部成功');
       expect(fs.existsSync(packetPath)).toBe(true);
       expect(fs.existsSync(filingChecklistPath)).toBe(true);
       expect(fs.existsSync(authorizationChecklistPath)).toBe(true);
-      expect(fs.existsSync(evidenceMatrixPath)).toBe(true);
+      expect(fs.existsSync(evidenceMatrixPath)).toBe(false);
       expect(fs.existsSync(complaintPath)).toBe(true);
       expect(fs.existsSync(elementComplaintPath)).toBe(true);
       expect(fs.existsSync(engagementPath)).toBe(true);
@@ -136,11 +202,16 @@ describe('semi-automated legal workflows', () => {
       expect(fs.existsSync(manifestPath)).toBe(true);
       expect(fs.readFileSync(filingChecklistPath, 'utf8')).toContain('Filing Material Checklist');
       expect(fs.readFileSync(authorizationChecklistPath, 'utf8')).toContain('Authorization Checklist');
-      expect(fs.readFileSync(evidenceMatrixPath, 'utf8')).toContain('Evidence Catalog And Three-Property Review');
+      for (const label of ['真实性：', '合法性：', '关联性：']) expect(fs.readFileSync(evidenceCatalogPath, 'utf8')).toContain(label);
+      expect(fs.readFileSync(evidenceCatalogPath, 'utf8')).toContain('买卖合同；送货单；签收单；银行流水。');
       const complaint = fs.readFileSync(complaintPath, 'utf8');
       expect(complaint).toContain('民事起诉状（系统草稿）');
-      expect(complaint).toContain('待结合请求权基础检索并核验现行有效法律');
-      expect(complaint).toContain('legal_finalize_delivery_package');
+      expect(complaint).toContain('尚待核验');
+      expect(complaint).toContain('正式交付前必须完成');
+      expect(complaint).toContain('原告 Alpha；被告 Beta');
+      expect(complaint).toContain('请求支付货款及违约金');
+      expect(complaint).toContain('F1；');
+      expect(complaint).toContain('买卖合同；送货单；签收单；银行流水。');
       expect(complaint).not.toMatch(/《[^》]+》第/);
       expect(fs.readFileSync(elementComplaintPath, 'utf8')).toContain('要素式诉状（系统草稿）');
       expect(fs.readFileSync(engagementPath, 'utf8')).toContain('委托代理合同（系统草稿）');
@@ -148,7 +219,7 @@ describe('semi-automated legal workflows', () => {
       expect(fs.readFileSync(lawFirmLetterPath, 'utf8')).toContain('律师事务所函（系统草稿）');
       expect(fs.readFileSync(serviceAddressPath, 'utf8')).toContain('电子送达意愿');
       expect(fs.readFileSync(evidenceCatalogPath, 'utf8')).toContain('原告证据目录（系统草稿）');
-      expect(fs.readFileSync(manifestPath, 'utf8')).toContain('尚未通过正式交付 gate');
+      expect(fs.readFileSync(manifestPath, 'utf8')).toContain('尚未通过正式交付核验');
 
       for (const baseName of [
         '00_litigation-packet',
@@ -179,10 +250,29 @@ describe('semi-automated legal workflows', () => {
     }
   });
 
+  it.each(['no-model', 'no-goal'])('keeps an incomplete %s packet unarchived even when persistence is requested', async mode => {
+    const registry = createLegalRegistry();
+    const caseName = 'Synthetic incomplete packet ' + mode + '-' + crypto.randomUUID();
+    const orgId = 'partial-packet-' + crypto.randomUUID();
+    const sdk = await packetModelContext();
+    const output = await registry.execute('legal_generate_litigation_packet', {
+      orgId, userId: 'vitest', caseName, role: 'plaintiff', parties: '虚构甲公司/虚构乙公司',
+      facts: '甲方自述已付款，合同原件与入账日期待核验。', evidence: '仅提供虚构回单文字摘录；原件、主体和关联待核验。',
+      ...(mode === 'no-model' ? { claims: '仅请求核对交货条件，不增加欠款或退款诉请。' } : {}),
+      persistCase: true, writeFiles: false,
+    }, mode === 'no-goal' ? sdk.context : { userId: 'vitest', authenticated: true, authRole: 'user', localExecution: true, executionBoundary: 'trusted_local', source: 'legal-direct-tool' });
+    expect(decodeToolResult(output).receipt).toMatchObject({ ok: false, status: 'partial', persisted: false });
+    expect(output).not.toContain('案件空间：已归档');
+    expect(sdk.create).not.toHaveBeenCalled();
+    const cases = await import('../server/org/legal_cases');
+    expect(cases.listCases(orgId, caseName, 10, 'vitest')).toHaveLength(0);
+  });
+
   it('writes separate defendant answer, cross-examination, procedural, and authorization documents', async () => {
     const registry = createLegalRegistry();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi_legal_defendant_packet_'));
 
+    const sdk = await packetModelContext();
     try {
       const output = await registry.execute('legal_generate_litigation_packet', {
         orgId: `test-legal-defendant-files-${Date.now()}`,
@@ -197,14 +287,16 @@ describe('semi-automated legal workflows', () => {
         evidence: '质量异议函；退货沟通记录；检测记录。',
         opponentMaterials: '原告起诉状；合同复印件；送货单。',
         outputDir: dir,
-      });
+      }, sdk.context);
 
       expect(output).toContain('DOCX 生成：全部成功');
+      expect(decodeToolResult(output).receipt).toMatchObject({ ok: true, status: 'generated', persisted: true });
+      expect(sdk.create).toHaveBeenCalledTimes(8);
       const expected = [
         ['20_statement-of-defense', '民事答辩状（系统草稿）'],
         ['21_cross-examination-opinion', '质证意见（系统草稿）'],
         ['22_procedural-defense-checklist', '程序抗辩检查表（系统草稿）'],
-        ['23_argument-outline', '代理词框架（系统草稿）'],
+        ['23_argument-outline', '代理词工作稿（系统草稿）'],
         ['24_engagement-agreement', '委托代理合同（系统草稿）'],
         ['24_power-of-attorney', '授权委托书（系统草稿）'],
         ['24_law-firm-letter', '律师事务所函（系统草稿）'],
@@ -222,37 +314,46 @@ describe('semi-automated legal workflows', () => {
 
       const answer = fs.readFileSync(path.join(dir, '20_statement-of-defense.md'), 'utf8');
       expect(answer).toContain('逐项答辩意见');
-      expect(answer).toContain('待围绕抗辩要件检索并核验现行有效法律');
+      expect(answer).toContain('完整法律依据仍待核验');
+      for (const original of ['被告认为货物存在质量问题，双方曾协商退货。', '原告起诉状；合同复印件；送货单。', '请求驳回原告缺乏事实和证据依据的诉讼请求']) {
+        expect(sdk.create.mock.calls.some(([request]) => String(request.messages.find((message: any) => message.role === 'user')?.content || '').includes(original))).toBe(true);
+      }
+      expect(answer).not.toContain('法律适用自动复核已完成');
       expect(answer).not.toMatch(/《[^》]+》第/);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it('extracts dispute focuses from complaint, evidence, and trial notes', async () => {
-    const registry = createLegalRegistry();
-
-    const output = await registry.execute('legal_extract_dispute_focus', {
-      caseName: 'Trial Focus Case',
-      role: 'defendant',
-      caseType: '买卖合同纠纷',
+  it('extracts source-bound dispute questions through the configured SDK and keeps no-model input incomplete', async () => {
+    const registry = createLegalRegistry(); const cases = await import('../server/org/legal_cases');
+    const orgId = 'focus-source-positive-' + crypto.randomUUID();
+    const args = { orgId, userId: 'vitest', caseName: 'Trial Focus Case', role: 'defendant', caseType: '买卖合同纠纷',
       complaint: '原告称双方合同成立，被告拖欠货款并应承担违约金。',
       evidence: '合同、发货单、签收单、质量异议函、聊天记录。',
-      transcript: '庭审中双方争议付款条件是否成就、质量异议是否成立、违约金是否过高。',
-    });
-
-    expect(output).toContain('Trial Focus Case');
-    expect(output).not.toMatch(/底层三段论|三段论|大前提|小前提|涵摄/);
-    expect(output).toMatch(/争议焦点|待证事实|质证|抗辩/);
-    expect(output).toMatch(/已有证据|待补证据|外部检索关键词/);
-    expect(output).toMatch(/律师|复核|确认/);
+      transcript: '庭审中双方争议付款条件是否成就、质量异议是否成立、违约金是否过高。' };
+    const sdk = await reasoningModelContext();
+    const output = await registry.execute('legal_extract_dispute_focus', args, sdk.context);
+    expect(decodeToolResult(output).receipt).toMatchObject({ ok: true, status: 'generated', persisted: true });
+    expect(sdk.create).toHaveBeenCalledOnce();
+    expect(output).toContain('Trial Focus Case'); expect(output).toContain('拟检索问题');
+    for (const original of [args.complaint, args.evidence, args.transcript]) expect(output).toContain(original);
+    expect(output).not.toMatch(/底层三段论|三段论|大前提|小前提|涵摄|legal_finalize_delivery_package/);
+    expect(output).toContain('尚未开展外部检索'); expect(output).toMatch(/律师|复核|确认/);
+    const noModelArgs = { ...args, orgId: orgId + '-no-model', caseName: 'No model focus', persistCase: true };
+    const partial = await registry.execute('legal_extract_dispute_focus', noModelArgs);
+    expect(decodeToolResult(partial).receipt).toMatchObject({ ok: false, status: 'partial', persisted: false });
+    expect(partial).toContain('归集未完成'); expect(partial).not.toContain('案件空间：已归档');
+    for (const original of [args.complaint, args.evidence, args.transcript]) expect(partial).toContain(original);
+    expect(cases.listCases(noModelArgs.orgId, noModelArgs.caseName, 10, 'vitest')).toHaveLength(0);
+    expect(sdk.create).toHaveBeenCalledOnce();
   });
 
   it('creates unified legal case workspaces with case state and search order', async () => {
     const registry = createLegalRegistry();
     const orgId = `test-legal-workspace-${Date.now()}`;
 
-    const output = await registry.execute('legal_case_workspace', {
+    const rawOutput = await registry.execute('legal_case_workspace', {
       orgId,
       userId: 'vitest',
       caseName: '统一案件工作台测试案',
@@ -266,23 +367,37 @@ describe('semi-automated legal workflows', () => {
       evidence: '买卖合同；送货单；微信催款记录；银行流水',
       legalAuthorities: '拟引用《民法典》第五百八十五条。',
     });
+    const output = decodeToolResult(rawOutput).content;
 
     expect(output).toContain('案件工作台');
-    expect(output).toContain('案件ID：');
+    const CaseStore = await import('../server/org/legal_cases');
+    const createdCases = CaseStore.listCases(orgId, "统一案件工作台测试案", 50, 'vitest')
+      .filter(item => item.title === "统一案件工作台测试案");
+    expect(createdCases).toHaveLength(1);
+    const createdCase = createdCases[0];
+    expect(createdCase).toMatchObject({ orgId, title: "统一案件工作台测试案", createdBy: 'vitest' });
+    expect(createdCase.materials).toHaveLength(3);
+    expect(output).toContain(createdCase.title);
+    expect(output).toContain(`案件现有材料：共 ${createdCase.materials.length} 份`);
+    expect(output).not.toContain(createdCase.id);
+    expect(output).not.toContain(orgId);
+    for (const material of createdCase.materials) {
+      expect(output).not.toContain(material.id);
+    }
     expect(output).toContain('闭环状态');
     expect(output).toContain('完成度：');
     expect(output).toContain('下一动作：');
-    expect(output).toContain('推荐工具');
+    expect(output).not.toContain('推荐工具');
     expect(output).toContain('优先行动队列');
-    expect(output).toContain('| 顺位 | 模块 | 状态 | 下一步 | 推荐工具 |');
-    expect(output).toContain('Standard Legal Casework Sequence');
-    expect(output).toContain('Intake / case space');
-    expect(output).toContain('Major premise');
-    expect(output).toContain('Minor premise');
-    expect(output).toContain('Conclusion / subsumption');
-    expect(output).toContain('Current-law gate');
-    expect(output).toContain('legal_message_intake_to_case -> legal_case_workspace');
-    expect(output).toContain('legal_generate_citation_verification_report -> legal_finalize_delivery_package');
+    expect(output).toContain('| 顺位 | 模块 | 状态 | 下一步 |');
+    expect(output).not.toContain('Standard Legal Casework Sequence');
+    expect(output).not.toContain('Intake / case space');
+    expect(output).not.toContain('Major premise');
+    expect(output).not.toContain('Minor premise');
+    expect(output).not.toContain('Conclusion / subsumption');
+    expect(output).not.toContain('Current-law gate');
+    expect(output).not.toContain('legal_message_intake_to_case -> legal_case_workspace');
+    expect(output).not.toContain('legal_generate_citation_verification_report -> legal_finalize_delivery_package');
     expect(output).toContain('三段论分析');
     expect(output).toContain('尚未形成完整法律分析底稿');
     expect(output).toContain('证据目录与三性审查矩阵');
@@ -292,9 +407,9 @@ describe('semi-automated legal workflows', () => {
     expect(output).toContain('关联性核验');
     expect(output).toContain('现行有效法律');
     expect(output).toContain('最高人民法院 > 高级人民法院 > 中级人民法院 > 基层人民法院');
-    expect(output).toContain('legal_case_reasoning_matrix');
-    expect(output).toContain('legal_generate_litigation_packet');
-    expect(output).toContain('legal_finalize_delivery_package');
+    expect(output).not.toContain('legal_case_reasoning_matrix');
+    expect(output).not.toContain('legal_generate_litigation_packet');
+    expect(output).not.toContain('legal_finalize_delivery_package');
     expect(output).toContain('人民法院在线服务');
   });
 
@@ -302,7 +417,7 @@ describe('semi-automated legal workflows', () => {
     const registry = createLegalRegistry();
     const orgId = `test-legal-workflow-block-${Date.now()}`;
 
-    const output = await registry.execute('legal_case_workspace', {
+    const rawOutput = await registry.execute('legal_case_workspace', {
       orgId,
       userId: 'vitest',
       caseName: '闭环阻断测试案',
@@ -313,13 +428,15 @@ describe('semi-automated legal workflows', () => {
       evidence: '买卖合同；送货单；银行流水',
       legalAuthorities: '拟引用《合同法》第六十条作为请求权基础。',
     });
+    const output = decodeToolResult(rawOutput).content;
 
     expect(output).toContain('闭环状态');
     expect(output).toContain('阻断项：');
     expect(output).toMatch(/\| 现行有效法律 \| 阻断 \|/);
     expect(output).toContain('合同法');
-    expect(output).toContain('legal_search_statute / legal_generate_citation_verification_report');
-    expect(output).toContain('未通过现行有效法律硬门槛时自动阻断');
+    expect(output).not.toContain('legal_search_statute / legal_generate_citation_verification_report');
+    expect(output).toContain('正式交付');
+    expect(output).not.toContain('正式交付包已生成');
   });
 
   it('reports legal case workflow status without creating work products', async () => {
@@ -336,26 +453,43 @@ describe('semi-automated legal workflows', () => {
       facts: '双方签订买卖合同，被告收货后未付款。',
       evidence: '买卖合同；送货单；银行流水',
     });
-    const caseId = workspace.match(/案件ID：([0-9a-f-]+)/)?.[1];
+    const CaseStore = await import('../server/org/legal_cases');
+    const createdCases = CaseStore.listCases(orgId, "直接状态查询测试案", 50, 'vitest')
+      .filter(item => item.title === "直接状态查询测试案");
+    expect(createdCases).toHaveLength(1);
+    const createdCase = createdCases[0];
+    expect(createdCase).toMatchObject({ orgId, title: "直接状态查询测试案", createdBy: 'vitest' });
+    expect(createdCase.materials).toHaveLength(2);
+    const caseId = createdCase.id;
     expect(caseId).toBeTruthy();
 
-    const output = await registry.execute('legal_case_workflow_status', {
+    const rawOutput = await registry.execute('legal_case_workflow_status', {
       orgId,
       caseId,
       legalAuthorities: '拟引用《合同法》第六十条。',
     });
+    const output = decodeToolResult(rawOutput).content;
 
     expect(output).toContain('案件闭环状态');
     expect(output).toContain('直接状态查询测试案');
+    expect(output).toContain(createdCase.title);
+    expect(output).toContain(`案件现有材料：共 ${createdCase.materials.length} 份`);
+    expect(output).not.toContain(createdCase.id);
+    expect(output).not.toContain(orgId);
+    for (const material of createdCase.materials) {
+      expect(output).not.toContain(material.id);
+    }
+    expect(decodeToolResult(workspace).content).not.toContain(caseId);
+    expect(CaseStore.getCase(orgId, caseId, 'vitest')?.materials).toEqual(createdCase.materials);
     expect(output).toContain('完成度：');
     expect(output).toContain('下一动作：');
     expect(output).toContain('优先行动队列');
-    expect(output).toContain('| 顺位 | 模块 | 状态 | 下一步 | 推荐工具 |');
-    expect(output).toContain('Standard Legal Casework Sequence');
-    expect(output).toContain('Major premise');
-    expect(output).toContain('Minor premise');
-    expect(output).toContain('Conclusion / subsumption');
-    expect(output).toContain('Current-law gate');
+    expect(output).toContain('| 顺位 | 模块 | 状态 | 下一步 |');
+    expect(output).not.toContain('Standard Legal Casework Sequence');
+    expect(output).not.toContain('Major premise');
+    expect(output).not.toContain('Minor premise');
+    expect(output).not.toContain('Conclusion / subsumption');
+    expect(output).not.toContain('Current-law gate');
     expect(output).toMatch(/\| 现行有效法律 \| 阻断 \|/);
     expect(output).toContain('合同法');
     expect(output).not.toContain('正式交付包已生成');
@@ -376,7 +510,16 @@ describe('semi-automated legal workflows', () => {
         facts: '被告收货后未付款。',
         evidence: '合同；送货单；银行流水',
       });
-      const caseId = workspace.match(/案件ID：([0-9a-f-]+)/)?.[1];
+      const CaseStore = await import('../server/org/legal_cases');
+      const createdCases = CaseStore.listCases(orgId, "案件归档闭环测试案", 50, 'vitest')
+        .filter(item => item.title === "案件归档闭环测试案");
+      expect(createdCases).toHaveLength(1);
+      const createdCase = createdCases[0];
+      expect(createdCase).toMatchObject({ orgId, title: "案件归档闭环测试案", createdBy: 'vitest' });
+      expect(createdCase.materials).toHaveLength(2);
+      const caseId = createdCase.id;
+      expect(decodeToolResult(workspace).content).toContain(createdCase.title);
+      expect(decodeToolResult(workspace).content).not.toContain(caseId);
       expect(caseId).toBeTruthy();
 
       const filing = await registry.execute('legal_prepare_filing_handoff', {
@@ -393,6 +536,8 @@ describe('semi-automated legal workflows', () => {
       expect(filing).toContain('法律成果预检');
 
       const delivery = await registry.execute('legal_finalize_delivery_package', {
+        factDate:'2026-01-15',
+        ...await traceableDeliveryInput(orgId, '被告应承担违约责任。', caseId),
         orgId,
         userId: 'vitest',
         caseId,
@@ -417,8 +562,9 @@ describe('semi-automated legal workflows', () => {
     }
   });
 
-  it('turns legal meeting transcripts into archived case minutes', async () => {
+  it('archives an existing meeting report separately from the complete original transcript', async () => {
     const registry = createLegalRegistry();
+    expect(registry.get('legal_meeting_minutes_to_case')?.parameters.properties).toHaveProperty('report');
     const orgId = `test-legal-meeting-${Date.now()}`;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi_legal_meeting_'));
     const caseName = '法律会议闭环测试案';
@@ -433,6 +579,7 @@ describe('semi-automated legal workflows', () => {
         participants: '承办律师、原告法务、业务负责人',
         meetingTime: '2026-07-10 09:30',
         objective: '整理立案前事实、证据和期限',
+        report: '已有模型会议报告：付款条件和质量争议需核对。证据核对真实性、合法性、关联性；7月15安排仅以会议原文为线索，法院期限待确认。',
         outputDir: dir,
         transcript: [
           '双方在2026年3月签订买卖合同，被告收货后只支付部分货款。',
@@ -459,48 +606,50 @@ describe('semi-automated legal workflows', () => {
       expect(fs.existsSync(actionItemsPath)).toBe(true);
       expect(fs.existsSync(caseUpdatePath)).toBe(true);
       const markdown = fs.readFileSync(minutesPath, 'utf8');
-      expect(markdown).toContain('沟通要点');
-      expect(markdown).toContain('证据线索与三性提示');
-      expect(markdown).toContain('真实性');
-      expect(markdown).toContain('合法性');
-      expect(markdown).toContain('关联性');
-      expect(markdown).toContain('期限和待办');
+      expect(markdown).toContain('已有模型会议报告');
+      expect(markdown).not.toContain('原始转写/沟通记录');
+      expect(markdown).not.toContain('双方在2026年3月签订买卖合同');
+      expect(markdown).not.toContain('需要在7月15日前提交立案材料');
       expect(markdown).toContain('法律成果预检');
-      expect(markdown).toContain('legal_case_workspace');
-      expect(markdown).toContain('Live Meeting Workstream');
-      expect(markdown).toContain('Rolling Summary');
-      expect(fs.readFileSync(liveBriefPath, 'utf8')).toContain('Automatic Follow-Up');
-      expect(fs.readFileSync(actionItemsPath, 'utf8')).toContain('Meeting Action Items');
-      expect(fs.readFileSync(actionItemsPath, 'utf8')).toContain('Next Legal Workflow');
-      expect(fs.readFileSync(caseUpdatePath, 'utf8')).toContain('Case Intake Update');
-      expect(fs.readFileSync(caseUpdatePath, 'utf8')).toContain('Case Workspace Fields To Recheck');
+      expect(markdown).not.toContain('legal_case_workspace');
+      expect(fs.readFileSync(liveBriefPath, 'utf8')).toContain('已有模型会议报告');
+      expect(fs.readFileSync(actionItemsPath, 'utf8')).toContain('已有模型会议报告');
+      expect(fs.readFileSync(caseUpdatePath, 'utf8')).toContain('需要在7月15日前提交立案材料');
 
       const LegalCases = await import('../server/org/legal_cases');
       const caseFile = LegalCases.listCases(orgId, caseName, 1)[0];
+      expect(caseFile?.materials).toHaveLength(2);
       expect(caseFile?.materials.some(material => (
-        material.source === 'meeting'
-        && material.type === 'consultation'
-        && material.title.includes('法律会议纪要')
-        && material.localPath === minutesPath
+        material.source === 'import' && material.type === 'consultation'
+        && material.localPath === caseUpdatePath && material.content === fs.readFileSync(caseUpdatePath, 'utf8')
+        && material.content.includes('双方在2026年3月签订买卖合同') && material.content.includes('需要在7月15日前提交立案材料')
       ))).toBe(true);
       expect(caseFile?.materials.some(material => (
-        material.source === 'meeting'
-        && material.type === 'note'
-        && material.title.includes('会议行动项与期限')
-        && material.localPath === actionItemsPath
-      ))).toBe(true);
-      expect(caseFile?.materials.some(material => (
-        material.source === 'meeting'
-        && material.type === 'note'
-        && material.title.includes('会议案件更新')
-        && material.localPath === caseUpdatePath
+        material.source === 'tool' && material.type === 'note'
+        && material.localPath === minutesPath && material.content.includes('已有模型会议报告')
       ))).toBe(true);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it('creates archived legal reasoning matrices for syllogism-style case analysis', async () => {
+  it('keeps a transcript-only meeting as partial without inventing a summary or case archive', async () => {
+    const registry = createLegalRegistry(); const cases = await import('../server/org/legal_cases');
+    const orgId = 'meeting-no-report-' + crypto.randomUUID(); const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi_meeting_no_report_'));
+    const transcript = '仅为虚构验收。原告说已支付20万元，原件未核实。7月15日前收集资料只是内部安排，不是法院期限。尾句完整保留。';
+    try {
+      const output = await registry.execute('legal_meeting_minutes_to_case', { orgId, userId: 'vitest', caseName: 'No report meeting',
+        transcript, outputDir: dir, persistCase: false });
+      expect(decodeToolResult(output).receipt).toMatchObject({ ok: false, status: 'partial', persisted: false });
+      expect(output).toContain('法律会议原文已保存，尚未生成总结'); expect(output).not.toContain('法律会议纪要已生成');
+      expect(fs.readFileSync(path.join(dir, 'legal-meeting-case-update.md'), 'utf8')).toBe(transcript);
+      const minutes = fs.readFileSync(path.join(dir, 'legal-meeting-minutes.md'), 'utf8');
+      expect(minutes).toContain('尚未生成总结'); expect(minutes).not.toContain('已支付20万元');
+      expect(cases.listCases(orgId, 'No report meeting', 10, 'vitest')).toHaveLength(0);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps an unlinked reasoning template partial without creating a case', async () => {
     const registry = createLegalRegistry();
     const orgId = `test-legal-reasoning-${Date.now()}`;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi_legal_reasoning_'));
@@ -508,6 +657,7 @@ describe('semi-automated legal workflows', () => {
 
     try {
       const output = await registry.execute('legal_case_reasoning_matrix', {
+        factDate:'2026-01-15',
         orgId,
         userId: 'vitest',
         caseName,
@@ -521,10 +671,11 @@ describe('semi-automated legal workflows', () => {
         outputDir: dir,
       });
 
-      expect(output).toContain('法律分析三段论底稿已生成');
+      expect(output).toContain('法律分析未完成');
+      expect(decodeToolResult(output).receipt).toMatchObject({ ok: false, status: 'partial', reasoningLinked: false });
       expect(output).toContain('现行有效法律预检：通过');
       expect(output).toContain('底稿文件');
-      expect(output).toContain('案件空间：已归档');
+      expect(output).toContain('案件空间：未归档');
 
       const matrixPath = path.join(dir, 'legal-reasoning-matrix.md');
       expect(fs.existsSync(matrixPath)).toBe(true);
@@ -534,16 +685,12 @@ describe('semi-automated legal workflows', () => {
       expect(markdown).toContain('小前提：待证事实、证据材料、举证质证');
       expect(markdown).toContain('结论：涵摄、文书表达、风险');
       expect(markdown).toContain('最高人民法院 > 高级人民法院 > 中级人民法院 > 基层人民法院');
-      expect(markdown).toContain('legal_finalize_delivery_package');
+      expect(markdown).toContain('正式交付核验');
+      expect(markdown).toContain('来源关联检查：未通过');
+      expect(markdown).toContain('待逐项匹配法条');
 
       const LegalCases = await import('../server/org/legal_cases');
-      const caseFile = LegalCases.listCases(orgId, caseName, 1)[0];
-      expect(caseFile?.materials.some(material => (
-        material.source === 'tool'
-        && material.type === 'note'
-        && material.title.includes('法律分析三段论底稿')
-        && material.localPath === matrixPath
-      ))).toBe(true);
+      expect(LegalCases.listCases(orgId, caseName, 100)).toEqual([]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -551,61 +698,50 @@ describe('semi-automated legal workflows', () => {
 
   it('archives contract and bid work products into the case workspace', async () => {
     const registry = createLegalRegistry();
-    const orgId = `test-legal-contract-bid-${Date.now()}`;
+    const orgId = 'test-legal-contract-bid-' + Date.now();
     const caseName = '合同标书闭环测试案';
-
-    const review = await registry.execute('legal_review_contract', {
-      orgId,
-      userId: 'vitest',
-      caseName,
-      caseType: '合同审查',
-      contract: [
-        '建设工程施工合同',
-        '发包人逾期付款的，承包人每日按合同总价30%收取违约金。',
-        '任一方可单方解除合同，无需通知对方。',
-      ].join('\n'),
+    const { upsertUserPreferredLLM } = await import('../server/llm/user_preferences');
+    const { contractStructuredReply } = await import('./legal_contract_fixture');
+    const { bidStructuredReply } = await import('./legal_bid_fixture');
+    upsertUserPreferredLLM('vitest', { provider: 'relay', model: 'synthetic-contract-bid-positive', selectionMode: 'pinned', allowCloudFallback: false });
+    const create = vi.fn((request: any, options: any) => {
+      const prompt = String(request.messages.find((message: any) => message.role === 'user')?.content || '');
+      const body = '本次仅依据已提供原文形成拟议工作稿；付款条件、签章、资质与实际履行尚待核对，未提供不表示没有约定，不作正式核验通过。';
+      const content = /^指定栏目：/m.test(prompt) ? contractStructuredReply(prompt, body) : bidStructuredReply(prompt, body);
+      return sdkCompletion(request, { choices: [{ message: { content }, finish_reason: 'stop' }] }, 0, options.signal);
     });
-    expect(review).toContain('案件归档与交付边界');
-    expect(review).toContain('案件空间：已归档');
-    expect(review).toContain('legal_finalize_delivery_package');
-
-    const draft = await registry.execute('legal_draft_contract', {
-      orgId,
-      userId: 'vitest',
-      caseName,
-      caseType: '合同起草',
-      type: '建设工程施工合同',
-      details: '项目名称：测试工程；工期：90日；价款：待填写；需要违约责任和付款节点。',
-    });
-    expect(draft).toContain('合同起草');
-    expect(draft).toContain('案件空间：已归档');
-
-    const bid = await registry.execute('legal_generate_bid', {
-      orgId,
-      userId: 'vitest',
-      caseName,
-      caseType: '投标/招标文件响应',
-      projectName: '测试工程投标项目',
-      requirements: '招标要求：提交商务标、技术标、项目管理机构、施工组织设计、授权委托书和报价清单。',
-    });
-    expect(bid).toContain('投标书');
-    expect(bid).toContain('案件空间：已归档');
-    expect(bid).toContain('三段论核心基础');
-
+    const context = { userId: 'vitest', authenticated: true, authRole: 'user', localExecution: true,
+      executionBoundary: 'trusted_local' as const, source: 'legal-direct-tool',
+      llmGetters: { getDeepSeek: () => null, getGemini: () => null, getRelay: () => ({ chat: { completions: { create } } }) } };
+    const common = { orgId, userId: 'vitest', caseName };
+    const reviewArgs = { ...common, caseType: '合同审查', contract: '建设工程施工合同\n发包人逾期付款的，承包人每日按合同总价30%收取违约金。\n任一方可单方解除合同，无需通知对方。' };
+    const draftArgs = { ...common, caseType: '合同起草', type: '建设工程施工合同', details: '项目名称：测试工程；工期：90日；价款：待填写；需要违约责任和付款节点。' };
+    const bidArgs = { ...common, caseType: '投标/招标文件响应', projectName: '测试工程投标项目', requirements: '招标要求：提交商务标、技术标、项目管理机构、施工组织设计、授权委托书和报价清单。' };
+    const review = decodeToolResult(await registry.execute('legal_review_contract', reviewArgs, context));
+    expect(review.receipt).toMatchObject({ ok: true, status: 'reviewed', persisted: true });
+    expect(review.content).toContain('案件归档与交付边界');
+    expect(review.content).toContain('案件空间：已归档');
+    const draft = decodeToolResult(await registry.execute('legal_draft_contract', draftArgs, context));
+    expect(draft.receipt).toMatchObject({ ok: true, status: 'generated', persisted: true });
+    expect(draft.content).toContain('建设工程施工合同工作稿');
+    expect(draft.content).toContain('案件空间：已归档');
+    const bid = decodeToolResult(await registry.execute('legal_generate_bid', bidArgs, context));
+    expect(bid.receipt).toMatchObject({ ok: true, status: 'generated', persisted: true });
+    expect(bid.content).toContain('投标响应工作底稿'); expect(bid.content).toContain('案件空间：已归档');
+    expect(bid.content).toContain('正式交付核验'); expect(bid.content).not.toContain('三段论核心基础');
+    expect(create).toHaveBeenCalledTimes(8);
     const LegalCases = await import('../server/org/legal_cases');
     const caseFile = LegalCases.listCases(orgId, caseName, 1)[0];
-    expect(caseFile?.materials.some(material => (
-      material.type === 'contract'
-      && material.title.includes('合同审查报告')
-    ))).toBe(true);
-    expect(caseFile?.materials.some(material => (
-      material.type === 'contract'
-      && material.title.includes('合同起草底稿')
-    ))).toBe(true);
-    expect(caseFile?.materials.some(material => (
-      material.type === 'note'
-      && material.title.includes('投标书工作底稿')
-    ))).toBe(true);
+    expect(caseFile?.materials.some(material => material.type === 'contract' && material.title.includes('合同审查报告'))).toBe(true);
+    expect(caseFile?.materials.some(material => material.type === 'contract' && material.title.includes('合同起草底稿'))).toBe(true);
+    expect(caseFile?.materials.some(material => material.type === 'note' && material.title.includes('投标书工作底稿'))).toBe(true);
+    for (const [tool, args] of [['legal_review_contract', reviewArgs], ['legal_draft_contract', draftArgs], ['legal_generate_bid', bidArgs]] as const) {
+      const missingName = caseName + '-无模型-' + tool;
+      const incomplete = decodeToolResult(await registry.execute(tool, { ...args, caseName: missingName }));
+      expect(incomplete.receipt).toMatchObject({ ok: false, status: 'partial', persisted: false });
+      expect(LegalCases.listCases(orgId, missingName, 10, 'vitest')).toHaveLength(0);
+    }
+    expect(create).toHaveBeenCalledTimes(8);
   });
 
   it('preflights draft legal work products before formal delivery', async () => {
@@ -624,23 +760,31 @@ describe('semi-automated legal workflows', () => {
     expect(output).toContain('现行有效法律预检：未通过');
     expect(output).toContain('合同法');
     expect(output).toContain('不得标记为正式成果');
-    expect(output).toContain('legal_finalize_delivery_package');
+    expect(output).toContain('正式交付核验');
+    expect(output).not.toMatch(/legal_finalize_delivery_package|内部分析链路/);
   });
 
   it('archives core litigation work products into the same case workspace', async () => {
     const registry = createLegalRegistry();
     const orgId = `test-legal-core-products-${Date.now()}`;
     const caseName = '核心办案产物闭环测试案';
+    const sdk = await packetModelContext();
 
     const packet = await registry.execute('legal_generate_litigation_packet', {
       orgId,
       userId: 'vitest',
       caseName,
       role: '原告',
+      parties: '虚构供货方/虚构采购方', claims: '仅请求核对付款条件及交付，不增加欠款、退款或违约金诉请。',
       caseType: '买卖合同纠纷',
       facts: '被告收货后未付剩余货款。',
       evidence: '买卖合同；送货单；签收单；银行流水。',
-    });
+    }, sdk.context);
+    expect(decodeToolResult(packet).receipt).toMatchObject({ ok: true, status: 'generated', persisted: true });
+    const LegalCases = await import('../server/org/legal_cases');
+    const caseFile = LegalCases.listCases(orgId, caseName, 1)[0];
+    expect(caseFile).toBeDefined();
+    const archivedPacketMaterials = JSON.stringify(caseFile.materials);
     const focus = await registry.execute('legal_extract_dispute_focus', {
       orgId,
       userId: 'vitest',
@@ -670,22 +814,16 @@ describe('semi-automated legal workflows', () => {
       facts: '原告已完成供货，被告以质量问题拒付剩余货款。',
     });
 
-    for (const output of [packet, focus, argument, strategy]) {
-      expect(output).toContain('案件归档与交付边界');
-      expect(output).toContain('案件空间：已归档');
-      expect(output).toContain('legal_finalize_delivery_package');
+    for (const output of [focus, argument, strategy]) {
+      expect(decodeToolResult(output).receipt).toMatchObject({ ok: false, status: 'partial', persisted: false });
+      expect(output).not.toContain('案件空间：已归档');
     }
-
-    const LegalCases = await import('../server/org/legal_cases');
-    const caseFile = LegalCases.listCases(orgId, caseName, 1)[0];
-    const titles = caseFile?.materials.map(material => material.title).join('\n') || '';
-    expect(titles).toContain('半自动诉讼文书包');
-    expect(titles).toContain('争议焦点提炼');
-    expect(titles).toContain('代理词草稿');
-    expect(titles).toContain('诉讼策略分析');
+    expect(JSON.stringify(LegalCases.getCase(orgId, caseFile.id)!.materials)).toBe(archivedPacketMaterials);
+    expect(caseFile.materials.map(material => material.title).join('\n')).toContain('半自动诉讼文书包');
+    expect(sdk.create).toHaveBeenCalledTimes(4);
   });
 
-  it('archives asset tracing and equity penetration reports into case workspaces', async () => {
+  it('keeps asset and equity queries incomplete and unarchived when external sources return no data', async () => {
     const registry = createLegalRegistry();
     const orgId = `test-legal-asset-equity-${Date.now()}`;
     const caseName = '执行财产线索闭环测试案';
@@ -710,21 +848,13 @@ describe('semi-automated legal workflows', () => {
         name: `${subjectName}有限公司`,
       });
 
-      expect(assets).toContain('财产线索报告');
-      expect(assets).toContain('案件空间：已归档');
-      expect(equity).toContain('授权网页登录协作');
-      expect(equity).toContain('案件空间：已归档');
-
+      expect(assets).toContain('财产线索查询报告'); expect(equity).toContain('授权网页登录协作');
+      for (const output of [assets, equity]) {
+        expect(decodeToolResult(output).receipt).toMatchObject({ ok: false, status: 'partial' });
+        expect(output).not.toContain('案件空间：已归档'); expect(output).toMatch(/未取得|未通过|不能/);
+      }
       const LegalCases = await import('../server/org/legal_cases');
-      const caseFile = LegalCases.listCases(orgId, caseName, 1)[0];
-      expect(caseFile?.materials.some(material => (
-        material.type === 'evidence'
-        && material.title.includes('财产线索报告')
-      ))).toBe(true);
-      expect(caseFile?.materials.some(material => (
-        material.type === 'evidence'
-        && material.title.includes('股权穿透')
-      ))).toBe(true);
+      expect(LegalCases.listCases(orgId, caseName, 10, 'vitest')).toHaveLength(0);
     } finally {
       fetchMock.mockRestore();
     }
@@ -732,40 +862,44 @@ describe('semi-automated legal workflows', () => {
 
   it('generates bid work products directly from local tender files', async () => {
     const registry = createLegalRegistry();
-    const orgId = `test-legal-bid-file-${Date.now()}`;
+    const orgId = 'test-legal-bid-file-' + Date.now();
     const caseName = '招标文件直读闭环测试案';
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lumi_legal_bid_file_'));
     const tenderPath = path.join(dir, 'tender-requirements.txt');
-
+    const { upsertUserPreferredLLM } = await import('../server/llm/user_preferences');
+    const { bidStructuredReply } = await import('./legal_bid_fixture');
+    upsertUserPreferredLLM('vitest', { provider: 'relay', model: 'synthetic-local-tender-positive', selectionMode: 'pinned', allowCloudFallback: false });
+    const create = vi.fn((request: any, options: any) => {
+      const prompt = String(request.messages.find((message: any) => message.role === 'user')?.content || '');
+      const content = bidStructuredReply(prompt, '仅按给定原件编制本节拟议响应；资质、业绩、报价及签章尚待核验，付款和实施方案仍需责任人确认，不等于已经投标。');
+      return sdkCompletion(request, { choices: [{ message: { content }, finish_reason: 'stop' }] }, 0, options.signal);
+    });
+    const context = { userId: 'vitest', authenticated: true, authRole: 'user', localExecution: true,
+      executionBoundary: 'trusted_local' as const, source: 'legal-direct-tool',
+      llmGetters: { getDeepSeek: () => null, getGemini: () => null, getRelay: () => ({ chat: { completions: { create } } }) } };
     try {
-      fs.writeFileSync(tenderPath, [
-        '招标要求：提交商务标、技术标、项目管理机构、施工组织设计。',
-        '评分标准：企业资质、类似业绩、技术方案、报价清单、授权委托书。',
-        '合同条款：需响应付款节点、违约责任、工期、质量标准。',
-      ].join('\n'), 'utf8');
-
-      const output = await registry.execute('legal_generate_bid', {
-        orgId,
-        userId: 'vitest',
-        caseName,
-        caseType: '投标/招标文件响应',
-        projectName: '直读招标文件测试项目',
-        filePath: tenderPath,
-      });
-
-      expect(output).toContain('直读招标文件测试项目');
-      expect(output).toContain('招标文件来源');
-      expect(output).toContain('tender-requirements.txt');
-      expect(output).toContain('案件空间：已归档');
-
+      const originalText = '招标要求：提交商务标、技术标、项目管理机构、施工组织设计。\n评分标准：企业资质、类似业绩、技术方案、报价清单、授权委托书。\n合同条款：需响应付款节点、违约责任、工期、质量标准。';
+      fs.writeFileSync(tenderPath, originalText, 'utf8');
+      const args = { orgId, userId: 'vitest', caseName, caseType: '投标/招标文件响应', projectName: '直读招标文件测试项目', filePath: tenderPath };
+      const result = decodeToolResult(await registry.execute('legal_generate_bid', args, context));
+      expect(result.receipt).toMatchObject({ ok: true, status: 'generated', persisted: true });
+      const output = result.content;
+      expect(output).toContain('直读招标文件测试项目'); expect(output).toContain('招标文件来源');
+      expect(output).toContain('tender-requirements.txt'); expect(output).toContain('案件空间：已归档');
+      expect(output).toContain(originalText); expect(fs.readFileSync(tenderPath, 'utf8')).toBe(originalText);
+      const docxPath = output.match(/- DOCX 文件：([^\r\n]+)/)![1];
+      const artifact = fs.readFileSync(docxPath);
+      expect(artifact.length).toBeGreaterThan(256); expect(artifact.subarray(0, 4)).toEqual(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+      expect(create).toHaveBeenCalledTimes(6);
       const LegalCases = await import('../server/org/legal_cases');
       const caseFile = LegalCases.listCases(orgId, caseName, 1)[0];
-      expect(caseFile?.materials.some(material => (
-        material.type === 'note'
-        && material.title.includes('投标书工作底稿')
-        && material.content.includes('招标文件来源')
-        && material.content.includes('tender-requirements.txt')
-      ))).toBe(true);
+      expect(caseFile?.materials.some(material => material.type === 'note' && material.title.includes('投标书工作底稿')
+        && material.content.includes('招标文件来源') && material.content.includes('tender-requirements.txt'))).toBe(true);
+      const missingName = caseName + '-无模型';
+      const incomplete = decodeToolResult(await registry.execute('legal_generate_bid', { ...args, caseName: missingName }));
+      expect(incomplete.receipt).toMatchObject({ ok: false, status: 'partial', persisted: false });
+      expect(LegalCases.listCases(orgId, missingName, 10, 'vitest')).toHaveLength(0);
+      expect(incomplete.content).toContain(originalText); expect(create).toHaveBeenCalledTimes(6);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -846,38 +980,53 @@ describe('semi-automated legal workflows', () => {
     ))).toBe(true);
   });
 
-  it('generates argument and legal-opinion drafts as lawyer-reviewed work products', async () => {
-    const registry = createLegalRegistry();
-
-    const argument = await registry.execute('legal_generate_argument_or_opinion', {
-      caseName: 'Argument Draft Case',
-      role: 'plaintiff',
-      documentType: '代理词',
-      caseType: '买卖合同纠纷',
-      facts: '双方签订买卖合同后，原告完成供货，被告以质量问题拒付剩余货款。',
-      issues: ['付款条件是否成就', '质量异议抗辩是否成立', '违约金是否需要调整'],
-      evidence: '合同、订单、发货单、签收单、发票、银行流水。',
-      opponentArguments: '被告主张货物存在质量问题，拒绝支付剩余货款。',
-      objective: '请求支持货款和违约金。',
-    });
-    const opinion = await registry.execute('legal_generate_argument_or_opinion', {
-      caseName: 'Opinion Draft Case',
-      role: 'defendant',
-      documentType: '法律意见书',
-      caseType: '买卖合同纠纷',
-      facts: '客户收到起诉状后，需要评估质量异议抗辩、违约金调整和和解空间。',
-      evidence: '验收异议函、退货沟通记录、检测报告。',
-      opponentArguments: '原告主张已按约供货并要求支付全额货款。',
-      objective: '形成应诉和谈判意见。',
-    });
-
-    for (const output of [argument, opinion]) {
-      expect(output).not.toMatch(/底层三段论|三段论|大前提|小前提|涵摄/);
-      expect(output).toMatch(/争议焦点|法律分析|证据评价|复核清单/);
-      expect(output).toMatch(/待检索|待核验|待补证|律师/);
+  it('generates argument and legal-opinion drafts with real source binding and SDK review', async () => {
+    const registry = createLegalRegistry(); const cases = await import('../server/org/legal_cases'); const sdk = await reasoningModelContext();
+    const orgId = 'argument-source-positive-' + crypto.randomUUID();
+    const inputs = [
+      { caseName: 'Argument Draft Case', role: 'plaintiff', documentType: '代理词', caseType: '买卖合同纠纷',
+        facts: '双方签订买卖合同后，原告完成供货，被告以质量问题拒付剩余货款。',
+        issues: ['付款条件是否成就', '质量异议抗辩是否成立', '违约金是否需要调整'], evidence: '合同、订单、发货单、签收单、发票、银行流水。',
+        opponentArguments: '被告主张货物存在质量问题，拒绝支付剩余货款。', objective: '请求支持货款和违约金。' },
+      { caseName: 'Opinion Draft Case', role: 'defendant', documentType: '法律意见书', caseType: '买卖合同纠纷',
+        facts: '客户收到起诉状后，需要评估质量异议抗辩、违约金调整和和解空间。', evidence: '验收异议函、退货沟通记录、检测报告。',
+        opponentArguments: '原告主张已按约供货并要求支付全额货款。', objective: '形成应诉和谈判意见。' },
+    ];
+    const outputs: string[] = [];
+    for (const input of inputs) {
+      const caseFile = cases.createCase(orgId, 'vitest', { title: input.caseName });
+      for (const [title, content] of Object.entries({ facts: input.facts, evidence: input.evidence, opponentArguments: input.opponentArguments })) {
+        cases.addMaterial(orgId, 'vitest', caseFile.id, { type: 'evidence', source: 'manual', title: '虚构原始材料 ' + title, content });
+      }
+      const output = await registry.execute('legal_generate_argument_or_opinion', { ...input, orgId, userId: 'vitest', caseId: caseFile.id,
+        factDate: '2026-09-01', legalAuthorities: '《民法典》第626条', persistCase: true }, sdk.context);
+      expect(decodeToolResult(output).receipt).toMatchObject({ ok: true, status: 'generated', reasoningLinked: true, reasoningReviewed: true, persisted: true });
+      expect(output).not.toMatch(/底层三段论|三段论|大前提|小前提|涵摄|legal_finalize_delivery_package|内部分析链路/);
+      expect(output).toContain('法律依据：'); expect(output).toContain('本案材料'); expect(output).toContain('规则原文衔接片段');
+      expect(output).toContain('未经律师核准'); expect(output).toMatch(/待检索|待核验|待补证|律师/);
+      for (const original of [input.facts, input.evidence, input.opponentArguments]) expect(output).toContain(original);
+      expect(cases.getCase(orgId, caseFile.id, 'vitest')!.materials.filter(material => material.source === 'tool')).toHaveLength(1);
+      outputs.push(output);
     }
-    expect(argument).toMatch(/代理词|结论请求/);
-    expect(opinion).toMatch(/法律意见书|风险提示|处理建议/);
+    expect(sdk.create).toHaveBeenCalledTimes(4);
+    expect(outputs[0]).toMatch(/代理词|结论请求/); expect(outputs[1]).toMatch(/法律意见书|风险提示|处理建议/);
+  });
+
+  it('keeps no-model ordinary legal drafts incomplete without replacing originals or archiving a result', async () => {
+    const registry = createLegalRegistry(); const cases = await import('../server/org/legal_cases');
+    const orgId = 'argument-no-model-' + crypto.randomUUID();
+    for (const documentType of ['代理词', '法律意见书']) {
+      const caseFile = cases.createCase(orgId, 'vitest', { title: 'No model ' + documentType });
+      const original = '虚构原始材料原文含“三段论”和“大前提”字样，属于当事人引述；付款、主体及日期尚待核实。';
+      cases.addMaterial(orgId, 'vitest', caseFile.id, { type: 'evidence', source: 'manual', title: '原始说明', content: original });
+      const before = JSON.stringify(cases.getCase(orgId, caseFile.id, 'vitest')!.materials);
+      const output = await registry.execute('legal_generate_argument_or_opinion', { orgId, userId: 'vitest', caseId: caseFile.id,
+        caseName: caseFile.title, documentType, facts: original, persistCase: true });
+      expect(decodeToolResult(output).receipt).toMatchObject({ ok: false, status: 'partial', persisted: false });
+      expect(output).toContain('拟议正文未完成'); expect(output).toContain(original);
+      expect(output).not.toMatch(/大前提：|小前提：|legal_finalize_delivery_package|内部分析链路|案件空间：已归档/);
+      expect(JSON.stringify(cases.getCase(orgId, caseFile.id, 'vitest')!.materials)).toBe(before);
+    }
   });
 
   it('builds external research plans around authorized browser sessions', async () => {
@@ -937,6 +1086,8 @@ describe('semi-automated legal workflows', () => {
       });
 
       const output = await registry.execute('legal_finalize_delivery_package', {
+        factDate:'2026-01-15',
+        ...await traceableDeliveryInput(orgId, '被告应支付货款并承担违约责任。', undefined, '正式交付测试案'),
         orgId,
         userId: 'vitest',
         caseName: '正式交付测试案',
@@ -989,6 +1140,7 @@ describe('semi-automated legal workflows', () => {
 
     try {
       const output = await registry.execute('legal_finalize_delivery_package', {
+        factDate:'2026-01-15',
         caseName: '三段论阻断测试案',
         documentType: '法律意见书',
         outputDir: dir,
@@ -1001,7 +1153,8 @@ describe('semi-automated legal workflows', () => {
 
       expect(output).toContain('正式交付包未生成');
       expect(output).toContain('推理底稿结构不完整');
-      expect(output).toContain('legal_case_reasoning_matrix');
+      expect(output).toContain('来源关联未通过');
+      expect(output).toContain('法律分析底稿');
       expect(fs.existsSync(path.join(dir, '00_reasoning-gate-blocked.md'))).toBe(true);
       expect(fs.existsSync(path.join(dir, '02_citation-verification-report.md'))).toBe(true);
       expect(fs.existsSync(path.join(dir, '03_source-register.md'))).toBe(true);
@@ -1019,6 +1172,7 @@ describe('semi-automated legal workflows', () => {
 
     try {
       const output = await registry.execute('legal_finalize_delivery_package', {
+        factDate:'2026-01-15',
         caseName: '无法条引用阻断测试案',
         documentType: '法律意见书',
         outputDir: dir,
@@ -1061,6 +1215,7 @@ describe('semi-automated legal workflows', () => {
 
     try {
       const output = await registry.execute('legal_finalize_delivery_package', {
+        factDate:'2026-01-15',
         orgId,
         userId: 'vitest',
         caseName: '未核验类案阻断测试案',
@@ -1107,6 +1262,8 @@ describe('semi-automated legal workflows', () => {
 
     try {
       const output = await registry.execute('legal_finalize_delivery_package', {
+        factDate:'2026-01-15',
+        ...await traceableDeliveryInput(orgId, '被告应承担违约责任。', undefined, '本案案号豁免测试案'),
         orgId,
         userId: 'vitest',
         caseName: '本案案号豁免测试案',
@@ -1144,7 +1301,13 @@ describe('semi-automated legal workflows', () => {
     const caseName = '归档三段论复用测试案';
 
     try {
+      const LegalCases = await import('../server/org/legal_cases');
+      const sourceCase = LegalCases.createCase(orgId, 'vitest', { title: caseName, factDate: '2026-01-15' });
+      LegalCases.addMaterial(orgId, 'vitest', sourceCase.id, { type: 'evidence', source: 'manual', title: '虚构原始合同及签收记录', content: '原告已供货，被告签收后未支付剩余货款，违约金约定与实际损失待核实。' });
+      const model = await reasoningModelContext();
       await registry.execute('legal_case_reasoning_matrix', {
+        factDate:'2026-01-15',
+        caseId: sourceCase.id,
         orgId,
         userId: 'vitest',
         caseName,
@@ -1155,13 +1318,14 @@ describe('semi-automated legal workflows', () => {
         issues: ['被告是否应支付货款和违约金'],
         legalAuthorities: '引用《民法典》第五百八十五条。',
         outputDir: reasoningDir,
-      });
+      }, model.context);
+      expect(model.create).toHaveBeenCalledTimes(2);
 
-      const LegalCases = await import('../server/org/legal_cases');
       const caseFile = LegalCases.listCases(orgId, caseName, 1)[0];
       expect(caseFile?.id).toBeTruthy();
 
       const output = await registry.execute('legal_finalize_delivery_package', {
+        factDate:'2026-01-15',
         orgId,
         userId: 'vitest',
         caseId: caseFile.id,
@@ -1171,7 +1335,8 @@ describe('semi-automated legal workflows', () => {
         includeDocx: false,
         content: [
           '# 代理词草稿',
-          '根据《民法典》第五百八十五条，原告请求被告支付货款并承担违约责任。',
+          '根据《民法典》第五百八十五条进行条件分析。',
+          caseFile.materials.find(m => m.reasoningLinks?.length)!.reasoningLinks![0].conclusion,
         ].join('\n'),
       });
 
@@ -1194,6 +1359,7 @@ describe('semi-automated legal workflows', () => {
 
     try {
       const output = await registry.execute('legal_finalize_delivery_package', {
+        factDate:'2026-01-15',
         caseName: '废止法阻断测试案',
         documentType: '代理词',
         caseType: '买卖合同纠纷',
@@ -1231,6 +1397,7 @@ describe('semi-automated legal workflows', () => {
 
     try {
       const output = await registry.execute('legal_finalize_delivery_package', {
+        factDate:'2026-01-15',
         caseName: '未知法条阻断测试案',
         documentType: '法律意见书',
         outputDir: dir,
@@ -1258,6 +1425,7 @@ describe('semi-automated legal workflows', () => {
 
     try {
       const output = await registry.execute('legal_generate_citation_verification_report', {
+        factDate:'2026-01-15',
         caseName: '引用核验测试案',
         outputDir: dir,
         text: '本案拟引用《合同法》第六十条、《民法典》第五百八十五条及（2025）沪0101民初123号。',
@@ -1339,8 +1507,9 @@ describe('semi-automated legal workflows', () => {
       expect(output).toMatch(/跳过\/失败：1 份|跳过\/失败：1/);
       expect(output).toContain('起诉状.txt');
       expect(output).toContain('证据目录.md');
-      expect(output).toContain('ocr_image_file');
-      expect(output).toContain('legal_import_materials_to_kb');
+      expect(output).toContain('图片文字识别');
+      expect(output).not.toMatch(/ocr_image_file|legal_import_materials_to_kb/);
+      expect(decodeToolResult(output).receipt).toMatchObject({ ok: false, status: 'partial' });
 
       const results = await KB.searchKnowledgeBase('org-legal-material-import', '质量异议 付款条件', {
         limit: 5,
@@ -1523,10 +1692,13 @@ describe('semi-automated legal workflows', () => {
 
   it('keeps triad reasoning as core legal logic rather than a standalone UI tab', () => {
     const registry = createLegalRegistry();
-    const legalHubSource = fs.readFileSync(path.join(process.cwd(), 'src/components/org/LegalHub.tsx'), 'utf-8');
+    const legalHubSource = readImplementationSource(path.join(process.cwd(), 'src/components/org/LegalHub.tsx'), 'utf-8');
     const toolRouterSource = fs.readFileSync(path.join(process.cwd(), 'server/cognition/tool_router.ts'), 'utf-8');
     const legalToolsShimSource = fs.readFileSync(path.join(process.cwd(), 'server/tools/definitions/legal_tools.ts'), 'utf-8');
-    const legalToolsSource = fs.readFileSync(path.join(process.cwd(), 'server/regions/packs/cn/legal_tools.ts'), 'utf-8');
+    const legalToolDirectory = path.join(process.cwd(), 'server/regions/packs/cn/legal_tools');
+    const legalToolsSource = [fs.readFileSync(path.join(process.cwd(), 'server/regions/packs/cn/legal_tools.ts'), 'utf8'),
+      ...fs.readdirSync(legalToolDirectory).filter(file => file.endsWith('.ts')).sort()
+        .map(file => fs.readFileSync(path.join(legalToolDirectory, file), 'utf8'))].join('\n');
     const uiMessagesSource = fs.readFileSync(path.join(process.cwd(), 'src/i18n/locales/ui.generated.json'), 'utf-8');
     const chatRoutesSource = fs.readFileSync(path.join(process.cwd(), 'server/routes/chat_routes.ts'), 'utf-8');
 
@@ -1540,7 +1712,6 @@ describe('semi-automated legal workflows', () => {
     expect(legalHubSource).not.toContain('Case Action Board');
     expect(legalHubSource).not.toContain('案件行动面板');
     expect(legalHubSource).toContain('legalCaseToolArgs');
-    expect(legalHubSource).toContain("runLegalTool('legal_case_reasoning_matrix'");
     expect(legalHubSource).not.toContain('办案闭环');
     expect(uiMessagesSource).toContain('办案闭环');
     expect(legalHubSource).toContain('persistCase: true');
@@ -1551,13 +1722,11 @@ describe('semi-automated legal workflows', () => {
     expect(fs.readFileSync(path.join(process.cwd(), 'src/lib/legalToolClient.ts'), 'utf-8')).toContain('/api/legal/tool/');
     expect(chatRoutesSource).toContain('DIRECT_LEGAL_TOOL_ALLOWLIST');
     expect(chatRoutesSource).toContain('/legal/tool/:toolName');
-    expect(chatRoutesSource).toContain('legal_generate_litigation_packet');
-    expect(chatRoutesSource).toContain('legal_case_workflow_status');
-    expect(chatRoutesSource).toContain('legal_message_intake_to_case');
-    expect(chatRoutesSource).toContain('legal_finalize_delivery_package');
-    expect(chatRoutesSource).toContain('legal_refresh_authoritative_sources');
-    expect(chatRoutesSource).toContain('legal_authority_source_status');
-    expect(chatRoutesSource).toContain('legal_process_notice_link');
+    expect(chatRoutesSource).toContain('legalToolDefinitions().map(tool => tool.name)');
+    const catalogNames = legalToolDefinitions().map(tool => tool.name);
+    for (const name of ["legal_generate_litigation_packet","legal_case_workflow_status","legal_message_intake_to_case","legal_finalize_delivery_package","legal_refresh_authoritative_sources","legal_authority_source_status","legal_process_notice_link"]) {
+      expect(catalogNames).toContain(name); expect(registry.get(name)?.name).toBe(name);
+    }
     expect(registry.get('legal_triad_analysis')).toBeUndefined();
     expect(registry.get('legal_case_reasoning_matrix')).toBeTruthy();
     expect(registry.get('legal_case_workflow_status')).toBeTruthy();
@@ -1567,10 +1736,10 @@ describe('semi-automated legal workflows', () => {
     expect(legalToolsShimSource).toContain("../../regions/packs/cn/legal_tools");
     expect(legalToolsShimSource).not.toContain('三段论是 Lumi 法律工作的核心基础');
     expect(legalToolsSource).toContain('三段论是 Lumi 法律工作的核心基础');
-    expect(legalToolsSource).toContain('Standard Legal Casework Sequence');
+    expect(legalToolsSource).not.toContain('Standard Legal Casework Sequence');
     expect(legalToolsSource).toContain('Major premise');
     expect(legalToolsSource).toContain('Minor premise');
-    expect(legalToolsSource).toContain('Conclusion / subsumption');
+    expect(legalToolsSource).not.toContain('Conclusion / subsumption');
     expect(toolRouterSource).toContain('legal_case_reasoning_matrix');
     expect(toolRouterSource).toContain('legal_case_workflow_status');
     expect(toolRouterSource).toContain('legal_message_intake_to_case');
@@ -1618,6 +1787,14 @@ describe('legal web login presets', () => {
     const ids = data.presets.map((preset: { id: string }) => preset.id);
 
     expect(ids).toEqual(expect.arrayContaining(requiredPresetIds));
-    expect(data.note).toContain('web_login_profile_save_from_preset');
+    expect(data.note).toMatch(/select.*site.*authorized browser session/i);
+    expect(data.note).not.toMatch(/web_login_profile_save_from_preset|password|apiKey|appSecret/i);
+    for(const preset of data.presets){const actual=getWebLoginSitePreset(preset.id)!;expect(preset).toMatchObject({id:actual.id,loginUrl:actual.loginUrl,matchHosts:actual.matchHosts});if(actual.sourceUrl)expect(preset.sourceUrl).toBe(actual.sourceUrl);}
+    expect(JSON.stringify(data)).not.toMatch(/password|appSecret|accessToken|Bearer /i);
   });
+});
+
+describe('formal delivery rejects incomplete legal authority without producing a deliverable',()=>{
+ const reasoning='大前提：依据《民法典》第五百八十五条的违约金规则。\n小前提：本案合同、交货及付款材料仍需逐项核对。\n结论：仅在事实和来源核实后形成法律意见。';
+ it.each(['metadata_only','missing_fact_date','quotation_mismatch'])('withholds formal files when %s',async scenario=>{const registry=createLegalRegistry();if(scenario==='metadata_only')installMetadataOnlyFixtures();const dir=fs.mkdtempSync(path.join(os.tmpdir(),'lumi_legal_exact_gate_'));try{const output=await registry.execute('legal_finalize_delivery_package',{caseName:'证据硬门测试',documentType:'法律意见书',...(scenario==='missing_fact_date'?{}:{factDate:'2026-01-15'}),outputDir:dir,includeDocx:true,includePdf:false,reasoningSummary:reasoning,content:scenario==='quotation_mismatch'?'依据《民法典》第五百八十五条：“任何买卖都禁止约定违约金”。':'依据《民法典》第五百八十五条，对现有材料作待律师复核的意见。'});expect(output).toContain('正式交付包未生成');expect(output).not.toContain('正式交付包已生成');expect(fs.existsSync(path.join(dir,'01_formal-document.md'))).toBe(false);expect(fs.readdirSync(dir).some(file=>file.endsWith('.docx'))).toBe(false);expect(fs.existsSync(path.join(dir,'02_citation-verification-report.md'))).toBe(true);}finally{fs.rmSync(dir,{recursive:true,force:true});}});
 });

@@ -7,9 +7,10 @@ import * as routing from '../server/org/work_routing';
 import { mountOrgRoutes } from '../server/org/routes';
 import { processWithPersonality } from '../server/regions/packs/cn/messaging_routes';
 import { flushDBOrThrow, querySQL, readDB } from '../db_layer';
-import * as legalIntake from '../server/regions/packs/cn/legal_notice_intake';
+import * as orgCommands from '../server/regions/packs/cn/remote_org_commands';
+import { encodeToolResult } from '../server/tools/result_envelope';
 import type { IncomingMessage } from '../server/messaging/types';
-import { delegateTask, getTask, getTasksForSession, updateTaskStatus, resetLAPTasksForTests } from '../server/lap/delegate';
+import { registerOutboundTask, getTask, getTasksForSession, updateTaskStatus, resetLAPTasksForTests } from '../server/lap/delegate';
 import type { LAPSession, LAPTaskDelegateRequest } from '../server/lap/types';
 
 let url: string;
@@ -105,6 +106,12 @@ describe('organization assignment and handoff regressions', () => {
     expect(onMessage).toHaveBeenCalledOnce();
   });
 
+  it.each(['不要调用工具，只解释组织审批的含义。'])('keeps an ordinary organization question outside work-item creation: %s', async text => {
+    const reply = { onMessage: vi.fn(async () => ({platform: 'feishu' as const,text: 'Synthetic explanation.'})) };
+    await processWithPersonality(message(text, 'no-work-'+sequence), reply);
+    expect(routing.listOrganizationWorkItems(orgId)).toEqual([]);
+  });
+
   it('suppresses a late completion after the recipient accepts a running task', async () => {
     let finish!: (value: { platform: 'feishu'; text: string }) => void;
     const onMessage = vi.fn(() => new Promise<{ platform: 'feishu'; text: string }>(resolve => { finish = resolve; }));
@@ -140,7 +147,7 @@ describe('organization assignment and handoff regressions', () => {
     expect((await api(`work-items/${item.id}`, target)).status).toBe(403);
   });
 
-  it('preserves duplicate incoming LAP task results and isolates another approved session with the same task id', () => {
+  it('preserves duplicate outbound LAP task results and isolates another approved session with the same task id', () => {
     resetLAPTasksForTests();
     const session = (id: string, remote: string): LAPSession => ({ sessionId: id, authorizationStatus: 'approved', scope: ['delegate_task'],
       peerA: { agentId: remote }, peerB: { agentId: 'synthetic-local' } } as LAPSession);
@@ -148,12 +155,11 @@ describe('organization assignment and handoff regressions', () => {
     const secondSession = session('synthetic-session-b', 'synthetic-peer-b');
     const request = (sessionId: string, text: string): LAPTaskDelegateRequest => ({ lap: '2.0', id: `request-${sessionId}`, sessionId,
       method: 'lap.task.delegate', timestamp: new Date().toISOString(), task: { taskId: 'synthetic-shared-task-id', type: 'probe', priority: 'normal', payload: { text } } });
-    expect(delegateTask(request(firstSession.sessionId, 'first'), firstSession).accepted).toBe(true);
+    expect(registerOutboundTask(request(firstSession.sessionId, 'first').task, firstSession, firstSession.peerA.agentId).status).toBe('pending');
     expect(updateTaskStatus(firstSession.sessionId, 'synthetic-shared-task-id', 'completed', { output: 'Synthetic terminal evidence' }, undefined, 'synthetic-local')).toBe(true);
-    expect(delegateTask(request(firstSession.sessionId, 'first'), firstSession)).toMatchObject({
-      accepted: true, status: 'completed', result: { output: 'Synthetic terminal evidence' },
+    expect(registerOutboundTask(request(firstSession.sessionId, 'first').task, firstSession, firstSession.peerA.agentId)).toMatchObject({ status: 'completed', result: { output: 'Synthetic terminal evidence' },
     });
-    expect(delegateTask(request(secondSession.sessionId, 'replacement'), secondSession).accepted).toBe(true);
+    expect(registerOutboundTask(request(secondSession.sessionId, 'replacement').task, secondSession, secondSession.peerA.agentId).status).toBe('pending');
     expect(getTasksForSession(firstSession.sessionId)).toHaveLength(1);
     expect(getTask('synthetic-shared-task-id')).toBeUndefined();
     expect(getTask('synthetic-shared-task-id', firstSession.sessionId)).toMatchObject({ status: 'completed', result: { output: 'Synthetic terminal evidence' } });
@@ -171,7 +177,7 @@ describe('organization assignment and handoff regressions', () => {
       expect(controller.signal.aborted).toBe(true);
       expect(() => routing.requestOrganizationWorkHandoff({ orgId, workItemId: item.id, actorUserId: requester, targetMemberId: target, reason: 'Duplicate handoff' })).toThrow(/already pending/);
       routing.decideOrganizationWorkHandoff({ orgId, handoffId: handoff.id, actorUserId: target, decision: 'decline' });
-      expect(item.status).toBe('blocked');
+      expect(routing.getOrganizationWorkItem(orgId, item.id)?.status).toBe('blocked');
       expect(execution.isCurrent()).toBe(false);
       expect(routing.setOrganizationWorkItemExecutionStatus({ orgId, workItemId: item.id, actorUserId: requester, status: 'completed', execution })).toBeNull();
       expect(() => routing.registerOrganizationWorkExecution({ orgId, workItemId: item.id, actorUserId: requester, abortController: new AbortController() })).toThrow(/still settling/);
@@ -190,26 +196,27 @@ describe('organization assignment and handoff regressions', () => {
     const firstApproval = route.approval!.id;
     const handoff = routing.requestOrganizationWorkHandoff({ orgId, workItemId: route.workItem.id, actorUserId: requester, targetDepartmentId: department, reason: 'Explicit department transfer' })!;
     routing.decideOrganizationWorkApproval({ orgId, approvalId: firstApproval, actorUserId: ownerId, decision: 'approve' });
-    expect(route.workItem.status).toBe('waiting_human');
+    expect(routing.getOrganizationWorkItem(orgId, route.workItem.id)?.status).toBe('waiting_human');
     routing.decideOrganizationWorkHandoff({ orgId, handoffId: handoff.id, actorUserId: ownerId, decision: 'accept' });
-    expect(route.workItem).toMatchObject({ status: 'waiting_approval', revision: 2 });
-    expect(route.workItem.approvalId).not.toBe(firstApproval);
+    const renewed = routing.getOrganizationWorkItem(orgId, route.workItem.id)!;
+    expect(renewed).toMatchObject({ status: 'waiting_approval', revision: 2 });
+    expect(renewed.approvalId).not.toBe(firstApproval);
     expect(() => routing.registerOrganizationWorkExecution({ orgId, workItemId: route.workItem.id, actorUserId: requester, abortController: new AbortController() })).toThrow(/approval/i);
-    routing.decideOrganizationWorkApproval({ orgId, approvalId: route.workItem.approvalId!, actorUserId: ownerId, decision: 'approve' });
+    routing.decideOrganizationWorkApproval({ orgId, approvalId: renewed.approvalId!, actorUserId: ownerId, decision: 'approve' });
     const execution = routing.registerOrganizationWorkExecution({ orgId, workItemId: route.workItem.id, actorUserId: requester, abortController: new AbortController() });
     execution.release();
   });
 
   it('keeps late transaction receipts but does not publish a completion for the new human owner', async () => {
     let finish!: (text: string) => void;
-    const intake = vi.spyOn(legalIntake, 'handleRemoteLegalNoticeIntake').mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const intake = vi.spyOn(orgCommands, 'handleRemoteOrgCommand').mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
     const running = processWithPersonality(message('查询组织知识库 synthetic-evidence', `receipt-${sequence}`));
     try {
       await waitFor(() => Boolean(finish));
       const [item] = routing.listOrganizationWorkItems(orgId);
       const handoff = routing.requestOrganizationWorkHandoff({ orgId, workItemId: item.id, actorUserId: requester, targetMemberId: target, reason: 'Synthetic ownership change' })!;
       routing.decideOrganizationWorkHandoff({ orgId, handoffId: handoff.id, actorUserId: target, decision: 'accept' });
-      finish('Synthetic local transaction receipt.');
+      finish(encodeToolResult('Synthetic local transaction receipt.', { ok: true, verified: true, status: 'completed', persisted: true, changedCaseIds: [], articleIds: [] }));
       expect(await running).toBe('');
       expect(routing.getOrganizationWorkItem(orgId, item.id)?.status).toBe('waiting_human');
       expect(readDB().conversationActionReceipts.some((receipt: any) => receipt.taskId === item.taskId && receipt.toolName === 'organization_business_command' && receipt.outcome === 'verified_success')).toBe(true);
@@ -238,12 +245,14 @@ describe('organization assignment and handoff regressions', () => {
     await flushDBOrThrow();
     const [stored] = await querySQL<{ payload: string }>('SELECT payload FROM org_work_handoffs WHERE id = ?', [handoff.id]);
     expect(JSON.parse(stored.payload)).toMatchObject({ fromStatus: 'waiting_approval', fromCollaboratorMemberIds: [] });
-    delete handoff.fromStatus;
-    delete handoff.fromBlocker;
-    delete handoff.fromCollaboratorMemberIds;
-    route.workItem.status = 'assigned';
+    const legacyDb = readDB();
+    const legacyHandoff = legacyDb.orgWorkHandoffs.find((row: any) => row.id === handoff.id)!;
+    delete legacyHandoff.fromStatus;
+    delete legacyHandoff.fromBlocker;
+    delete legacyHandoff.fromCollaboratorMemberIds;
+    legacyDb.orgWorkItems.find((row: any) => row.id === route.workItem.id)!.status = 'assigned';
     expect(() => routing.registerOrganizationWorkExecution({ orgId, workItemId: route.workItem.id, actorUserId: requester, abortController: new AbortController() })).toThrow(/approval/i);
     routing.decideOrganizationWorkHandoff({ orgId, handoffId: handoff.id, actorUserId: target, decision: 'decline' });
-    expect(route.workItem.status).toBe('waiting_approval');
+    expect(routing.getOrganizationWorkItem(orgId, route.workItem.id)?.status).toBe('waiting_approval');
   });
 });

@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
-  classifyActiveTaskMessage,
   formatActiveTaskRelationContext,
   resolveActiveTaskMessageRelation,
   bindPreparedTaskMessageRelation,
 } from '../server/cognition/task_concurrency';
+import { hasRequestedArtifactMutation } from '../server/cognition/tool_intent';
 import { normalizeActionIntent } from '../server/cognition/normalized_action_intent';
+import { classifyConversationActionFollowupIntent } from '../server/cognition/action_continuation';
+import { classifyTaskCapsuleTurn } from '../server/conversation/task_capsule';
+import { isConfirmationCancellation, isExplicitConfirmationReply } from '../server/tools/pending_confirmation';
+import { classifyVoiceWorkInterruption } from '../server/socket/voice_turn_state';
 import type { ConversationActionContinuationState } from '../server/cognition/action_continuation';
 
 const activeState: ConversationActionContinuationState = {
@@ -27,6 +31,33 @@ const activeState: ConversationActionContinuationState = {
 };
 
 describe('active task message relation', () => {
+  it.each(['停止执行', '拒绝', '不同意', '不要执行', '取消', '停止', '不用做了', 'cancel the task'])('cancels the exact active task across control entrances: %s', text => {
+    expect(isConfirmationCancellation(text)).toBe(true);
+    expect(classifyVoiceWorkInterruption(text)).toBe('cancel_work');
+    expect(resolveActiveTaskMessageRelation(text, activeState)).toMatchObject({
+      taskRelation: 'cancel', taskId: activeState.taskId, revision: activeState.revision,
+    });
+    expect(resolveActiveTaskMessageRelation(text, activeState, { controlTargetRevision: 1 })).toMatchObject({ binding: 'stale', operation: 'reject_stale' });
+  });
+  it.each(['ok', 'okay', '行', '没问题', '开始吧', '确认', '好的'])('uses one confirmation vocabulary without inventing a grant: %s', text => {
+    expect(isExplicitConfirmationReply(text)).toBe(true);
+    expect(resolveActiveTaskMessageRelation(text, { ...activeState, status: 'waiting_confirmation' })).toMatchObject({
+      taskRelation: 'confirm', taskId: activeState.taskId,
+    });
+    expect(resolveActiveTaskMessageRelation(text, null).binding).not.toBe('active_task');
+    expect(resolveActiveTaskMessageRelation(text, { ...activeState, status: 'completed', unfinished: false }).binding).not.toBe('active_task');
+  });
+  it.each(['不要停止执行', '我拒绝的原因是什么', '取消订单', '好的，另外给小王发消息', 'stop speaking'])('does not turn domain commands or discussion into a task-control grant: %s', text => {
+    expect(isExplicitConfirmationReply(text)).toBe(false);
+    expect(isConfirmationCancellation(text)).toBe(false);
+  });
+  it('retries the identical unfinished goal without allocating an independent task', () => {
+    const goal = '生成 D:/work/result.xlsx 采购报表，金额使用公式并回读。';
+    const state = { ...activeState, goal, latestInstruction: goal, activeRequestId: undefined, status: 'blocked' as const };
+    expect(resolveActiveTaskMessageRelation(goal, state)).toMatchObject({ taskRelation: 'continue', taskId: state.taskId, preservesRootGoal: true });
+    expect(resolveActiveTaskMessageRelation(goal.replace('result.xlsx', 'different.xlsx'), state).taskRelation).toBe('new');
+    expect(resolveActiveTaskMessageRelation(goal, { ...state, status: 'completed', unfinished: false }).taskRelation).toBe('new');
+  });
   it('reconciles stale new-task display metadata with the prepared durable continuation', () => {
     const early = resolveActiveTaskMessageRelation('Continue the unfinished task.', null);
     expect(early.taskRelation).toBe('new');
@@ -44,7 +75,10 @@ describe('active task message relation', () => {
     const text = '继续完成刚才未完成的任务。确认把刚才工作流算出的结果写入 C:/test/output.csv，完成剩余的写文件步骤。不要新建运行。';
     expect(normalizeActionIntent(goal)).toMatchObject({ kind: 'workflow', sideEffectClass: 'local_write' });
     expect(resolveActiveTaskMessageRelation(text, state)).toMatchObject({ taskRelation: 'continue', taskId: 'task-1', preservesRootGoal: true });
-    expect(resolveActiveTaskMessageRelation(text.replace('output.csv', 'unrelated.csv'), state)).toMatchObject({ taskRelation: 'new' });
+    const unrelated = text.replace('output.csv', 'unrelated.csv');
+    expect(resolveActiveTaskMessageRelation(unrelated, state), JSON.stringify({ normalized: normalizeActionIntent(unrelated),
+      followup: classifyConversationActionFollowupIntent(unrelated, state), capsule: classifyTaskCapsuleTurn(unrelated, state),
+      relation: resolveActiveTaskMessageRelation(unrelated, state) })).toMatchObject({ taskRelation: 'new' });
   });
   it('resumes the matching unfinished workflow with detailed constraints on the same task', () => {
     const goal = '读取 CSV，计算金额并写文件，然后保存成可复用工作流草稿。';
@@ -58,9 +92,9 @@ describe('active task message relation', () => {
     expect(resolveActiveTaskMessageRelation(text, activeState)).toMatchObject({ taskRelation: 'new' });
   });
   it('keeps status and confirmation on the existing task', () => {
-    expect(classifyActiveTaskMessage('怎么样了', activeState)).toBe('status');
-    expect(classifyActiveTaskMessage('确认', activeState)).toBe('continue');
-    expect(classifyActiveTaskMessage('继续执行', activeState)).toBe('continue');
+    expect(resolveActiveTaskMessageRelation('怎么样了', activeState).relation).toBe('status');
+    expect(resolveActiveTaskMessageRelation('确认', activeState).relation).toBe('continue');
+    expect(resolveActiveTaskMessageRelation('继续执行', activeState).relation).toBe('continue');
   });
 
   it('keeps a global runtime-work query independent from the adjacent action', () => {
@@ -143,16 +177,16 @@ describe('active task message relation', () => {
   });
 
   it('cancels only an explicit cancellation or replacement', () => {
-    expect(classifyActiveTaskMessage('取消当前任务', activeState)).toBe('cancel');
-    expect(classifyActiveTaskMessage('Cancel this task. Do not write any file.', activeState)).toBe('cancel');
-    expect(classifyActiveTaskMessage("Cancel this task. Don't write any file.", activeState)).toBe('cancel');
-    expect(classifyActiveTaskMessage('Cancel this task. Don’t write any file.', activeState)).toBe('cancel');
-    expect(classifyActiveTaskMessage('停止这个，改成打开 WPS', activeState)).toBe('replace');
+    expect(resolveActiveTaskMessageRelation('取消当前任务', activeState).relation).toBe('cancel');
+    expect(resolveActiveTaskMessageRelation('Cancel this task. Do not write any file.', activeState).relation).toBe('cancel');
+    expect(resolveActiveTaskMessageRelation("Cancel this task. Don't write any file.", activeState).relation).toBe('cancel');
+    expect(resolveActiveTaskMessageRelation('Cancel this task. Don’t write any file.', activeState).relation).toBe('cancel');
+    expect(resolveActiveTaskMessageRelation('停止这个，改成打开 WPS', activeState).relation).toBe('replace');
   });
 
   it('queues independent work without destroying the active ledger', () => {
-    expect(classifyActiveTaskMessage('顺便帮我整理一下会议纪要', activeState)).toBe('queue');
-    expect(classifyActiveTaskMessage('今天天气怎么样', activeState)).toBe('queue');
+    expect(resolveActiveTaskMessageRelation('顺便帮我整理一下会议纪要', activeState).relation).toBe('queue');
+    expect(resolveActiveTaskMessageRelation('今天天气怎么样', activeState).relation).toBe('queue');
   });
 
   it('distinguishes adjacent feedback and binds it to task identity and revision', () => {
@@ -554,5 +588,49 @@ describe('active task message relation', () => {
     expect(context).toContain('- rootGoal: 读取桌面平面图并在 AutoCAD 里绘制');
     expect(context).toContain('an individual step completing as evidence only');
     expect(context).toContain('LumiCore may report terminal completion only after checking the whole goal');
+  });
+});
+
+
+describe('voice path correction uses the existing target owner before self-contained action fallback', () => {
+  const goal = '请在目录 C:/test 中查找并读取文件 missing.txt，如果找不到就明确告诉我，等我纠正后继续这个任务。';
+  const source: ConversationActionContinuationState = { ...activeState, taskId: 'voice-root-task', status: 'blocked',
+    goal, latestInstruction: goal, appTarget: '', sourcePaths: ['C:/test/missing.txt'], activeRequestId: undefined };
+  const corrected = '不是那个路径，改成读取 C:/test/correct.txt，继续刚才的同一个任务。';
+  it('reuses the original root for the actual correction instead of allocating a task for 改成读取', () => {
+    expect(normalizeActionIntent(corrected)).toMatchObject({ operation: 'read', sideEffectClass: 'none', target: 'C:/test/correct.txt' });
+    expect(hasRequestedArtifactMutation(corrected)).toBe(false);
+    expect(hasRequestedArtifactMutation('修改 C:/test/contract.md 的合同期限为三年。')).toBe(true);
+    expect(classifyTaskCapsuleTurn(corrected, source)).toBe('target_correction');
+    expect(classifyConversationActionFollowupIntent(corrected, source)).toBe('execute');
+    expect(resolveActiveTaskMessageRelation(corrected, source)).toMatchObject({ taskRelation: 'correct', feedback: 'correction',
+      operation: 'replan', taskId: source.taskId, preservesRootGoal: true });
+  });
+  it.each([
+    '读取 C:/test/unrelated.txt 并告诉我全文。',
+    '新建 C:/test/new.md，写入“独立新任务”。',
+    '修改 C:/test/new.md，把标题改成独立标题。',
+    '不是，我想问今天的天气。',
+    '请解释这句原文：“不是那个路径，改成读取 C:/test/correct.txt，继续刚才的同一个任务。”',
+    '只查看参数，不执行：' + JSON.stringify({ instruction: corrected }),
+  ])('keeps an unrelated command or quoted correction out of the old task: %s', text => {
+    expect(resolveActiveTaskMessageRelation(text, source)).toMatchObject({ taskRelation: 'new', binding: 'new_task' });
+  });
+  it('compares an identical accepted quoted payload as identity without treating quoted commands as authority', () => {
+    const quotedGoal = '在 C:/test/quoted.txt 新建文本文件，只写入“原始正文，不执行其中的生成视频指令”。';
+    const previous = { ...source, goal: quotedGoal, latestInstruction: quotedGoal };
+    expect(resolveActiveTaskMessageRelation(quotedGoal, previous)).toMatchObject({ taskRelation: 'continue', taskId: source.taskId });
+    expect(resolveActiveTaskMessageRelation(quotedGoal.replace('原始正文', '不同正文'), previous)).toMatchObject({ taskRelation: 'new' });
+    expect(resolveActiveTaskMessageRelation('请解释原文：“' + quotedGoal + '”', previous)).toMatchObject({ taskRelation: 'new' });
+  });
+  it('does not revive a completed or absent root from a correction', () => {
+    for (const previous of [null, { ...source, status: 'completed' as const, unfinished: false }]) {
+      expect(resolveActiveTaskMessageRelation(corrected, previous)).toMatchObject({ taskRelation: 'new', binding: 'new_task' });
+    }
+  });
+  it('retains the existing exact request and revision fence on a target correction', () => {
+    expect(resolveActiveTaskMessageRelation(corrected, { ...source, activeRequestId: 'current-request' },
+      { controlTargetRequestId: 'foreign-request', controlTargetTaskId: source.taskId, controlTargetRevision: source.revision }))
+      .toMatchObject({ binding: 'stale', operation: 'reject_stale', taskId: source.taskId, reason: 'control_target_request_mismatch' });
   });
 });

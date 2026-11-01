@@ -1,4 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { isDesktopLaunchVerificationOnly } from '../server/cognition/action_request';
+import { foregroundPipeline } from './foreground_pipeline_fixture';
+import { describe, expect, it, vi } from 'vitest';
+import { readDB } from '../db_layer';
+import { ToolRegistry } from '../server/tools/registry';
+import { registerAllTools } from '../server/tools/definitions';
+import { executeToolCall } from '../server/tools/execution_engine';
+import { listWorkTakeoverTasks } from '../server/work_takeover/tasks';
+import { getPersonalClientSurfaceByAction, getPersonalClientSurfaceByTarget, PERSONAL_CLIENT_LAUNCHER_IDS, PERSONAL_CLIENT_SURFACE_ACTIONS } from '../shared/client_surfaces';
 import {
   hasMixedStatusExecutionIntent,
   isExplicitArtifactCreationText,
@@ -6,24 +14,13 @@ import {
   isPriorTurnToolReceiptQuestion,
   normalizeActionIntent,
 } from '../server/cognition/normalized_action_intent';
-import {
-  buildDeterministicClientNavigationCommand,
-  buildDeterministicExternalCommitConfirmationCommand,
-  buildDeterministicKnowledgeInspectionCommand,
-  buildDeterministicLocalDesktopNavigationCommand,
-  buildDeterministicWpsDocumentCommand,
-  buildDeterministicTextArtifactCommand,
-  buildDeterministicWorkTaskCreateCommand,
-  buildDeterministicWorkTaskProgressCommand,
-  buildDeterministicWorkTaskStatusCommand,
-} from '../server/cognition/quick_commands';
 
 describe('normalized desktop intent priority', () => {
   it.each(['/tmp/lumi-output/orders.xlsx', '/Users/test-user/My Documents/orders.xlsx'])(
     'retains the complete POSIX path in a concrete creation request: %s', output => {
       expect(normalizeActionIntent(`新建 ${output}，只有一个工作表。`)).toMatchObject({
         operation: 'create', sideEffectClass: 'local_write', target: output,
-      });
+     });
     },
   );
   it.each(['https://example.com/orders.xlsx', 'relative/reports/orders.xlsx', '~/Desktop/orders.xlsx'])(
@@ -52,41 +49,10 @@ describe('normalized desktop intent priority', () => {
 
   it('routes an enumerated persistent-task execution request to the shared planner', () => {
     const text = '\u7ee7\u7eed\u521a\u624d\u7684\u6301\u4e45\u4efb\u52a1\u201c\u4e3b\u7a0b\u5e8f\u6587\u5b57\u957f\u4efb\u52a1-20260818\u201d\uff08\u4efb\u52a1\u7f16\u53f7 wt_task_1787031027377_c8a3v\uff09\uff1a\u5b8c\u6210\u7b2c\u4e00\u6b65\u201c\u8bb0\u5f55\u9a8c\u6536\u9700\u6c42\u201d\u548c\u7b2c\u4e8c\u6b65\u201c\u5728\u804a\u5929\u4e2d\u751f\u6210\u4e94\u9879\u68c0\u67e5\u6e05\u5355\u201d\uff1b\u7b2c\u4e09\u6b65\u4ecd\u4fdd\u6301\u7b49\u5f85\u786e\u8ba4\u3002\u4e0d\u8981\u5199\u6587\u4ef6\uff0c\u4e0d\u8981\u5916\u53d1\u3002';
-    const command = buildDeterministicWorkTaskProgressCommand(text);
-    expect(command).toMatchObject({ matched: false, responseText: '' });
-    expect(command?.toolCall).toBeUndefined();
-    expect(buildDeterministicWorkTaskStatusCommand(text)).toBeNull();
-  });
 
-  it('keeps an explicit bookkeeping-only task note on the deterministic ledger lane', () => {
-    const command = buildDeterministicWorkTaskProgressCommand(
-      '\u6301\u4e45\u4efb\u52a1 wt_task_acceptance\uff1a\u53ea\u628a\u4ee5\u4e0b\u5907\u6ce8\u5199\u5165\u4efb\u52a1\u8d26\u672c\uff0c\u4e0d\u8981\u6267\u884c\u6216\u63a8\u8fdb\u4efb\u4f55\u6b65\u9aa4\uff0c\u4e0d\u4fee\u6539\u5f53\u524d\u72b6\u6001\u3002\u5907\u6ce8\uff1a\u5ba2\u6237\u8d44\u6599\u5df2\u7531\u7528\u6237\u8865\u9f50\uff0c\u7b49\u5f85\u4e0b\u4e00\u8f6e\u6267\u884c\u3002',
-    );
-    expect(command).toMatchObject({
-      matched: true,
-      toolCall: {
-        name: 'work_takeover_task_update',
-        arguments: {
-          id: 'wt_task_acceptance',
-          note: '\u5ba2\u6237\u8d44\u6599\u5df2\u7531\u7528\u6237\u8865\u9f50\uff0c\u7b49\u5f85\u4e0b\u4e00\u8f6e\u6267\u884c\u3002',
-        },
-      },
-    });
-    expect(command?.toolCall?.arguments).not.toHaveProperty('currentActionIndex');
-    expect(command?.toolCall?.arguments).not.toHaveProperty('status');
-    expect(command?.toolCall?.arguments).not.toHaveProperty('result');
-    const response = command?.formatToolResult?.(JSON.stringify({
-      persisted: true,
-      task: {
-        id: 'wt_task_acceptance',
-        status: 'in_progress',
-        currentActionIndex: 0,
-        nextActions: ['\u6574\u7406\u5ba2\u6237\u9700\u6c42', '\u751f\u6210\u8ddf\u8fdb\u8349\u7a3f'],
-      },
-    }));
-    expect(response).toContain('\u5907\u6ce8\u5df2\u6301\u4e45\u5316');
-    expect(response).toContain('\u672a\u6267\u884c\u4efb\u52a1\u6b65\u9aa4');
-    expect(response).toContain('\u5f53\u524d\u6b65\u9aa4\uff1a\u6574\u7406\u5ba2\u6237\u9700\u6c42');
+    const pipeline = foregroundPipeline(text);
+    expect(pipeline.normalizedIntent).toEqual(normalizeActionIntent(text));
+    expect(pipeline.executionRequested).toBe(true);
   });
 
   it('creates a new persistent work task instead of inheriting an older receipt', () => {
@@ -97,36 +63,7 @@ describe('normalized desktop intent priority', () => {
       target: '\u9752\u7a79\u5ba2\u6237\u8ddf\u8fdb\u95ed\u73af',
       sideEffectClass: 'local_write',
       relation: 'new',
-    });
-    const command = buildDeterministicWorkTaskCreateCommand(text);
-    expect(command?.toolCall).toMatchObject({
-      name: 'work_takeover_task_create',
-      arguments: {
-        title: '\u9752\u7a79\u5ba2\u6237\u8ddf\u8fdb\u95ed\u73af',
-        category: 'customer',
-        source: 'chat',
-        nextActions: [
-          '\u6574\u7406\u5ba2\u6237\u9700\u6c42',
-          '\u751f\u6210\u8ddf\u8fdb\u8349\u7a3f',
-          '\u7b49\u5f85\u7528\u6237\u786e\u8ba4\u540e\u518d\u5916\u53d1',
-        ],
-        confirmationRequired: ['\u7b49\u5f85\u7528\u6237\u786e\u8ba4\u540e\u518d\u5916\u53d1'],
-      },
-    });
-    const response = command?.formatToolResult?.(JSON.stringify({
-      ok: true,
-      status: 'created',
-      persisted: true,
-      task: {
-        id: 'takeover_123',
-        status: 'queued',
-        nextActions: command?.toolCall?.arguments.nextActions,
-        confirmationRequired: command?.toolCall?.arguments.confirmationRequired,
-      },
-    }));
-    expect(response).toContain('\u4efb\u52a1\u7f16\u53f7\uff1atakeover_123');
-    expect(response).toContain('\u5df2\u521b\u5efa\u5e76\u6301\u4e45\u5316');
-    expect(response).toContain('\u9700\u8981\u786e\u8ba4\uff1a\u7b49\u5f85\u7528\u6237\u786e\u8ba4\u540e\u518d\u5916\u53d1');
+   });
   });
 
   it('uses the Chinese task-name field as the persistent task title', () => {
@@ -135,105 +72,108 @@ describe('normalized desktop intent priority', () => {
       kind: 'work_task',
       operation: 'create',
       target: '\u4e3b\u7a0b\u5e8f\u6587\u5b57\u957f\u4efb\u52a1-20260818',
-    });
-    expect(buildDeterministicWorkTaskCreateCommand(text)?.toolCall?.arguments.title)
-      .toBe('\u4e3b\u7a0b\u5e8f\u6587\u5b57\u957f\u4efb\u52a1-20260818');
+   });
   });
 
   it('queries an explicitly named persistent task instead of the older conversation action ledger', () => {
     const text = '主程序任务状态验收：请查询任务“青穹客户跟进闭环”的持久状态，只根据任务账本回答任务编号、当前状态、当前步骤、后续步骤和确认边界，不要执行任何外部动作。';
-    const command = buildDeterministicWorkTaskStatusCommand(text);
-    expect(command?.toolCall).toEqual({
-      name: 'work_takeover_task_list',
-      arguments: { limit: 200 },
-    });
-    const response = command?.formatToolResult?.(JSON.stringify({
-      tasks: [{
-        id: 'wt_task_acceptance',
-        title: '青穹客户跟进闭环',
-        status: 'in_progress',
-        currentActionIndex: 0,
-        nextActions: ['整理客户需求', '生成跟进草稿', '等待用户确认后再外发'],
-        confirmationRequired: ['等待用户确认后再外发'],
-      }],
-    }));
-    expect(response).toContain('任务编号：wt_task_acceptance');
-    expect(response).toContain('当前步骤：整理客户需求');
-    expect(response).toContain('后续步骤：生成跟进草稿→等待用户确认后再外发');
-    expect(response).toContain('确认边界：等待用户确认后再外发');
+
+    const pipeline = foregroundPipeline(text);
+    expect(pipeline.normalizedIntent).toEqual(normalizeActionIntent(text));
+    expect(pipeline.executionRequested).toBe(true);
   });
 
-  it('keeps an explicit id-based status query read-only even when it says not to execute', () => {
+  it('keeps an explicit id-based status query read-only even when it says not to execute', async () => {
     const text = '\u8bf7\u67e5\u8be2\u6301\u4e45\u4efb\u52a1 wt_task_acceptance \u7684\u72b6\u6001\u548c\u8fdb\u5ea6\uff0c\u53ea\u8bfb\u4efb\u52a1\u8d26\u672c\uff0c\u4e0d\u8981\u6267\u884c\u6216\u63a8\u8fdb\u4efb\u4f55\u6b65\u9aa4\u3002';
-    expect(buildDeterministicWorkTaskProgressCommand(text)).toBeNull();
-    const command = buildDeterministicWorkTaskStatusCommand(text);
-    expect(command?.toolCall).toEqual({
-      name: 'work_takeover_task_get',
-      arguments: { id: 'wt_task_acceptance' },
-    });
-    expect(command?.formatToolResult?.(JSON.stringify({
-      task: {
-        id: 'wt_task_acceptance',
-        status: 'in_progress',
-        currentActionIndex: 1,
-        nextActions: ['\u6574\u7406\u5ba2\u6237\u9700\u6c42', '\u751f\u6210\u8ddf\u8fdb\u8349\u7a3f'],
-      },
-    }))).toContain('\u5f53\u524d\u6b65\u9aa4\uff1a\u751f\u6210\u8ddf\u8fdb\u8349\u7a3f');
+
+    const pipeline = foregroundPipeline(text);
+    expect(pipeline.normalizedIntent).toEqual(normalizeActionIntent(text));
+    // Availability of read schemas is not admission to execute or resume a task.
+    expect(pipeline.executionRequested).toBe(true);
+    expect(pipeline.normalizedIntent.sideEffectClass).toBe('none');
+    expect(pipeline.taskId).toBeUndefined();
+    expect(pipeline.trustedActionContinuation).toBe(false);
+    expect(pipeline.modelToolProjection.toolNames).toContain('client_capability_manifest');
+    for (const mutation of [
+      'work_takeover_task_create', 'work_takeover_task_update', 'work_takeover_task_continue',
+      'work_takeover_task_execute_step', 'work_takeover_task_advance', 'work_takeover_task_autorun',
+      'runtime_work_cancel', 'runtime_work_pause', 'runtime_work_resume',
+    ]) {
+      const allowed = pipeline.authorizationPolicy.allowedTools || [];
+      const forbidden = pipeline.authorizationPolicy.forbiddenTools || [];
+      const authorized = (allowed.includes('*') || allowed.includes(mutation))
+        && !forbidden.includes('*') && !forbidden.includes(mutation);
+      expect({ mutation, authorized }).toEqual({ mutation, authorized: false });
+      expect(pipeline.modelToolProjection.toolNames).not.toContain(mutation);
+    }
+    const userId = 'foreground-convergence-fixture';
+    const registry = new ToolRegistry();
+    registerAllTools(registry);
+    const originalTasks = JSON.stringify(listWorkTakeoverTasks({ userId }));
+    const originalActionTasks = JSON.stringify((readDB().conversationActionTasks || []).filter(row => row.userId === userId));
+    for (const [name, args] of [
+      ['work_takeover_task_create', { category: 'general_work', title: 'Must not be created by a status query' }],
+      ['work_takeover_task_update', { id: 'wt_task_acceptance', status: 'delivered' }],
+      ['work_takeover_task_advance', { id: 'wt_task_acceptance' }],
+    ] as const) {
+      const handler = vi.spyOn(registry.get(name)!, 'handler');
+      try {
+        const result = await executeToolCall({ registry, name, arguments: args,
+          context: { userId, requestId: 'readonly-id-query', domain: 'personal', orgId: '',
+            authenticated: true, authRole: 'admin', localExecution: true,
+            executionBoundary: 'trusted_local', actionIntent: text,
+            toolPolicy: pipeline.authorizationPolicy, acceptedActionContract: pipeline.turnIntent.flow.acceptedActionContract,
+          },
+        });
+        expect(result.error).toMatch(/forbidden/i);
+        expect(handler).not.toHaveBeenCalled();
+      } finally { handler.mockRestore(); }
+    }
+    const reader = vi.spyOn(registry.get('work_takeover_task_list')!, 'handler');
+    try {
+      const read = await executeToolCall({ registry, name: 'work_takeover_task_list', arguments: {},
+        context: { userId, requestId: 'readonly-id-query', domain: 'personal', orgId: '',
+          authenticated: true, authRole: 'admin', localExecution: true,
+          executionBoundary: 'trusted_local', actionIntent: text, toolPolicy: pipeline.authorizationPolicy },
+      });
+      expect(read.error).toBeUndefined();
+      expect(reader).toHaveBeenCalledOnce();
+      expect(JSON.parse(read.result)).toEqual({ tasks: JSON.parse(originalTasks), count: JSON.parse(originalTasks).length });
+    } finally { reader.mockRestore(); }
+    expect(JSON.stringify(listWorkTakeoverTasks({ userId }))).toBe(originalTasks);
+    expect(JSON.stringify((readDB().conversationActionTasks || []).filter(row => row.userId === userId))).toBe(originalActionTasks);
   });
 
   it('treats whether a persistent task is complete as a read-only status question', () => {
     const text = '请查询持久任务 wt_task_acceptance 是否完成和当前状态，只读任务账本，不要执行新动作。';
-    expect(buildDeterministicWorkTaskProgressCommand(text)).toBeNull();
-    expect(buildDeterministicWorkTaskStatusCommand(text)?.toolCall).toEqual({
-      name: 'work_takeover_task_get',
-      arguments: { id: 'wt_task_acceptance' },
-    });
+
+    const pipeline = foregroundPipeline(text);
+    expect(pipeline.normalizedIntent).toEqual(normalizeActionIntent(text));
+    expect(pipeline.executionRequested).toBe(false);
   });
 
   it('keeps affirmative step execution after a separate no-external-action clause', () => {
     const text = '持久任务 wt_task_acceptance：不要执行外发动作；现在完成第一步“整理客户需求”，然后返回状态。';
-    expect(buildDeterministicWorkTaskProgressCommand(text)).toMatchObject({
-      matched: false,
-      responseText: '',
-    });
-    expect(buildDeterministicWorkTaskStatusCommand(text)).toBeNull();
+
+    const pipeline = foregroundPipeline(text);
+    expect(pipeline.normalizedIntent).toEqual(normalizeActionIntent(text));
+    expect(pipeline.executionRequested).toBe(true);
   });
 
   it('does not let a requested status receipt shadow an explicit task progress update', () => {
     const text = '续接持久任务“主程序文字长任务-20260818-2031” wt_task_acceptance：完成第一步“整理三项能力”，给出五项检查清单；不要写文件，不要外发；第三步等待我确认。请把进度写回同一任务账本并返回当前状态与剩余步骤。';
-    expect(buildDeterministicWorkTaskProgressCommand(text)).toMatchObject({ matched: false });
-    expect(buildDeterministicWorkTaskStatusCommand(text)).toBeNull();
-  });
 
-  it('builds an exact write then readback chain for enumerated local text lines', () => {
-    const text = '请在 C:\\Users\\test-user\\Documents\\Lumi主程序实机验收_20260817.txt 新建一个 TXT 文件，只写入以下三行：第一行“验收对象：Lumi 主程序”；第二行“验收项目：本地文件创建与回读”；第三行“验收代号：青穹-17”。写入后必须重新读取。';
-    const command = buildDeterministicTextArtifactCommand(text);
-    expect(command?.toolCall).toEqual({
-      name: 'write_file',
-      arguments: {
-        path: 'C:\\Users\\test-user\\Documents\\Lumi主程序实机验收_20260817.txt',
-        content: '验收对象：Lumi 主程序\n验收项目：本地文件创建与回读\n验收代号：青穹-17',
-      },
-    });
-    expect(command?.followUpToolCalls).toEqual([{
-      name: 'read_file',
-      arguments: { path: 'C:\\Users\\test-user\\Documents\\Lumi主程序实机验收_20260817.txt' },
-    }]);
-    const response = command?.formatToolRecords?.([
-      { name: 'write_file', arguments: command?.toolCall?.arguments, result: 'File written' },
-      { name: 'read_file', arguments: command?.followUpToolCalls?.[0].arguments, result: '验收对象：Lumi 主程序\n验收项目：本地文件创建与回读\n验收代号：青穹-17' },
-    ]);
-    expect(response).toContain('总行数：3');
-    expect(response).toContain('编码：UTF-8');
-    expect(response).toContain('验收代号：青穹-17');
-    expect(buildDeterministicTextArtifactCommand('帮我写一份普通总结')).toBeNull();
+    const pipeline = foregroundPipeline(text);
+    expect(pipeline.normalizedIntent).toEqual(normalizeActionIntent(text));
+    expect(pipeline.executionRequested).toBe(true);
+    expect(pipeline.normalizedIntent.kind).not.toBe('status_query');
   });
 
   it('does not treat the Open prefix inside OpenAI as a desktop launch verb', () => {
     expect(normalizeActionIntent('搜一下今天 OpenAI 新闻')).toMatchObject({
       kind: 'none',
       sideEffectClass: 'none',
-    });
+   });
   });
 
   it('classifies a named artifact receipt question as status instead of new file work', () => {
@@ -243,7 +183,7 @@ describe('normalized desktop intent priority', () => {
       target: 'Lumi主程序实机验收_20260816.txt',
       sideEffectClass: 'none',
       relation: 'status',
-    });
+   });
   });
 
   it.each([
@@ -274,37 +214,8 @@ describe('normalized desktop intent priority', () => {
       target: '验收占位联系人',
       payload: 'Lumi外发确认测试',
       sideEffectClass: 'external_commit',
-    });
-    expect(buildDeterministicExternalCommitConfirmationCommand(intent, text)?.toolCall).toMatchObject({
-      name: 'wechat_send_message',
-      arguments: {
-        contact: '验收占位联系人',
-        message: 'Lumi外发确认测试',
-      },
-    });
+   });
     expect(normalizeActionIntent('不要给验收占位联系人发送任何消息。').kind).toBe('none');
-  });
-
-  it('builds a deterministic read-only knowledge inventory without opening the client surface', () => {
-    const command = buildDeterministicKnowledgeInspectionCommand('请检查当前个人知识库是否可用，报告文档数量、已索引数量和最近错误。只读取真实状态，不导入、不修改任何内容。');
-    expect(command?.toolCall).toEqual({ name: 'knowledge_file_stats', arguments: {} });
-    expect(command?.matched).toBe(true);
-    const response = command?.formatToolResult?.(JSON.stringify({
-      totalFiles: 4,
-      indexedFiles: 2,
-      partialFiles: 0,
-      failedFiles: 0,
-      files: [
-        { name: 'a.txt', status: 'indexed_unverified', blockers: ['legacy_index_has_no_verification_manifest'] },
-        { name: 'b.docx', status: 'pending', blockers: [] },
-        { name: 'c.pdf', status: 'indexed_unverified', blockers: [] },
-        { name: 'd.docx', status: 'pending', blockers: [] },
-      ],
-    }));
-    expect(response).toContain('当前知识库部分可用');
-    expect(response).toContain('已索引2个、待索引2个');
-    expect(response).toContain('legacy_index_has_no_verification_manifest');
-    expect(buildDeterministicKnowledgeInspectionCommand('打开知识库')).toBeNull();
   });
 
   it('recognizes a concrete local application target', () => {
@@ -313,7 +224,7 @@ describe('normalized desktop intent priority', () => {
       operation: 'navigate',
       target: '记事本',
       sideEffectClass: 'none',
-    });
+   });
   });
 
   it('keeps a labelled exact app launch ahead of negated substitute and file clauses', () => {
@@ -324,10 +235,7 @@ describe('normalized desktop intent priority', () => {
       operation: 'navigate',
       target: 'Windows 计算器',
       sideEffectClass: 'none',
-    });
-    const command = buildDeterministicLocalDesktopNavigationCommand(intent, text);
-    expect(command?.toolCall).toEqual({ name: 'desktop_open', arguments: { target: '计算器' } });
-    expect(command?.followUpToolCalls).toEqual([{ name: 'desktop_active_window', arguments: {} }]);
+   });
   });
 
   it.each([
@@ -341,7 +249,7 @@ describe('normalized desktop intent priority', () => {
       target: 'command-center',
       clientAction: 'open_command_center',
       sideEffectClass: 'none',
-    });
+   });
   });
 
   it.each([
@@ -356,11 +264,7 @@ describe('normalized desktop intent priority', () => {
       target: 'home',
       clientAction: 'focus_home',
       sideEffectClass: 'none',
-    });
-    expect(buildDeterministicClientNavigationCommand(intent)?.toolCall).toEqual({
-      name: 'client_action',
-      arguments: { action: 'focus_home' },
-    });
+   });
   });
 
   it('preserves the named personal-home target in a status-only follow-up', () => {
@@ -371,7 +275,7 @@ describe('normalized desktop intent priority', () => {
       operation: 'status',
       target: 'home',
       relation: 'status',
-    });
+   });
   });
 
   it('keeps Lumi client navigation ahead of generic desktop control', () => {
@@ -379,12 +283,7 @@ describe('normalized desktop intent priority', () => {
     expect(intent).toMatchObject({
       kind: 'client_navigation',
       clientAction: 'open_chat',
-    });
-    const deterministic = buildDeterministicClientNavigationCommand(intent);
-    expect(deterministic?.formatToolResult?.(JSON.stringify({
-      ok: true,
-      verification: { status: 'verified' },
-    }))).toBe('已打开聊天界面。');
+   });
   });
 
   it('parses an actionable restatement as a correction of the same client action', () => {
@@ -395,11 +294,7 @@ describe('normalized desktop intent priority', () => {
       target: 'chat',
       clientAction: 'open_chat',
       relation: 'correction',
-    });
-    expect(buildDeterministicClientNavigationCommand(intent)?.toolCall).toEqual({
-      name: 'client_action',
-      arguments: { action: 'open_chat' },
-    });
+   });
   });
 
   it('treats the spoken wallpaper-state imperative as native wallpaper activation', () => {
@@ -411,30 +306,22 @@ describe('normalized desktop intent priority', () => {
       clientAction: 'set_wallpaper_mode',
       clientActionArguments: { enabled: true },
       sideEffectClass: 'none',
-    });
-    expect(buildDeterministicClientNavigationCommand(intent)?.toolCall).toEqual({
-      name: 'client_action',
-      arguments: { action: 'set_wallpaper_mode', enabled: true },
-    });
+   });
     const closeIntent = normalizeActionIntent('关闭壁纸状态。');
-    expect(buildDeterministicClientNavigationCommand(closeIntent)?.toolCall).toEqual({
-      name: 'client_action',
-      arguments: { action: 'set_wallpaper_mode', enabled: false },
-    });
     expect(normalizeActionIntent('壁纸状态怎么样？')).toMatchObject({
       kind: 'status_query',
       target: 'wallpaper',
-    });
+   });
     expect(normalizeActionIntent('打开壁纸状态了吗？')).toMatchObject({
       kind: 'status_query',
       target: 'wallpaper',
       rule: 'registered-client-surface-status',
-    });
+   });
     expect(normalizeActionIntent('关闭壁纸状态了吗？')).toMatchObject({
       kind: 'status_query',
       target: 'wallpaper',
       rule: 'registered-client-surface-status',
-    });
+   });
   });
 
   it('does not turn a negated tool mention in ordinary context recall into a receipt query', () => {
@@ -443,7 +330,7 @@ describe('normalized desktop intent priority', () => {
     expect(normalizeActionIntent(text)).toMatchObject({
       kind: 'none',
       relation: 'new',
-    });
+   });
     expect(isPriorTurnToolReceiptQuestion(
       'Do not call any tools. What was the cup code from the previous turn?',
     )).toBe(false);
@@ -462,40 +349,40 @@ describe('normalized desktop intent priority', () => {
       operation: 'navigate',
       target,
       sideEffectClass: 'none',
-    });
-    expect(buildDeterministicLocalDesktopNavigationCommand(intent, text)?.toolCall).toEqual({
-      name: 'desktop_open',
-      arguments: { target },
-    });
+   });
   });
 
+  it.each([['打开社媒运营', 'business', 'open_business'], ['打开电商运营', 'business-ecommerce', 'open_ecommerce_workspace'],
+    ['打开财务', 'business-finance', 'open_finance_workspace']])('opens each direct business destination through its registered metadata: %s', (text, target, clientAction) => {
+    expect(normalizeActionIntent(text)).toMatchObject({ kind: 'client_navigation', target, clientAction });
+  });
+  it.each(['打开任务与归档', 'open business archive'])('does not register the removed archive surface for typed or spoken navigation: %s', text => {
+    expect(getPersonalClientSurfaceByTarget('business-archive')).toBeUndefined();
+    expect(getPersonalClientSurfaceByAction('open_business_archive')).toBeUndefined();
+    expect(PERSONAL_CLIENT_LAUNCHER_IDS).not.toContain('business-archive');
+    expect(PERSONAL_CLIENT_SURFACE_ACTIONS).not.toContain('open_business_archive');
+    expect(normalizeActionIntent(text).clientAction).not.toBe('open_business_archive');
+  });
   it('derives native navigation from the registered client surface map', () => {
+    expect(normalizeActionIntent('进入灵息之境')).toMatchObject({
+      kind: 'client_navigation', target: 'nexus', clientAction: 'open_nexus',
+    });
     expect(normalizeActionIntent('open personalization')).toMatchObject({
       kind: 'client_navigation',
       target: 'personalization',
       clientAction: 'open_personalization',
-    });
+   });
     expect(normalizeActionIntent('personalization 状态怎么样')).toMatchObject({
       kind: 'status_query',
       target: 'personalization',
-    });
-  });
-
-  it('maps the Chinese command-center label to the native Lumi surface', () => {
-    expect(normalizeActionIntent('打开 Lumi 指挥中心')).toMatchObject({
-      kind: 'client_navigation',
-      operation: 'navigate',
-      target: 'command-center',
-      sideEffectClass: 'none',
-      clientAction: 'open_command_center',
-    });
+   });
   });
 
   it('keeps inbound semantic roles ahead of action-shaped words', () => {
     expect(normalizeActionIntent('张勇给我发了什么')).toMatchObject({
       kind: 'messaging_read',
       sideEffectClass: 'none',
-    });
+   });
   });
 
   it('keeps external AI history in its own read-only lane', () => {
@@ -505,67 +392,19 @@ describe('normalized desktop intent priority', () => {
       target: 'ChatGPT',
       sideEffectClass: 'none',
       rule: 'external-ai-history-read',
-    });
+   });
     expect(normalizeActionIntent('Lumi 可以读取外部 AI 里的聊天内容吗？')).toMatchObject({
       kind: 'external_ai_history',
       operation: 'read',
       target: 'external_ai',
       sideEffectClass: 'none',
-    });
+   });
   });
 
   it('does not turn a fresh external AI prompt into history access', () => {
     expect(normalizeActionIntent('问问 ChatGPT 并让它回答聊天历史应该怎么迁移')).not.toMatchObject({
       kind: 'external_ai_history',
-    });
-  });
-
-  it('ignores negated navigation while preserving an explicit image-generation request', () => {
-    expect(normalizeActionIntent('\u751f\u6210\u4e00\u5f20\u771f\u5b9e\u672c\u5730\u6548\u679c\u56fe\uff0c\u4e0d\u8981\u6253\u5f00\u6216\u4fee\u6539\u5916\u90e8\u8f6f\u4ef6\uff0c\u4e0d\u8981\u5916\u53d1')).toMatchObject({
-      kind: 'media_generation',
-      operation: 'create',
-      target: 'generate_image',
-      sideEffectClass: 'external_commit',
-    });
-    expect(normalizeActionIntent('\u4e0d\u8981\u751f\u6210\u6548\u679c\u56fe\uff0c\u53ea\u67e5\u8be2\u5f53\u524d\u9879\u76ee\u72b6\u6001')).not.toMatchObject({
-      kind: 'media_generation',
-    });
-  });
-
-  it('keeps an explicit proposal PPT workflow separate from referenced CAD prerequisites', () => {
-    expect(normalizeActionIntent('\u7ee7\u7eed\u5f53\u524d\u9879\u76ee\uff0c\u6267\u884c\u201c\u63d0\u6848 PPT\u201d\u9636\u6bb5\uff0cPPT \u5fc5\u987b\u7ee7\u627f\u5df2\u9a8c\u8bc1\u7684\u9879\u76ee\u65b9\u6848\u3001CAD \u548c\u6548\u679c\u56fe\u56de\u6267\u3002')).toMatchObject({
-      kind: 'document_creation',
-      operation: 'create',
-      target: 'presentation',
-      sideEffectClass: 'local_write',
-      relation: 'continue',
-    });
-  });
-
-  it('executes only normalized local navigation through the exact desktop-open tool', () => {
-    expect(buildDeterministicLocalDesktopNavigationCommand({
-      kind: 'desktop_operation',
-      operation: 'navigate',
-      subject: 'user',
-      target: 'Notepad',
-      payload: '',
-      sideEffectClass: 'none',
-      relation: 'new',
-      confidence: 0.9,
-      rule: 'test',
-    })?.toolCall).toEqual({ name: 'desktop_open', arguments: { target: 'Notepad' } });
-
-    expect(buildDeterministicLocalDesktopNavigationCommand({
-      kind: 'desktop_operation',
-      operation: 'mutate',
-      subject: 'user',
-      target: 'Notepad',
-      payload: '',
-      sideEffectClass: 'none',
-      relation: 'new',
-      confidence: 0.9,
-      rule: 'test',
-    })).toBeNull();
+   });
   });
 
   it('does not let the one-step launcher consume a labelled WPS create-and-type workflow', () => {
@@ -574,16 +413,15 @@ describe('normalized desktop intent priority', () => {
     expect(intent).toMatchObject({
       kind: 'desktop_operation',
       target: 'WPS',
-    });
-    expect(buildDeterministicLocalDesktopNavigationCommand(intent, text)).toBeNull();
+   });
   });
 
   it('builds one governed WPS adapter call with the exact multiline user payload', () => {
     const text = '\u4e3b\u7a0b\u5e8f\u5b9e\u673a\u9a8c\u6536\u00b7WPS\u6b63\u6587\u95ed\u73af\uff1a\u8bf7\u6253\u5f00 WPS\uff0c\u7136\u540e\u65b0\u5efa\u4e00\u4e2a\u4e34\u65f6 Word \u6587\u6863\uff0c\u5728\u6b63\u6587\u5199\u5165\u5185\u5bb9\uff1a\nLumi\u4e3b\u7a0b\u5e8fWPS\u534f\u540c\u9a8c\u6536\u901a\u8fc7\u3002\n\u5b8c\u6210\u540e\u53ea\u6839\u636e\u771f\u5b9e\u5de5\u5177\u56de\u6267\u56de\u7b54\u3002';
-    expect(buildDeterministicWpsDocumentCommand(text)?.toolCall).toEqual({
-      name: 'wps_create_document_with_text',
-      arguments: { text: 'Lumi\u4e3b\u7a0b\u5e8fWPS\u534f\u540c\u9a8c\u6536\u901a\u8fc7\u3002' },
-    });
+
+    const pipeline = foregroundPipeline(text);
+    expect(pipeline.normalizedIntent).toEqual(normalizeActionIntent(text));
+    expect(pipeline.executionRequested).toBe(true);
   });
 
   it('keeps retrospective open questions in the zero-tool status lane', () => {
@@ -593,7 +431,7 @@ describe('normalized desktop intent priority', () => {
       target: 'previous_action',
       sideEffectClass: 'none',
       relation: 'status',
-    });
+   });
     expect(normalizeActionIntent(
       'What did you just do, and what evidence proved it succeeded?',
     )).toMatchObject({
@@ -602,7 +440,7 @@ describe('normalized desktop intent priority', () => {
       target: 'previous_action',
       sideEffectClass: 'none',
       relation: 'status',
-    });
+   });
     expect(normalizeActionIntent(
       'Based only on the task receipt already recorded, report the current real status of the read-only observation task, whether a tool receipt exists, and the observed window title.',
     )).toMatchObject({
@@ -612,7 +450,7 @@ describe('normalized desktop intent priority', () => {
       sideEffectClass: 'none',
       relation: 'status',
       rule: 'recent-action-receipt-before-action',
-    });
+   });
   });
 
   it.each([
@@ -641,7 +479,7 @@ describe('normalized desktop intent priority', () => {
       kind: 'status_query',
       target: 'previous_action',
       sideEffectClass: 'none',
-    });
+   });
   });
 
   it('keeps a direct Chinese previous-action evidence question on the receipt lane', () => {
@@ -651,7 +489,7 @@ describe('normalized desktop intent priority', () => {
       kind: 'status_query',
       target: 'previous_action',
       sideEffectClass: 'none',
-    });
+   });
   });
 
   it.each([
@@ -666,7 +504,7 @@ describe('normalized desktop intent priority', () => {
       kind: 'status_query',
       target: 'previous_action',
       sideEffectClass: 'none',
-    });
+   });
   });
 
   it.each([
@@ -684,7 +522,7 @@ describe('normalized desktop intent priority', () => {
       target: 'previous_action',
       sideEffectClass: 'none',
       relation: 'correction',
-    });
+   });
   });
 
   it('normalizes a constrained natural calculator request to one exact target', () => {
@@ -695,18 +533,15 @@ describe('normalized desktop intent priority', () => {
       operation: 'navigate',
       target: 'Windows 计算器',
       sideEffectClass: 'none',
-    });
-    expect(buildDeterministicLocalDesktopNavigationCommand(intent)?.toolCall).toEqual({
-      name: 'desktop_open',
-      arguments: { target: '计算器' },
-    });
+   });
   });
 
   it('adds an explicit active-window verification call when the user requests it', () => {
     const text = '请打开 Windows 计算器。打开后读取当前活动窗口，只有窗口标题和进程能证明是计算器时才报告完成。';
-    const command = buildDeterministicLocalDesktopNavigationCommand(normalizeActionIntent(text), text);
-    expect(command?.toolCall).toEqual({ name: 'desktop_open', arguments: { target: '计算器' } });
-    expect(command?.followUpToolCalls).toEqual([{ name: 'desktop_active_window', arguments: {} }]);
+
+    const pipeline = foregroundPipeline(text);
+    expect(pipeline.normalizedIntent).toEqual(normalizeActionIntent(text));
+    expect(pipeline.executionRequested).toBe(true);
   });
 
   it('removes a redundant Windows prefix from an exact Notepad recovery request', () => {
@@ -716,22 +551,7 @@ describe('normalized desktop intent priority', () => {
       kind: 'desktop_operation',
       operation: 'navigate',
       target: 'Windows \u8bb0\u4e8b\u672c',
-    });
-    const command = buildDeterministicLocalDesktopNavigationCommand(intent, text);
-    expect(command?.toolCall).toEqual({ name: 'desktop_open', arguments: { target: '\u8bb0\u4e8b\u672c' } });
-    expect(command?.followUpToolCalls).toEqual([{ name: 'desktop_active_window', arguments: {} }]);
-    expect(command?.formatToolRecords?.([{
-      name: 'desktop_open',
-      result: JSON.stringify({ ok: true, status: 'verified', targetMatched: true }),
-    }, {
-      name: 'desktop_active_window',
-      result: JSON.stringify({ process_name: 'notepad.exe', pid: 39872, title: '\u65e0\u6807\u9898 - \u8bb0\u4e8b\u672c' }),
-    }])).toBe([
-      '\u5df2\u6253\u5f00Windows \u8bb0\u4e8b\u672c\u3002',
-      '\u5b9e\u9645\u8fdb\u7a0b\uff1anotepad.exe (PID 39872)',
-      '\u7a97\u53e3\uff1a\u65e0\u6807\u9898 - \u8bb0\u4e8b\u672c',
-      '\u9a8c\u8bc1\u72b6\u6001\uff1a\u5df2\u9a8c\u8bc1\uff08\u76ee\u6807\u7cbe\u786e\u5339\u914d\uff09',
-    ].join('\n'));
+   });
   });
 
   it('classifies a recent launch success question as status, not a new launch', () => {
@@ -739,7 +559,7 @@ describe('normalized desktop intent priority', () => {
       kind: 'status_query',
       operation: 'status',
       relation: 'status',
-    });
+   });
   });
 
   it('preserves an explicitly named desktop target in a status-only question', () => {
@@ -751,7 +571,7 @@ describe('normalized desktop intent priority', () => {
       sideEffectClass: 'none',
       relation: 'status',
       rule: 'named-desktop-status-before-action',
-    });
+   });
   });
 
   it.each([
@@ -768,7 +588,7 @@ describe('normalized desktop intent priority', () => {
       sideEffectClass: 'local_write',
       relation: 'new',
       rule: 'explicit-artifact-create',
-    });
+   });
   });
 
   it('preserves relative artifact basenames through the linear filename scanner', () => {
@@ -777,13 +597,13 @@ describe('normalized desktop intent priority', () => {
       operation: 'read',
       target: '交付总结.md',
       sideEffectClass: 'none',
-    });
+   });
     expect(normalizeActionIntent('请创建 交付总结.md，并写入今天的结论')).toMatchObject({
       kind: 'desktop_operation',
       operation: 'create',
       target: '交付总结.md',
       sideEffectClass: 'local_write',
-    });
+   });
   });
 
   it.each([
@@ -798,7 +618,7 @@ describe('normalized desktop intent priority', () => {
       sideEffectClass: 'none',
       relation: 'new',
       rule: 'current-authoring-document-read',
-    });
+   });
   });
 
   it.each([
@@ -811,7 +631,7 @@ describe('normalized desktop intent priority', () => {
       operation: 'status',
       sideEffectClass: 'none',
       relation: 'status',
-    });
+   });
   });
 
   it.each([
@@ -828,7 +648,7 @@ describe('normalized desktop intent priority', () => {
       operation: 'create',
       sideEffectClass: 'local_write',
       relation: 'new',
-    });
+   });
   });
 
   it('treats quoted old navigation inside a task correction as explanation-only', () => {
@@ -837,6 +657,242 @@ describe('normalized desktop intent priority', () => {
       operation: 'explain',
       sideEffectClass: 'none',
       relation: 'correction',
-    });
+   });
+  });
+});
+
+describe('instructions are not outbound message commands', () => {
+  it.each(["如果共同验收丙.docx在其他目录，我不知道完整路径怎么找，也不知道怎么把文件发给你。请教我具体怎么操作，这一步先给操作说明。", '给我操作说明。', '我不知道怎么把文件发给你。'])('does not invent an external recipient from explanation wording: %s', text => {
+    expect(normalizeActionIntent(text)).toMatchObject({ kind: 'none', sideEffectClass: 'none' });
+  });
+  it('still recognizes an actual send using the same words as a real payload', () => {
+    expect(normalizeActionIntent('给张三发送操作说明，下午三点开始。')).toMatchObject({ kind: 'messaging_send', sideEffectClass: 'external_commit' });
+    expect(normalizeActionIntent('给张三说下午三点开会。')).toMatchObject({ kind: 'messaging_send', sideEffectClass: 'external_commit' });
+  });
+});
+
+describe('message how-to scope keeps independent commands', () => {
+  it.each(['我不知道怎么给张三发送文件。请教我。', '请教我如何给张三发消息。', 'I do not know how to send a message to Bob.'])('does not execute an embedded message example: %s', text => {
+    expect(normalizeActionIntent(text)).not.toMatchObject({ kind: 'messaging_send' });
+  });
+  it('still sends an independent imperative after a how-to clause', () => {
+    expect(normalizeActionIntent('教我如何发送文件，然后给张三发送操作说明。')).toMatchObject({ kind: 'messaging_send', target: '张三', payload: '操作说明' });
+  });
+});
+
+
+describe('same-turn corrected document read intent', () => {
+ it.each(['只读', '只补读', '补读', '读取'])('binds %s这份 to the one explicitly corrected filename in this turn', verb => {
+  const text = '第二份文件名写错了，实际是桌面的“corrected-note.docx”。请' + verb + '这份，把完整正文发到当前聊天，上一份不需要再读。';
+  expect(normalizeActionIntent(text)).toMatchObject({ kind: 'desktop_operation', operation: 'read', sideEffectClass: 'none', target: 'corrected-note.docx', rule: 'explicit-local-artifact-read' });
+ });
+ it.each(['请只读 D:/case-source/source.docx。', '请只补读 D:/case-source/source.docx。'])('keeps the same aliases on a directly named source: %s', text => {
+  expect(normalizeActionIntent(text)).toMatchObject({ operation: 'read', target: 'D:/case-source/source.docx', rule: 'explicit-local-artifact-read' });
+ });
+ it.each([
+  '实际是桌面的“corrected-note.docx”。上一份不需要再读。',
+  '“corrected-note.docx”的只读模式是什么意思？',
+  '文件正文为“实际是桌面的corrected-note.docx。请只补读这份”。',
+  '例如，实际是桌面的“corrected-note.docx”。请只补读这份。',
+  '请只补读这份。',
+ ])('does not bind a read without both a direct affirmative command and a current explicit target: %s', text => {
+  expect(normalizeActionIntent(text).rule).not.toBe('explicit-local-artifact-read');
+ });
+ it('preserves an affirmative write despite quoted read words and a later read-only switch', () => {
+  expect(normalizeActionIntent('请创建 D:/case-source/new-note.txt，内容为“只补读这份”。然后把文件设为只读。')).toMatchObject({ operation: 'create', sideEffectClass: 'local_write', target: 'D:/case-source/new-note.txt' });
+ });
+});
+
+
+describe('client navigation binds its own surface operand', () => {
+  it.each([
+    "请用系统浏览器打开人民法院在线服务网 https://zxfw.court.gov.cn/ ，打开后停在首页或登录页面，告诉我实际打开的结果。只打开入口，不登录、不填写或提交案件。",
+    '请用系统浏览器打开公开文档 https://example.org/ ，打开后停在首页或登录页面。只打开入口。',
+    '请用浏览器打开 https://docs.example.org/ ，打开后显示设置页面，不登录。',
+    '请用系统浏览器打开 https://service.example.net/ ，进入后停在个人主页。',
+    '请打开 https://example.org/ ，返回后停在主界面，不操作其他内容。',
+    '请用Chrome打开 https://example.net/ 的设置页面。',
+    'Open the home page of https://example.org/ in the system browser.',
+    'Show the settings page of https://example.net/ in Chrome.',
+  ])('does not reinterpret a browser page or a post-open condition as a Lumi surface: %s', text => {
+    expect(normalizeActionIntent(text).kind).not.toBe('client_navigation');
+  });
+
+  it.each([
+    '不要打开 Lumi 首页。',
+    '原文写着“打开 Lumi 首页”。请只解释这句话。',
+    '假设打开 Lumi 设置页面，只解释这个例子。',
+    'The source says "open settings". Explain the quotation only.',
+  ])('does not authorize navigation from a negated, quoted, or hypothetical command: %s', text => {
+    expect(normalizeActionIntent(text).kind).not.toBe('client_navigation');
+  });
+
+  it.each([
+    ['请打开 Lumi 首页。', 'focus_home'],
+    ['返回 Lumi 个人主页。', 'focus_home'],
+    ['请打开 Lumi 设置页面。', 'open_settings'],
+    ['打开“Lumi 首页”。', 'focus_home'],
+    ['Please open the Lumi home page.', 'focus_home'],
+    ['Open settings.', 'open_settings'],
+  ])('retains direct client navigation to the registered surface: %s', (text, action) => {
+    expect(normalizeActionIntent(text)).toMatchObject({kind: 'client_navigation', clientAction: action});
+  });
+});
+
+
+describe('local desktop navigation binds an explicit application or location operand', () => {
+  it.each([
+    ["请用系统浏览器打开人民法院在线服务网 https://zxfw.court.gov.cn/ ，打开后停在首页或登录页面，告诉我实际打开的结果。只打开入口，不登录、不填写或提交案件。", 'https://zxfw.court.gov.cn/'],
+    ['请用系统浏览器打开 https://example.org/ ，打开后停在首页。', 'https://example.org/'],
+    ['请使用Chrome打开 https://docs.example.org/ ，启动之后显示当前窗口。', 'https://docs.example.org/'],
+    ['Use the system browser to open https://example.org/. After opening, stay on the homepage.', 'https://example.org/'],
+    ['使用桌面工具打开记事本。打开后读取当前窗口。', '记事本'],
+    ['请打开 Windows 计算器。打开后停在它的主窗口。', 'Windows 计算器'],
+    ['请打开“后勤助手”。', '后勤助手'],
+    ['打开时钟。', '时钟'],
+    ['请打开记事本但不要打开 https://example.org/。', '记事本'],
+    ['请打开记事本，但不要打开 https://example.org/。', '记事本'],
+  ])('retains the real first application/location rather than a later condition: %s', (text, target) => {
+    expect(normalizeActionIntent(text)).toMatchObject({kind: 'desktop_operation', operation: 'navigate', target});
+  });
+  it.each([
+    '打开后停在首页。',
+    '启动之后显示窗口。',
+    '运行前先检查环境。',
+    '原文写着“请用系统浏览器打开 https://example.org/”。请只解释原文。',
+    '假设使用Chrome打开 https://example.org/，请解释这个例子。',
+  ])('does not turn a dependent time clause, quotation, or example into an application target: %s', text => {
+    expect(normalizeActionIntent(text).kind).not.toBe('desktop_operation');
+  });
+});
+
+
+describe('fresh source status reads do not become previous Lumi task status', () => {
+ const cases = [
+  {
+    "id": "printer-job2-original",
+    "prompt": "刚才 Job ID 2 已正常出纸。请只使用 printer_job_status 读取队列“All-in-One Inkjet Printer PCL-3 (网络)”中任务编号 2 的状态，按回执说明是否仍可观察到。不要再次打印，不要查询其他队列，不要修改任何设置。"
+  },
+  {
+    "id": "order-source-file",
+    "prompt": "请只读取本地文件“C:/fixtures/order-status.json”，查看其中订单 ORD-7328 的任务编号 2 的状态，按文件的字段说明。这是合成验收材料，不联系任何订单平台，不执行订单，不修改文件。",
+    "expectedPath": "C:/fixtures/order-status.json"
+  },
+  {
+    "id": "download-source-file",
+    "prompt": "读取“C:/fixtures/download-status.json”，告诉我下载任务编号 17 的状态和已下载字节数，只以文件现有字段为准。这是合成验收材料，不运行下载器、不恢复任务，不修改文件。",
+    "expectedPath": "C:/fixtures/download-status.json"
+  },
+  {
+    "id": "prior-receipt-plus-new-read",
+    "prompt": "你上一轮用了哪个工具？现在读取本地文件“C:/fixtures/order-status.json”，给出订单 ORD-7328 的任务状态；订单状态以这次新读取的合成材料为准，不联系平台、不执行订单，不修改文件。",
+    "expectedPath": "C:/fixtures/order-status.json"
+  }
+] as const;
+ it.each(cases)('$id stays new work with its exact source', item => {
+  const intent = normalizeActionIntent(item.prompt);
+  expect(intent.kind).not.toBe('status_query');
+  expect(intent.relation).toBe('new');
+  if ('expectedPath' in item) expect(intent).toMatchObject({kind:'desktop_operation',operation:'read',target:item.expectedPath});
+ });
+ it.each(['这个任务现在状态如何？','那个任务进度怎么样？','刚才的任务状态怎么样？','当前任务现在状态如何？','AutoCAD 任务现在什么状态？'])('keeps direct task status: %s', text => { expect(normalizeActionIntent(text).kind).toBe('status_query'); });
+});
+
+it('does not map an English external task status request onto the Lumi runtime ledger', () => { expect(normalizeActionIntent('Query the external fulfillment task status for order ORD-9841 from its supplied source.')).not.toMatchObject({kind:'status_query',target:'runtime_work'}); });
+
+
+describe('fresh navigation does not become a named desktop status fragment', () => {
+  it.each([
+    ['请用系统浏览器打开 https://www.python.org/ ，停在首页，告诉我实际打开的结果。不登录、不下载、不提交任何表单。', 'https://www.python.org/'],
+    ['请用系统浏览器打开 https://developer.mozilla.org/zh-CN/，报告实际打开的结果。', 'https://developer.mozilla.org/zh-CN/'],
+    ['请用系统浏览器打开 https://www.w3.org/standards/，停在首页，然后说明实际打开的结果。不要登录或提交表单。', 'https://www.w3.org/standards/'],
+    ['请打开 Windows 计算器，告诉我实际打开的结果。不要输入或保存。', 'Windows 计算器'],
+  ])('retains the affirmative current target: %s', (text, target) => {
+    expect(normalizeActionIntent(text)).toMatchObject({ kind: 'desktop_operation', operation: 'navigate', target, relation: 'new', sideEffectClass: 'none' });
+  });
+  it.each([
+    ['打开 Windows 计算器的任务最终状态是什么？请只根据持久任务账本回答，不要执行任何新工具。', 'Windows 计算器'],
+    ['启动记事本的结果如何？', '记事本'],
+  ])('keeps an independent named receipt question bound to its target: %s', (text, target) => {
+    expect(normalizeActionIntent(text)).toMatchObject({ kind: 'status_query', operation: 'status', target, relation: 'status', sideEffectClass: 'none' });
+  });
+});
+
+describe('canonical outgoing roles keep complete recipient operands', () => {
+  it.each([
+    ['把领航员计划2026发给我', '我', '领航员计划2026'],
+    ['请把桌面的报价单.pdf发给张三', '张三', '桌面的报价单.pdf'],
+    ['将完整说明发送给陈小明', '陈小明', '完整说明'],
+    ['发送给张三 操作说明', '张三', '操作说明'],
+    ['发给张三', '张三', ''],
+    ['发送给李小明', '李小明', ''],
+  ])('binds the supplied audience and content without splitting the name: %s', (text, target, payload) => {
+    expect(normalizeActionIntent(text)).toMatchObject({ kind: 'messaging_send', operation: 'mutate', target, payload, sideEffectClass: 'external_commit' });
+  });
+  it.each([
+    '不要发给张三。',
+    '不发给张三。',
+    '我没让你发给张三。',
+    '我怎么把完整说明发给陈小明？请先讲操作步骤。',
+    '原文写着“把报价单发给张三”。只解释这句话。',
+  ])('does not promote prohibited, denied or explained sends into an external action: %s', text => {
+    expect(normalizeActionIntent(text).kind).not.toBe('messaging_send');
+  });
+});
+
+
+describe('one polarity projection owns launch verification and message authoring', () => {
+  it.each([
+    '请用系统浏览器打开 https://www.python.org/，停在首页，告诉我实际打开的结果。不登录、不下载、不提交任何表单。',
+    '请用系统浏览器打开 https://example.org/login/search/send，报告实际打开的结果。不要登录或提交表单。',
+  ])('does not turn URL operands or exclusions into follow-up account work: %s', text => {
+    expect(isDesktopLaunchVerificationOnly(text, normalizeActionIntent(text))).toBe(true);
+  });
+  it.each([
+    '请用系统浏览器打开 https://example.org/，然后登录我的账号。',
+    '请打开 https://example.org/，搜索今天的公开公告。',
+  ])('keeps real account and search operations beyond a launch receipt: %s', text => {
+    expect(isDesktopLaunchVerificationOnly(text, normalizeActionIntent(text))).toBe(false);
+  });
+  it('keeps a send mentioned as the object of writing in the draft authoring scope', () => {
+    expect(normalizeActionIntent('先写一条给林森发送的消息草稿：下午三点开会').kind).not.toBe('messaging_send');
+    expect(normalizeActionIntent('给林森发送这份草稿')).toMatchObject({ kind: 'messaging_send', target: '林森', payload: '这份草稿' });
+    expect(normalizeActionIntent('发送这份草稿给林森')).toMatchObject({ kind: 'messaging_send', target: '林森', payload: '这份草稿' });
+  });
+});
+
+
+describe('existing polite delivery and historical receipt phrasing', () => {
+  it.each([
+    ['Can you send a message to Alice: I will arrive at three?', 'Alice'],
+    ['Could you message Alice that I will arrive at three?', 'Alice'],
+    ['微信帮我给林森发下午三点开会', '林森'],
+    ['用微信给林森发下午三点开会', '林森'],
+  ])('keeps the actual recipient through the outer request or instrument prefix: %s', (text, target) => {
+    expect(normalizeActionIntent(text)).toMatchObject({ kind: 'messaging_send', target, sideEffectClass: 'external_commit' });
+  });
+  it.each([
+    ['请告诉我打开 Windows 计算器的任务最终状态是什么？', 'Windows 计算器'],
+    ['刚才打开 Windows 计算器的结果怎么样？', 'Windows 计算器'],
+    ['请问启动记事本的结果如何？', '记事本'],
+    ['我刚才让你打开记事本的结果是什么？', '记事本'],
+  ])('preserves the named historical target rather than the most recent task: %s', (text, target) => {
+    expect(normalizeActionIntent(text)).toMatchObject({ kind: 'status_query', operation: 'status', target, relation: 'status' });
+  });
+});
+
+
+describe('delivery predicates do not split discovery prose or lose quoted content', () => {
+  it.each([
+    '使用本次发现给出的端点读取设备状态',
+    '通过局域网发现给出的节点查看状态',
+  ])('does not derive a send from adjacent word fragments: %s', text => {
+    expect(normalizeActionIntent(text).kind).not.toBe('messaging_send');
+  });
+  it.each([
+    ['给张勇发「明天见」', '张勇'],
+    ['给林森发送“明天见”', '林森'],
+  ])('restores a literal payload only for the outer addressed send: %s', (text, target) => {
+    expect(normalizeActionIntent(text)).toMatchObject({ kind: 'messaging_send', target, payload: '明天见', sideEffectClass: 'external_commit' });
   });
 });

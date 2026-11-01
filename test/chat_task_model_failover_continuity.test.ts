@@ -41,7 +41,7 @@ vi.mock('../server/conversation/summary_scheduler', async importOriginal => {
 
 import { initDatabase, readDB } from '../db_layer';
 import { resetCircuit } from '../server/cloud/circuit_breaker';
-import { getConversationActionStateByTaskId } from '../server/conversation/action_ledger';
+import { getConversationActionStateByTaskId } from "../server/conversation/ledger/queries";
 import { getConversationActionTurn } from '../server/conversation/action_turn_ledger';
 import { taskCompletionFromReceipts } from '../server/cognition/task_execution_ledger';
 import { buildActionContract, hasCoreActionEvidence } from '../server/cognition/action_contract';
@@ -230,6 +230,8 @@ describe('Chat/task model failover continuity', () => {
   let httpServer: HttpServer;
   let io: SocketIOServer;
   let client: ClientSocket;
+  let loadedContextTokens = 8_192;
+  const metadataReads: number[] = [];
   const primaryPayloads: any[] = [];
   const fallbackPayloads: any[] = [];
   const clientEvents: Array<{ event: string; payload: Record<string, any> }> = [];
@@ -286,8 +288,13 @@ describe('Chat/task model failover continuity', () => {
     conversationId = getOrCreateActiveConversation(userId, 'lumi', 'personal', '').id;
 
     const primary = { chat: { completions: { create: primaryCreate } } };
-    const lmstudio = { chat: { completions: { create: fallbackCreate } } };
-    httpServer = createServer();
+    const lmstudio = { baseURL: '', chat: { completions: { create: fallbackCreate } } };
+    httpServer = createServer((request, response) => {
+      if (request.url !== '/api/v0/models') { response.writeHead(404); response.end(); return; }
+      metadataReads.push(loadedContextTokens);
+      response.setHeader('Content-Type', 'application/json');
+      response.end(JSON.stringify({ data: [{ id: fallbackModel, state: 'loaded', loaded_context_length: loadedContextTokens }] }));
+    });
     io = new SocketIOServer(httpServer, { transports: ['websocket'] });
     io.on('connection', serverSocket => {
       serverSocket.data.authenticatedUserId = userId;
@@ -330,6 +337,7 @@ describe('Chat/task model failover continuity', () => {
     if (!address || typeof address === 'string') {
       throw new Error('Unable to bind isolated S8 Chat server');
     }
+    lmstudio.baseURL = `http://127.0.0.1:${address.port}/v1`;
     client = createSocketClient(`http://127.0.0.1:${address.port}`, {
       transports: ['websocket'],
     });
@@ -389,9 +397,11 @@ describe('Chat/task model failover continuity', () => {
     });
     expect(terminal.text).not.toMatch(/No successful current-turn tool execution|这一轮没有记录到成功|model routes unavailable|processing failed/i);
 
-    expect(primaryCreate).toHaveBeenCalledTimes(2);
+    expect(metadataReads.length).toBeGreaterThan(0);
+    expect(metadataReads.every(capacity => capacity === 8_192)).toBe(true);
+    expect(primaryCreate).toHaveBeenCalledTimes(1);
     expect(fallbackCreate).toHaveBeenCalledTimes(2);
-    expect(primaryPayloads).toHaveLength(2);
+    expect(primaryPayloads).toHaveLength(1);
     expect(fallbackPayloads).toHaveLength(2);
     expect(primaryPayloads.every(payload => payload.model === primaryModel)).toBe(true);
     expect(fallbackPayloads.every(payload => payload.model === fallbackModel)).toBe(true);
@@ -399,7 +409,8 @@ describe('Chat/task model failover continuity', () => {
       .map((name: unknown) => String(name));
     const primaryToolNames = payloadToolNames(primaryPayloads[0]);
     expect(routeNames.length).toBeGreaterThan(0);
-    expect(primaryToolNames).toEqual(routeNames);
+    expect(primaryToolNames[0]).toBe('read_file');
+    expect(new Set(primaryToolNames)).toEqual(new Set(routeNames));
     expect(primaryPayloads.every(payload => (
       JSON.stringify(payloadToolNames(payload)) === JSON.stringify(primaryToolNames)
     ))).toBe(true);
@@ -498,12 +509,8 @@ describe('Chat/task model failover continuity', () => {
       && receipt.requestedModel === primaryModel
       && receipt.selectedProvider === 'lmstudio'
       && receipt.selectedModel === fallbackModel
-      && receipt.fallbackReason === 'provider_unreachable'
       && receipt.attempts.length === 2
       && receipt.attempts[0].provider === 'deepseek'
-      && receipt.attempts[0].status === 'failed'
-      && receipt.attempts[0].reason === 'provider_unreachable'
-      && receipt.attempts[0].visibleOutputCommitted === false
       && receipt.attempts[1].provider === 'lmstudio'
       && receipt.attempts[1].status === 'succeeded'
     ))).toBe(true);
@@ -512,13 +519,22 @@ describe('Chat/task model failover continuity', () => {
     const finalReceipt = receipts.find(receipt => receipt.id !== toolRecord.modelRoutingReceiptId);
     expect(planningReceipt).toBeDefined();
     expect(finalReceipt).toBeDefined();
+    expect(planningReceipt).toMatchObject({ fallbackReason: 'provider_unreachable', attempts: [
+      { status: 'failed', reason: 'provider_unreachable', visibleOutputCommitted: false },
+      { status: 'succeeded' },
+    ] });
+    expect(finalReceipt).toMatchObject({ fallbackReason: 'failed_earlier_this_turn', attempts: [
+      { status: 'skipped', reason: 'failed_earlier_this_turn', durationMs: 0 },
+      { status: 'succeeded' },
+    ] });
+    expect(finalReceipt!.attempts[0].outboundMessagesEvidence).toBeUndefined();
+    expect(planningReceipt!.attempts[0].outboundMessagesEvidence?.messagesSha256)
+      .toBe(privateDigest({ system: null, messages: primaryPayloads[0].messages }));
+    expect(planningReceipt!.attempts[0].outboundMessagesEvidence?.toolDeclarationsSha256)
+      .toBe(privateDigest(primaryPayloads[0].tools || []));
+    expect(planningReceipt!.attempts[0].outboundMessagesEvidence?.toolDeclarationCount)
+      .toBe(primaryToolNames.length);
     for (const [receipt, index] of [[planningReceipt!, 0], [finalReceipt!, 1]] as const) {
-      expect(receipt.attempts[0].outboundMessagesEvidence?.messagesSha256)
-        .toBe(privateDigest({ system: null, messages: primaryPayloads[index].messages }));
-      expect(receipt.attempts[0].outboundMessagesEvidence?.toolDeclarationsSha256)
-        .toBe(privateDigest(primaryPayloads[index].tools || []));
-      expect(receipt.attempts[0].outboundMessagesEvidence?.toolDeclarationCount)
-        .toBe(primaryToolNames.length);
       expect(receipt.attempts[1].outboundMessagesEvidence?.messagesSha256)
         .toBe(privateDigest({ system: null, messages: fallbackPayloads[index].messages }));
       expect(receipt.attempts[1].outboundMessagesEvidence?.toolDeclarationsSha256)
@@ -543,4 +559,23 @@ describe('Chat/task model failover continuity', () => {
     ))).toBe(false);
     expect(clientEvents.filter(event => event.event === 'agent:error' && event.payload?.requestId === requestId)).toEqual([]);
   }, 20_000);
+
+  it('refuses a truly undersized loaded local runtime without truncating the accepted request or required tools', async () => {
+    loadedContextTokens = 4_096;
+    const smallRequestId = requestId + '-undersized';
+    const callsBefore = fallbackCreate.mock.calls.length;
+    const terminalPromise = waitForRequestEvent<Record<string, any>>(client, 'agent:response', smallRequestId);
+    expect(await client.timeout(5_000).emitWithAck('agent:chat', {
+      text: userText, history: [], agentId: 'lumi', domain: 'personal', source,
+      requestId: smallRequestId, conversationId,
+    })).toMatchObject({ ok: true, requestId: smallRequestId });
+    const terminal = await terminalPromise;
+    expect(terminal).toMatchObject({ requestId: smallRequestId, conversationId, finalized: true, blocked: true });
+    expect(terminal.text).not.toBe(`The exact verified marker is ${sentinel}.`);
+    expect(fallbackCreate).toHaveBeenCalledTimes(callsBefore);
+    expect(metadataReads.at(-1)).toBe(4_096);
+    expect(terminal.reason).toBe('chat_model_routes_unavailable');
+    expect(getChatExecution({ userId, domain: 'personal', orgId: '', source, conversationId }, smallRequestId)).toMatchObject({ terminal: true, status: 'failed' });
+  }, 20_000);
+
 });

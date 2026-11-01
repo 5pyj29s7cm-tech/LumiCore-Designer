@@ -36,4 +36,17 @@ describe('interrupted industry workflow reconciliation', () => {
       blockedBy: [expect.stringContaining('previous runtime ended')],
     });
   });
+
+  it('does not reconcile Main commerce, finance or legal tasks through the Designer startup hook', () => {
+    const scope={userId:`retained-main-${Date.now()}`,domain:'personal' as const,orgId:''};
+    const started=['today-operations','business-dashboard','workspace'].map(entryId=>startIndustryWorkflow({...scope,entryId,sourceInput:'Synthetic retained Main workflow'}));
+    const db=readDB();
+    for (const item of started) {
+      const action=db.conversationActionTasks.find((task:any)=>task.id===item.conversationTaskId);
+      action.status='blocked';action.blocker='Other workflow owner retains its own recovery policy.';
+    }
+    writeDB(db);
+    reconcileInterruptedIndustryWorkflowTasks();
+    for(const item of started) expect(getIndustryWorkflowTask(scope,item.task.id)?.status).toBe('in_progress');
+  });
 });

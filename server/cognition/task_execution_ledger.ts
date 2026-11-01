@@ -1,18 +1,40 @@
+import { classifyToolRecordTaskDurability } from './continuation/tool_receipts';
+import { getConversationCompletionSnapshot } from '../conversation/conversation_lifecycle';
+import { listModelRoutingReceipts } from '../llm/model_routing_receipts';
+import { toolRecordSucceeded } from '../tools/receipt_payload';
+export { toolRecordSucceeded } from '../tools/receipt_payload';
 import crypto from 'node:crypto';
 import type { ToolPolicy } from '../personality/types';
-import type { ToolExecutionRecord } from '../tools/types';
+import type { ToolExecutionIdentity, ToolExecutionRecord } from '../tools/types';
+import { defaultLocalToolExecutionKey, EXECUTION_IDENTITY_FIELDS, toolExecutionIdentity } from '../tools/execution_identity';
+import { isArtifactReaderRecord, artifactReadbackMetadata } from '../tools/artifact_evidence';
+import { inspectPersistedToolExecutionReceipt } from '../tools/persisted_execution_receipt';
 import {
   buildActionEvidenceContract,
   hasCoreActionEvidence,
-  requiresCurrentAppUiMutation,
 } from './action_contract';
 import type { TaskCapsuleV1 } from '../conversation/task_capsule';
 import {
-  parseNestedJson,
-  toolRecordHasTerminalPayload,
-  toolRecordTerminalPayload,
-  toolRecordTerminalText,
+  toolRecordTerminalPayload, toolRecordTerminalText,
 } from '../tools/receipt_payload';
+
+/** Merge repeated deliveries of one call, preserving distinct observations. */
+export function mergeToolExecutionRecords(prior: ToolExecutionRecord[], incoming: ToolExecutionRecord[]): ToolExecutionRecord[] {
+  const merged = [...prior];
+  for (const record of incoming) {
+    const index = merged.findIndex(item => item.name === record.name
+      && item.taskId === record.taskId && item.requestId === record.requestId
+      && (item.modelRoutingReceiptId || '') === (record.modelRoutingReceiptId || '')
+      && (record.id ? item.id === record.id : !item.id
+        && item.idempotencyKey === record.idempotencyKey
+        && JSON.stringify(item.arguments || {}) === JSON.stringify(record.arguments || {})
+        && item.result === record.result && item.error === record.error));
+    // This is an evolving turn-local snapshot; normal terminal receipts are immutable.
+    if (index >= 0 && record.name === 'desktop_execution_plan_receipt') merged[index] = record;
+    else if (index < 0) merged.push(record);
+  }
+  return merged;
+}
 
 export type ConversationTaskStatus =
   | 'created'
@@ -24,6 +46,13 @@ export type ConversationTaskStatus =
   | 'completed'
   | 'failed'
   | 'cancelled';
+
+/** Index only the selected tasks; never change stored receipt order or payloads. */
+export function groupTaskReceipts<T extends { taskId: string }>(tasks: readonly { id: string }[], receipts: readonly T[]): Map<string, T[]> {
+  const grouped = new Map<string, T[]>(tasks.map(task => [task.id, []]));
+  for (const receipt of receipts) grouped.get(receipt?.taskId)?.push(receipt);
+  return grouped;
+}
 
 /** An archive shares receipt storage, while its delegated owner owns execution. */
 export function isDelegatedActionEvidenceArchive(task: { id?: string; context?: unknown }): boolean {
@@ -81,11 +110,8 @@ export interface ConversationTaskPolicySnapshot {
   maxIterations: number;
 }
 
-export interface ConversationTaskReceipt {
+export interface ConversationTaskReceipt extends ToolExecutionIdentity {
   id: string;
-  taskId?: string;
-  turnId?: string;
-  requestId?: string;
   /** Preserve the exact archive deduplication identity across task hydration. */
   idempotencyKey?: string;
   /** Preserve conflicting source fences instead of laundering them on hydration. */
@@ -96,6 +122,8 @@ export interface ConversationTaskReceipt {
   result: string;
   /** Exact machine receipt used by capability verification, bounded for persistence. */
   receipt?: unknown;
+  adapterStarted?: true;
+  envelope?: ToolExecutionRecord['envelope'];
   /** Exact persisted model call that selected this tool, when model-routed. */
   modelRoutingReceiptId?: string;
   executionOrigin?: ToolExecutionRecord['executionOrigin'];
@@ -107,48 +135,14 @@ export interface ConversationTaskReceipt {
   recordedAt: string;
 }
 
-const TERMINAL_FAILURE_STATUSES = new Set([
-  'blocked',
-  'cancelled',
-  'canceled',
-  'denied',
-  'error',
-  'failed',
-  'forbidden',
-  'incomplete',
-  'needs_confirmation',
-  'not_found',
-  'not_ready',
-  'partial',
-  'pending',
-  'queued',
-  'requires_confirmation',
-  'requires_setup',
-  'submitted_unverified',
-  'timed_out',
-  'timeout',
-  'unverified',
-  'uncertain',
-  'not_verified',
-]);
-
-const SEMANTIC_FALSE_FIELDS = [
-  'sent',
-  'opened',
-  'saved',
-  'written',
-  'created',
-  'generated',
-  'submitted',
-  'targetMatched',
-  'resultVerified',
-  'geometryReady',
-  'geometryVerified',
-  'executableGeometryAvailable',
-] as const;
-
 function compact(value: unknown, limit: number): string {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+function persistableToolResult(value: unknown): string {
+  // Every source result keeps its complete text and section boundaries.
+  // Canonical envelope metadata is stored separately without a second payload.
+  return String(value ?? '');
 }
 
 function stableValue(value: unknown, depth = 0): unknown {
@@ -268,6 +262,19 @@ function cloneTerminalVerification(
   };
 }
 
+function taskReceiptEnvelope(value: Partial<ToolExecutionRecord> & { scopeConflict?: true; receiptScopeConflict?: true }): ToolExecutionRecord['envelope'] {
+  if (value.scopeConflict || value.receiptScopeConflict) return undefined;
+  const inspection = inspectPersistedToolExecutionReceipt({
+    ...value, toolName: value.name, outcome: value.envelope?.status,
+    targetIdentity: value.envelope?.targetIdentity,
+  });
+  if (!inspection.valid || !inspection.envelope) return undefined;
+  // The structured receipt already stores the payload; retain its original
+  // canonical identity without copying another full document into the capsule.
+  const { result: _result, ...metadata } = inspection.envelope;
+  return stableValue(metadata) as ToolExecutionRecord['envelope'];
+}
+
 export function normalizeConversationTaskReceipt(value: unknown): ConversationTaskReceipt | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const candidate = value as Record<string, any>;
@@ -284,8 +291,10 @@ export function normalizeConversationTaskReceipt(value: unknown): ConversationTa
     arguments: candidate.arguments && typeof candidate.arguments === 'object' && !Array.isArray(candidate.arguments)
       ? stableValue(candidate.arguments) as Record<string, unknown>
       : {},
-    result: compact(candidate.result, 3000),
+    result: persistableToolResult(candidate.result),
     ...(candidate.receipt !== undefined ? { receipt: stableValue(candidate.receipt) } : {}),
+    ...(candidate.adapterStarted === true ? { adapterStarted: true as const } : {}),
+    ...(candidate.envelope ? { envelope: taskReceiptEnvelope(candidate) } : {}),
     ...(compact(candidate.modelRoutingReceiptId, 180)
       ? { modelRoutingReceiptId: compact(candidate.modelRoutingReceiptId, 180) }
       : {}),
@@ -304,11 +313,9 @@ export function normalizeConversationTaskReceipt(value: unknown): ConversationTa
   };
 }
 
-function receiptScope(value: Record<string, any>): {
-  taskId?: string; turnId?: string; requestId?: string; scopeConflict?: true;
-} {
-  const scope: { taskId?: string; turnId?: string; requestId?: string; scopeConflict?: true } = {};
-  for (const field of ['taskId', 'turnId', 'requestId'] as const) {
+function receiptScope(value: Record<string, any>): ToolExecutionIdentity & { scopeConflict?: true } {
+  const scope: ToolExecutionIdentity & { scopeConflict?: true } = {};
+  for (const field of EXECUTION_IDENTITY_FIELDS) {
     const values = [value[field], value.envelope?.[field]]
       .filter(candidate => typeof candidate === 'string' && candidate.trim())
       .map(candidate => candidate.trim());
@@ -319,76 +326,9 @@ function receiptScope(value: Record<string, any>): {
   return scope;
 }
 
-function parseResult(value: unknown): unknown {
-  return parseNestedJson(value);
-}
-
 function structuredRecordPayload(record: ToolExecutionRecord): unknown {
   const payload = toolRecordTerminalPayload(record);
   return payload && typeof payload === 'object' ? payload : null;
-}
-
-export function toolRecordSucceeded(record: ToolExecutionRecord): boolean {
-  if (!record?.name || compact(record.error, 600)) return false;
-  if (record.terminalVerification?.status === 'failed') return false;
-  if (!toolRecordHasTerminalPayload(record)) return false;
-  const result = compact(toolRecordTerminalText(record), 4000);
-  const structuredPayload = structuredRecordPayload(record);
-  if (structuredPayload && !Array.isArray(structuredPayload)) {
-    const payload = structuredPayload as Record<string, any>;
-    const verification = payload.verification && typeof payload.verification === 'object'
-      ? payload.verification as Record<string, any>
-      : {};
-    const status = compact(
-      payload.status
-        || payload.verificationStatus
-        || verification.status,
-      80,
-    ).toLowerCase();
-    // The dedicated WPS create adapter deliberately leaves a newly-created
-    // document unsaved unless the user explicitly requested a save path.
-    // `saved: false` is therefore a verified state of that create operation,
-    // not evidence that document creation failed. Save contracts are checked
-    // separately by the action contract and still require `saved: true` plus
-    // a concrete path.
-    const ignoredFalseFields = /^(?:wps_create_document|wps_create_document_with_text)$/i.test(record.name)
-      ? new Set<string>(['saved'])
-      : new Set<string>();
-    const openOperation = /(?:^|_)(?:open|launch|activate)(?:_|$)/i.test(record.name);
-    if (!openOperation) ignoredFalseFields.add('opened');
-    const declaredProgress = record.terminalVerification?.status === 'verified'
-      && record.capability?.verification.successStatuses?.includes(status)
-      && ['started', 'queued', 'running', 'waiting_confirmation', 'paused'].includes(status);
-    if (declaredProgress) ignoredFalseFields.add('completed');
-    const explicitlyFailedOutcome = SEMANTIC_FALSE_FIELDS.some(field => (
-      !ignoredFalseFields.has(field) && payload[field] === false
-    ));
-    const verifiedRuntimeCancellation = record.name === 'runtime_work_cancel'
-      && payload.ok === true
-      && Number(payload.failedCount || 0) === 0
-      && (status === 'idle' || status === 'cancelled');
-    if (verifiedRuntimeCancellation) return true;
-    if (
-      payload.ok === false
-      || payload.success === false
-      || payload.failed === true
-      || payload.completed === false && !declaredProgress
-      || payload.verified === false
-      || explicitlyFailedOutcome
-      || payload.completionMarkerExists === false
-      || payload.requiresConfirmation === true
-      || payload.confirmationRequired === true
-      || TERMINAL_FAILURE_STATUSES.has(status)
-      || compact(payload.error || verification.error, 400)
-    ) return false;
-    // A structured terminal receipt is authoritative. Do not scan its JSON
-    // text for words such as `failed` after the structured value explicitly
-    // reported `failed: 0`; that production bug inverted verified client
-    // actions into failures.
-    return true;
-  }
-  if (Array.isArray(structuredPayload)) return true;
-  return !/(?:requires? (?:user )?confirmation|permission denied|not allowed|forbidden|timed out|(?:^|\b)(?:failed|error|blocked)(?:\b|:))/i.test(result);
 }
 
 export function toolRecordVerifiedForCompletion(record: ToolExecutionRecord): boolean {
@@ -426,7 +366,7 @@ export function coalesceToolExecutionRecords(
   const latestIndexByKey = new Map<string, number>();
   for (const record of records) {
     if (!record?.name) continue;
-    const key = toolRecordKey(record);
+    const key = JSON.stringify([record.taskId || '', record.requestId || '', record.id || '', toolRecordKey(record), record.modelRoutingReceiptId || '']);
     if (hasPlaybackObservation(record)) {
       // A new capture can supersede earlier playback, including an ad, pause
       // or unreadable progress. Preserve runtime observation order instead of
@@ -491,7 +431,7 @@ export function snapshotTaskPolicy(policy?: ToolPolicy | null): ConversationTask
   return {
     allowedTools,
     requireConfirmation: Array.from(new Set(policy.requireConfirmation || [])).filter(Boolean).slice(0, 160),
-    forbiddenTools: Array.from(new Set(policy.forbiddenTools || [])).filter(Boolean).slice(0, 160),
+    forbiddenTools: Array.from(new Set(policy.forbiddenTools || [])).filter(Boolean),
     maxIterations: Math.max(1, Math.min(Number(policy.maxIterations) || 5, 40)),
   };
 }
@@ -536,16 +476,7 @@ export function recordsToTaskReceipts(
   recordedAt = new Date().toISOString(),
 ): ConversationTaskReceipt[] {
   return coalesceToolExecutionRecords(records).map((record, index) => {
-    const rawResult = String(record.result || '');
-    const textReadbackMetadata = record.name === 'read_file' && toolRecordSucceeded(record) && rawResult
-      ? {
-          kind: 'text_readback_metadata',
-          encoding: 'UTF-8',
-          lineCount: rawResult.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n').length,
-          byteLength: Buffer.byteLength(rawResult, 'utf8'),
-          contentDigest: crypto.createHash('sha256').update(rawResult, 'utf8').digest('hex'),
-        }
-      : null;
+    const textReadbackMetadata = artifactReadbackMetadata(record);
     return ({
     id: compact(record.id, 180) || `receipt_${Date.now()}_${index}`,
     ...receiptScope(record),
@@ -554,14 +485,14 @@ export function recordsToTaskReceipts(
     key: toolRecordKey(record),
     name: compact(record.name, 160),
     arguments: stableValue(record.arguments || {}) as Record<string, unknown>,
-    result: compact(record.result, 3000),
+    result: persistableToolResult(record.result),
     ...(record.receipt !== undefined
       ? { receipt: stableValue(record.receipt) }
-      : structuredRecordPayload(record) !== null
-        ? { receipt: stableValue(structuredRecordPayload(record)) }
-        : textReadbackMetadata
-          ? { receipt: stableValue(textReadbackMetadata) }
+      : textReadbackMetadata
+        ? { receipt: stableValue(textReadbackMetadata) }
         : {}),
+    ...(record.adapterStarted === true ? { adapterStarted: true as const } : {}),
+    ...(record.envelope ? { envelope: taskReceiptEnvelope(record) } : {}),
     ...(compact(record.modelRoutingReceiptId, 180)
       ? { modelRoutingReceiptId: compact(record.modelRoutingReceiptId, 180) }
       : {}),
@@ -589,19 +520,18 @@ export function mergeTaskReceipts(
   const order: string[] = [];
   for (const receipt of [...previous, ...recordsToTaskReceipts(records, recordedAt)]) {
     if (!receipt?.key || !receipt.name) continue;
-    const playback = hasPlaybackObservation(receipt);
-    const mergeKey = playback
-      ? JSON.stringify(['playback', receipt.requestId || '', receipt.taskId || '', receipt.id || receipt.key])
-      : receipt.key;
+    const observation = hasPlaybackObservation(receipt)
+      || ['observe', 'test'].includes(receipt.capability?.operation || '')
+      || isArtifactReaderRecord({ name: receipt.name } as ToolExecutionRecord);
+    const mergeKey = JSON.stringify([receipt.taskId || '', receipt.requestId || '', receipt.id || '', receipt.key, receipt.modelRoutingReceiptId || '']);
     if (!merged.has(mergeKey)) order.push(mergeKey);
     const prior = merged.get(mergeKey);
     const rank = { failure: 0, partial: 1, success: 2 } as const;
-    if (playback || !prior || rank[receipt.outcome] >= rank[prior.outcome]) merged.set(mergeKey, receipt);
+    if (observation || !prior || rank[receipt.outcome] >= rank[prior.outcome]) merged.set(mergeKey, receipt);
   }
   return order
     .map(key => merged.get(key))
-    .filter((receipt): receipt is ConversationTaskReceipt => Boolean(receipt))
-    .slice(-40);
+    .filter((receipt): receipt is ConversationTaskReceipt => Boolean(receipt));
 }
 
 export function taskReceiptsToRecords(receipts: ConversationTaskReceipt[] = []): ToolExecutionRecord[] {
@@ -610,14 +540,14 @@ export function taskReceiptsToRecords(receipts: ConversationTaskReceipt[] = []):
     if (!receipt) return null;
     return {
     id: receipt.id,
-    ...(receipt.taskId ? { taskId: receipt.taskId } : {}),
-    ...(receipt.turnId ? { turnId: receipt.turnId } : {}),
-    ...(receipt.requestId ? { requestId: receipt.requestId } : {}),
+    ...toolExecutionIdentity(receipt),
     ...(receipt.idempotencyKey ? { idempotencyKey: receipt.idempotencyKey } : {}),
     ...(receipt.scopeConflict ? { receiptScopeConflict: true } : {}),
     name: receipt.name,
     arguments: receipt.arguments || {},
-    result: receipt.result || '',
+    result: receipt.name === 'knowledge_file_stats' ? toolRecordTerminalText(receipt) : receipt.result || '',
+    ...(receipt.adapterStarted === true ? { adapterStarted: true } : {}),
+    ...(receipt.envelope ? { envelope: receipt.envelope } : {}),
     ...(receipt.receipt !== undefined ? { receipt: stableValue(receipt.receipt) } : {}),
     ...(receipt.modelRoutingReceiptId
       ? { modelRoutingReceiptId: receipt.modelRoutingReceiptId }
@@ -630,23 +560,63 @@ export function taskReceiptsToRecords(receipts: ConversationTaskReceipt[] = []):
   }).filter((record): record is ToolExecutionRecord => Boolean(record));
 }
 
+
+/** A taskless contract may finish only its fresh, model-selected read observation. */
+type ReadCompletionScope = { requestId?: string; taskId?: string; userId?: string; conversationId?: string; domain?: string; orgId?: string };
+function hasVerifiedReadObservation(records: ToolExecutionRecord[], goal: string, current?: ReadCompletionScope): boolean {
+  if (!current?.requestId || !current.taskId || !current.userId || !current.conversationId || !goal.trim()) return false;
+  const scoped = records.filter(record => record.requestId === current.requestId && record.taskId === current.taskId);
+  const substantive = (value: unknown): boolean => {
+    if (typeof value === 'string') return Boolean(value.trim());
+    if (typeof value === 'number') return Number.isFinite(value);
+    if (Array.isArray(value)) return value.some(substantive);
+    return Boolean(value && typeof value === 'object' && Object.entries(value).some(([key, item]) =>
+      !/^(?:ok|success|status|verified|verification|count|total|query|queriedAt|sourceEndpoint|sourceTool|sourceTextSha256|error|warning)$/iu.test(key) && substantive(item)));
+  };
+  return scoped.length > 0 && scoped.every(record => {
+    if (!toolRecordSucceeded(record) || record.executionOrigin !== 'model_selected'
+      || !record.modelRoutingReceiptId
+      || classifyToolRecordTaskDurability(record) !== 'observation_only' || record.adapterStarted !== true
+      || !substantive(toolRecordTerminalPayload(record))) return false;
+    const proof = inspectPersistedToolExecutionReceipt({ ...record, toolName: record.name,
+      outcome: record.envelope?.status, targetIdentity: record.envelope?.targetIdentity },
+      { rowTaskId: current.taskId, requestId: current.requestId, outcome: 'verified_success' });
+    if (!proof.valid || !proof.explicitlyTerminalVerified) return false;
+    const scope = { ...current, domain: current.domain || 'personal', orgId: current.orgId || '' };
+    const snapshot = getConversationCompletionSnapshot(scope);
+    if (!snapshot?.root || ![snapshot.task.goal, (() => { try { return JSON.parse(snapshot.task.context || '{}').actionState?.latestInstruction; } catch { return ''; } })()].some(value => String(value || '').trim() === goal.trim())
+      || !snapshot.turns.some(turn => turn.requestId === current.requestId
+        && (['accepted','leased'].includes(turn.status) || snapshot.task.status === 'completed' && turn.status === 'terminal'))) return false;
+    const stored = snapshot.receipts.filter(row => (row.id === record.id
+      || Boolean(record.modelRoutingReceiptId && record.idempotencyKey === defaultLocalToolExecutionKey(record)))
+      && row.taskId === current.taskId
+      && row.requestId === current.requestId && row.turnId === record.turnId && row.turnRowId === record.turnRowId
+      && row.toolName === record.name && row.modelRoutingReceiptId === record.modelRoutingReceiptId && row.executionOrigin === 'model_selected'
+      && row.targetIdentity === record.envelope?.targetIdentity && row.idempotencyKey === record.idempotencyKey
+      && row.inputDigest === crypto.createHash('sha256').update(JSON.stringify(stableValue(record.arguments || {}))).digest('hex'));
+    if (stored.length !== 1) return false;
+    const durable = inspectPersistedToolExecutionReceipt(stored[0], { rowTaskId: current.taskId, requestId: current.requestId, outcome: 'verified_success' });
+    const started = Date.parse(proof.envelope?.startedAt || ''), ended = Date.parse(proof.envelope?.completedAt || ''), persisted = Date.parse(durable.envelope?.completedAt || '');
+    if (!durable.valid || !durable.explicitlyTerminalVerified || !substantive(durable.envelope?.result)
+      || ![started, ended, persisted].every(Number.isFinite) || started > ended || ended > persisted) return false;
+    return listModelRoutingReceipts(current.userId!, 1000, { conversationId: current.conversationId, requestId: current.requestId })
+      .some(route => route.id === record.modelRoutingReceiptId && route.status === 'succeeded'
+        && route.domain === scope.domain && route.orgId === scope.orgId
+        && Number.isFinite(Date.parse(route.completedAt)) && Number.isFinite(Date.parse(proof.envelope!.startedAt || ''))
+        && Date.parse(route.completedAt) <= Date.parse(proof.envelope!.startedAt || ''));
+  });
+}
+
 export function taskCompletionFromReceipts(
   goal: string,
   receipts: ConversationTaskReceipt[] = [],
   taskCapsule?: TaskCapsuleV1 | null,
-  currentTurn?: { requestId?: string; taskId?: string },
+  currentTurn?: ReadCompletionScope,
 ): { complete: boolean; blocker: string; records: ToolExecutionRecord[] } {
   const records = coalesceToolExecutionRecords(taskReceiptsToRecords(receipts));
   const contract = buildActionEvidenceContract(goal);
-  // Legacy desktop builds emitted this terminal adapter name before the
-  // verified `wps_create_document_with_text` receipt was introduced. Keep
-  // already-persisted tasks resumable without weakening generic UI evidence.
-  const legacyVerifiedWpsCreate = requiresCurrentAppUiMutation(goal) && records.some(record => (
-    record.name === 'wps_create_document' && toolRecordSucceeded(record)
-  ));
-  const complete = contract.applies
-    ? hasCoreActionEvidence(contract, records, goal, taskCapsule, currentTurn) || legacyVerifiedWpsCreate
-    : records.some(toolRecordVerifiedForCompletion);
+  const complete = contract.applies ? hasCoreActionEvidence(contract, records, goal, taskCapsule, currentTurn)
+    : hasVerifiedReadObservation(records, goal, currentTurn);
   const failures = [...records].reverse().filter(record => !toolRecordSucceeded(record));
   // A later policy/routing rejection is useful diagnostic evidence, but it
   // must not replace the domain failure that actually stopped the task. Keep
@@ -672,26 +642,6 @@ export function taskCompletionFromReceipts(
         ),
     records,
   };
-}
-
-/**
- * Confirmation consumes one exact safety boundary; it does not adjudicate the
- * user's whole natural-language goal. Every canonical confirmation record is
- * therefore returned to the shared model/tool loop, including a failed or
- * unverified record. The loop and finalizer can then use the receipt as
- * evidence, continue missing work, or recover without rediscovering/replaying
- * the already-confirmed side effect.
- *
- * `goal` remains in the signature for compatibility with older callers. It is
- * deliberately not classified here: deterministic action-contract matching
- * must never turn one confirmed tool receipt into a terminal task decision.
- */
-export function confirmedStepNeedsContinuation(
-  goal: string,
-  records: ToolExecutionRecord[] = [],
-): boolean {
-  void goal;
-  return records.some(record => Boolean(compact(record?.name, 160)));
 }
 
 export function buildConfirmedStepContinuationNote(

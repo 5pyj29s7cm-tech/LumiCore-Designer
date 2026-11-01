@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { readDB, writeDB } from '../../db_layer';
+import { readDatabaseTables, commitDatabaseTables } from '../../db_layer';
 import type { InteriorProjectWorkflowState } from './project_workflow';
 
 export const INTERIOR_PROJECT_TYPES = [
@@ -185,7 +185,7 @@ export function listInteriorProjects(
   orgId: string,
   options: { includeArchived?: boolean } = {},
 ): InteriorProject[] {
-  const rows = projectRows(readDB())
+  const rows = projectRows(readDatabaseTables(['interiorProjects', 'settings']))
     .filter(project => project.orgId === orgId)
     .filter(project => options.includeArchived || project.status !== 'archived')
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
@@ -193,12 +193,12 @@ export function listInteriorProjects(
 }
 
 export function getInteriorProject(orgId: string, projectId: string): InteriorProject | null {
-  const project = projectRows(readDB()).find(item => item.orgId === orgId && item.id === projectId);
+  const project = projectRows(readDatabaseTables(['interiorProjects', 'settings'])).find(item => item.orgId === orgId && item.id === projectId);
   return project ? cloneProject(project) : null;
 }
 
 export function getActiveInteriorProject(orgId: string, userId: string): InteriorProject | null {
-  const db = readDB();
+  const db = readDatabaseTables(['interiorProjects', 'settings']);
   const projectId = activeProjectSelections(db)[activeProjectSelectionKey(orgId, userId)];
   if (!projectId) return null;
   const project = projectRows(db).find(item => item.orgId === orgId && item.id === projectId && item.status !== 'archived');
@@ -210,7 +210,7 @@ export function setActiveInteriorProject(
   userId: string,
   projectId: string | null,
 ): InteriorProject | null {
-  const db = readDB();
+  const db = readDatabaseTables(['interiorProjects', 'settings']);
   const key = activeProjectSelectionKey(orgId, userId);
   const selections = activeProjectSelections(db);
   const normalizedProjectId = String(projectId || '').trim();
@@ -230,7 +230,7 @@ export function setActiveInteriorProject(
   const value = JSON.stringify(selections);
   if (row) row.value = value;
   else db.settings.push({ key: ACTIVE_PROJECT_SETTING_KEY, value });
-  writeDB(db);
+  commitDatabaseTables(db);
   return project ? cloneProject(project) : null;
 }
 
@@ -239,7 +239,7 @@ export function createInteriorProject(
   ownerUserId: string,
   input: CreateInteriorProjectInput,
 ): InteriorProject {
-  const db = readDB();
+  const db = readDatabaseTables(['interiorProjects', 'settings']);
   const timestamp = new Date().toISOString();
   const project: InteriorProject = {
     id: randomUUID(),
@@ -253,7 +253,7 @@ export function createInteriorProject(
     updatedAt: timestamp,
   };
   projectRows(db).push(project);
-  writeDB(db);
+  commitDatabaseTables(db);
   return cloneProject(project);
 }
 
@@ -265,7 +265,7 @@ export function updateInteriorProject(
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     throw new InteriorProjectValidationError('request body must be an object');
   }
-  const db = readDB();
+  const db = readDatabaseTables(['interiorProjects', 'settings']);
   const project = projectRows(db).find(item => item.orgId === orgId && item.id === projectId);
   if (!project) return null;
 
@@ -282,6 +282,6 @@ export function updateInteriorProject(
     project.brief = briefInput(input.brief, project.brief);
   }
   project.updatedAt = new Date().toISOString();
-  writeDB(db);
+  commitDatabaseTables(db);
   return cloneProject(project);
 }

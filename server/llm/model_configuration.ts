@@ -1,4 +1,6 @@
-import { flushDBOrThrow, readDB } from '../../db_layer';
+import { type ProviderGetters as SharedProviderGetters, providerGetterArguments } from "./provider_getters";
+import { flushDBOrThrow } from '../../db_layer';
+import { readSettingJson } from '../persistence/settings_repository';
 import { loadKeys } from '../config/keys';
 import {
   getRegisteredProviderDefaultModel,
@@ -11,15 +13,10 @@ import { getActiveProvider as getActiveTTSProvider } from '../tts/adapter';
 import { analyzeScreen } from './adapter';
 import { generateConfiguredEmbedding } from './embedding_provider';
 import {
-  DEFAULT_IMAGE_EDIT_MODELS,
-  DEFAULT_IMAGE_GENERATION_MODELS,
-  DEFAULT_IMAGE_TO_VIDEO_MODELS,
-  DEFAULT_VIDEO_GENERATION_MODELS,
+  GENERATION_MODEL_ROLES,
   getUserPreferredGenerationModels,
-  isImageEditProvider,
-  isImageGenerationProvider,
-  isImageToVideoProvider,
-  isVideoGenerationProvider,
+  isGenerationModelRole,
+  updateUserGenerationModel,
   upsertUserPreferredGenerationModels,
 } from './generation_preferences';
 import { ensureLocalModelReady, getLocalModelConfig } from './local_models';
@@ -52,7 +49,6 @@ import {
   upsertUserPreferredVision,
 } from './vision_preferences';
 import {
-  DEFAULT_WORLD_MODELS,
   getUserPreferredWorldModel,
   getUserWorldModelPrefs,
   isWorldModelProvider,
@@ -91,20 +87,7 @@ export interface ModelConfigurationUpdate {
   allowCloudFallback?: boolean;
 }
 
-export interface TestableModelRuntime {
-  getDeepSeek?: () => any;
-  getGemini?: () => any;
-  getOpenAI?: () => any;
-  getAnthropic?: () => any;
-  getQwen?: () => any;
-  getArk?: () => any;
-  getOllama?: () => any;
-  getLmStudio?: () => any;
-  getXiaomi?: () => any;
-  getKimi?: () => any;
-  getGlm?: () => any;
-  getRelay?: () => any;
-}
+export type TestableModelRuntime = Partial<SharedProviderGetters>;
 
 const TESTABLE_LLM_PROVIDERS = new Set([
   'deepseek', 'gemini', 'openai', 'anthropic', 'qwen', 'ark',
@@ -273,19 +256,21 @@ export interface OfficialModelConfigurationRoleReceipt {
   role: LumiModelRole;
   provider: string;
   model: string;
-  status: 'applied' | 'skipped';
-  reason?: 'adapter_not_available' | 'official_api_not_configured';
+  status: 'applied' | 'skipped' | 'failed';
+  reason?: 'adapter_not_available' | 'official_api_not_configured' | 'catalog_model_unavailable';
   selectionReason?: 'recommended_default' | 'preserved_live_selection' | 'catalog_namespace_migration' | 'catalog_fallback';
 }
 
 export interface OfficialModelConfigurationApplyResult {
   ok: true;
+  status: 'complete' | 'partial';
   provider: typeof LUMI_OFFICIAL_PROVIDER_ID;
   /** The live catalog was read before all selected roles were persisted. */
   verification: 'catalog_verified_and_configuration_persisted';
   catalog: { modelCount: number; roleCount: number };
   applied: OfficialModelConfigurationRoleReceipt[];
   skipped: OfficialModelConfigurationRoleReceipt[];
+  failed: OfficialModelConfigurationRoleReceipt[];
   roles: Record<LumiModelRole, OfficialModelConfigurationRoleReceipt>;
   configuration: ReturnType<typeof getLumiModelConfiguration>;
 }
@@ -328,90 +313,27 @@ function officialModelForRole(userId: string, role: LumiModelRole, hasUserSelect
       : officialConfiguredModel(configured, role, LUMI_OFFICIAL_DEFAULT_MODELS[role]);
   }
 
-  switch (role) {
-    case 'reasoning': {
-      const preference = getUserPreferredLLM(userId, { persistMigration: false });
-      return officialConfiguredModel(
-        preference.provider === LUMI_OFFICIAL_PROVIDER_ID
-          ? (preference.model || preference.models[LUMI_OFFICIAL_PROVIDER_ID])
-          : preference.models[LUMI_OFFICIAL_PROVIDER_ID],
-        role,
-        DEFAULT_MODELS[LUMI_OFFICIAL_PROVIDER_ID],
-      );
+  let preference: { provider: string; model: string; models?: Record<string, string> };
+  if (isGenerationModelRole(role)) {
+    preference = getUserPreferredGenerationModels(userId)[GENERATION_MODEL_ROLES[role].field];
+  } else {
+    switch (role) {
+      case 'reasoning': preference = getUserPreferredLLM(userId, { persistMigration: false }); break;
+      case 'vision': preference = getUserPreferredVision(userId); break;
+      case 'world': preference = getUserWorldModelPrefs(userId); break;
+      case 'embedding': case 'rerank': preference = getUserRetrievalModelPreferences(userId)[role]; break;
+      case 'speech_recognition': case 'speech_synthesis': {
+        const voice = getVoicePreference();
+        return officialConfiguredModel(role === 'speech_recognition' ? voice.sttModel : voice.ttsModel, role, LUMI_OFFICIAL_DEFAULT_MODELS[role]);
+      }
     }
-    case 'vision': {
-      const preference = getUserPreferredVision(userId);
-      return officialConfiguredModel(
-        preference.provider === LUMI_OFFICIAL_PROVIDER_ID
-          ? (preference.model || preference.models[LUMI_OFFICIAL_PROVIDER_ID])
-          : preference.models[LUMI_OFFICIAL_PROVIDER_ID],
-        role,
-        DEFAULT_VISION_MODELS[LUMI_OFFICIAL_PROVIDER_ID],
-      );
-    }
-    case 'world': {
-      const preference = getUserWorldModelPrefs(userId);
-      return officialConfiguredModel(
-        preference.provider === LUMI_OFFICIAL_PROVIDER_ID
-          ? (preference.model || preference.models[LUMI_OFFICIAL_PROVIDER_ID])
-          : preference.models[LUMI_OFFICIAL_PROVIDER_ID],
-        role,
-        DEFAULT_WORLD_MODELS[LUMI_OFFICIAL_PROVIDER_ID],
-      );
-    }
-    case 'embedding': {
-      const preference = getUserRetrievalModelPreferences(userId);
-      return officialConfiguredModel(
-        preference.embedding.provider === LUMI_OFFICIAL_PROVIDER_ID ? preference.embedding.model : '',
-        role,
-        DEFAULT_EMBEDDING_MODELS[LUMI_OFFICIAL_PROVIDER_ID],
-      );
-    }
-    case 'image_generation': {
-      const preference = getUserPreferredGenerationModels(userId).image;
-      return officialConfiguredModel(
-        preference.provider === LUMI_OFFICIAL_PROVIDER_ID ? preference.model : '',
-        role,
-        DEFAULT_IMAGE_GENERATION_MODELS[LUMI_OFFICIAL_PROVIDER_ID],
-      );
-    }
-    case 'image_edit': {
-      const preference = getUserPreferredGenerationModels(userId).imageEdit;
-      return officialConfiguredModel(
-        preference.provider === LUMI_OFFICIAL_PROVIDER_ID ? preference.model : '',
-        role,
-        DEFAULT_IMAGE_EDIT_MODELS[LUMI_OFFICIAL_PROVIDER_ID],
-      );
-    }
-    case 'video_generation': {
-      const preference = getUserPreferredGenerationModels(userId).video;
-      return officialConfiguredModel(
-        preference.provider === LUMI_OFFICIAL_PROVIDER_ID ? preference.model : '',
-        role,
-        DEFAULT_VIDEO_GENERATION_MODELS[LUMI_OFFICIAL_PROVIDER_ID],
-      );
-    }
-    case 'image_to_video': {
-      const preference = getUserPreferredGenerationModels(userId).imageToVideo;
-      return officialConfiguredModel(
-        preference.provider === LUMI_OFFICIAL_PROVIDER_ID ? preference.model : '',
-        role,
-        DEFAULT_IMAGE_TO_VIDEO_MODELS[LUMI_OFFICIAL_PROVIDER_ID],
-      );
-    }
-    case 'rerank': {
-      const preference = getUserRetrievalModelPreferences(userId).rerank;
-      return officialConfiguredModel(
-        preference.provider === LUMI_OFFICIAL_PROVIDER_ID ? preference.model : '',
-        role,
-        DEFAULT_RERANK_MODELS[LUMI_OFFICIAL_PROVIDER_ID],
-      );
-    }
-    case 'speech_recognition':
-      return officialConfiguredModel(getVoicePreference().sttModel, role, LUMI_OFFICIAL_DEFAULT_MODELS[role]);
-    case 'speech_synthesis':
-      return officialConfiguredModel(getVoicePreference().ttsModel, role, LUMI_OFFICIAL_DEFAULT_MODELS[role]);
   }
+  const savedModel = role === 'reasoning' || role === 'vision' || role === 'world'
+    ? preference.models?.[LUMI_OFFICIAL_PROVIDER_ID] : '';
+  return officialConfiguredModel(
+    preference.provider === LUMI_OFFICIAL_PROVIDER_ID ? preference.model || savedModel : savedModel,
+    role, LUMI_OFFICIAL_DEFAULT_MODELS[role],
+  );
 }
 
 function rolePreferenceLocation(userId: string, role: LumiModelRole): [string, string] {
@@ -526,11 +448,7 @@ export function selectOfficialRoleModel(
 }
 
 function explicitlySelectedOfficialRoles(userId: string, includeEnvironment = true): Set<LumiModelRole> {
-  const settings = readDB().settings || [];
-  const readPreference = (key: string): any => {
-    try { return JSON.parse(settings.find(setting => setting.key === key)?.value || 'null'); }
-    catch { return null; }
-  };
+  const readPreference = readSettingJson;
   const generation = readPreference(`generation_prefs_${userId}`);
   const retrievalValue = readPreference(`retrieval_model_prefs_${userId}`)
     || readPreference(`model_role_prefs_${userId}`);
@@ -620,19 +538,15 @@ async function applyOfficialModelConfiguration(
   };
   const applied: OfficialModelConfigurationRoleReceipt[] = [];
   const skipped: OfficialModelConfigurationRoleReceipt[] = [];
+  const failed: OfficialModelConfigurationRoleReceipt[] = [];
 
-  // Resolve every supported role before the first write. This prevents a
-  // missing late role (for example I2V) from creating a transient half-applied
-  // configuration that then depends on best-effort rollback.
+  // Resolve available roles before the first write. An absent capability
+  // preserves that role and is reported separately; it cannot disable valid
+  // chat, image or voice routes from the same authenticated catalog.
   const planned = new Map<LumiModelRole, ReturnType<typeof selectOfficialRoleModel>>();
   for (const role of LUMI_MODEL_ROLES) {
     if (!LUMI_OFFICIAL_ROLE_CAPABILITIES[role]) continue;
-    const roleModels = catalog.byRole[role] || [];
-    const availableModels = role === 'image_to_video'
-      ? roleModels.filter(modelId => /(?:^|[\/_-])i2v(?:[\/_-]|$)|image[-_]?to[-_]?video/i.test(modelId))
-      : role === 'video_generation'
-        ? roleModels.filter(modelId => !/(?:^|[\/_-])i2v(?:[\/_-]|$)|image[-_]?to[-_]?video/i.test(modelId))
-        : roleModels;
+    const availableModels = catalog.byRole[role] || [];
     const selection = selectOfficialRoleModel(role, availableModels, officialModelForRole(uid, role, userSelectedRoles.has(role)), {
       explicitSelection: explicitRoles.has(role),
     });
@@ -640,10 +554,15 @@ async function applyOfficialModelConfiguration(
       if (availableModels.length > 0) {
         throw new Error(`Lumi Official API selected model is unavailable for ${role}. Explicitly choose a replacement model; no role configuration was changed.`);
       }
-      throw new Error(`Lumi Official API catalog has no compatible model for ${role}. No role configuration was changed.`);
+      const existing = current[role];
+      failed.push({ role, provider: String(existing?.provider || existing?.effectiveProvider || ''),
+        model: String(existing?.model || existing?.effectiveModel || ''), status: 'failed', reason: 'catalog_model_unavailable' });
+      continue;
     }
     planned.set(role, selection);
   }
+
+  if (planned.size === 0) throw new Error('Lumi Official API catalog has no compatible model for any supported role. No role configuration was changed.');
 
   const beforeRevisions = modelPreferenceRevisions(uid);
   for (const role of LUMI_MODEL_ROLES) {
@@ -659,8 +578,9 @@ async function applyOfficialModelConfiguration(
       continue;
     }
 
-    const selection = planned.get(role)!;
-    const model = selection!.model;
+    const selection = planned.get(role);
+    if (!selection) continue;
+    const model = selection.model;
     try {
       const update: ModelConfigurationUpdate = {
         role,
@@ -699,6 +619,7 @@ async function applyOfficialModelConfiguration(
 
   return {
     ok: true,
+    status: failed.length > 0 ? 'partial' : 'complete',
     provider: LUMI_OFFICIAL_PROVIDER_ID,
     verification: 'catalog_verified_and_configuration_persisted',
     catalog: {
@@ -707,7 +628,8 @@ async function applyOfficialModelConfiguration(
     },
     applied,
     skipped,
-    roles: Object.fromEntries([...applied, ...skipped].map(receipt => [receipt.role, receipt])) as Record<LumiModelRole, OfficialModelConfigurationRoleReceipt>,
+    failed,
+    roles: Object.fromEntries([...applied, ...skipped, ...failed].map(receipt => [receipt.role, receipt])) as Record<LumiModelRole, OfficialModelConfigurationRoleReceipt>,
     configuration: getLumiModelConfiguration(uid),
   };
 }
@@ -747,48 +669,8 @@ export function updateLumiModelConfiguration(userId: string, input: ModelConfigu
       model,
       models: provider === 'inherit_vision' ? current.models : { ...current.models, [provider]: model },
     });
-  } else if (
-    input.role === 'image_generation'
-    || input.role === 'image_edit'
-    || input.role === 'video_generation'
-    || input.role === 'image_to_video'
-  ) {
-    const current = getUserPreferredGenerationModels(uid);
-    if (input.role === 'image_generation') {
-      const provider = input.provider || current.image.provider;
-      if (!isImageGenerationProvider(provider)) throw new Error(`Unsupported image provider: ${provider}`);
-      const model = provider === 'auto'
-        ? cleanModel(input.model)
-        : cleanModel(input.model) || current.image.models[provider] || DEFAULT_IMAGE_GENERATION_MODELS[provider];
-      current.image = {
-        provider,
-        model,
-        models: provider === 'auto' ? current.image.models : { ...current.image.models, [provider]: model },
-      };
-    } else if (input.role === 'image_edit') {
-      const provider = input.provider || current.imageEdit.provider;
-      if (!isImageEditProvider(provider)) throw new Error(`Unsupported image edit provider: ${provider}`);
-      const model = cleanModel(input.model) || current.imageEdit.models[provider] || DEFAULT_IMAGE_EDIT_MODELS[provider];
-      current.imageEdit = { provider, model, models: { ...current.imageEdit.models, [provider]: model } };
-    } else if (input.role === 'video_generation') {
-      const provider = input.provider || current.video.provider;
-      if (!isVideoGenerationProvider(provider)) throw new Error(`Unsupported video provider: ${provider}`);
-      const model = cleanModel(input.model) || current.video.models[provider] || DEFAULT_VIDEO_GENERATION_MODELS[provider];
-      current.video = { provider, model, models: { ...current.video.models, [provider]: model } };
-    } else {
-      const provider = input.provider || current.imageToVideo.provider;
-      if (!isImageToVideoProvider(provider)) throw new Error(`Unsupported image-to-video provider: ${provider}`);
-      const model = cleanModel(input.model)
-        || current.imageToVideo.models[provider]
-        || DEFAULT_IMAGE_TO_VIDEO_MODELS[provider];
-      current.imageToVideo = {
-        provider,
-        model,
-        models: { ...current.imageToVideo.models, [provider]: model },
-      };
-    }
-    const field = rolePreferenceLocation(uid, input.role)[1] as keyof typeof current;
-    upsertUserPreferredGenerationModels(uid, current, [field]);
+  } else if (isGenerationModelRole(input.role)) {
+    updateUserGenerationModel(uid, input.role, input);
   } else if (input.role === 'embedding' || input.role === 'rerank') {
     const current = getUserRetrievalModelPreferences(uid);
     if (input.role === 'embedding') {
@@ -826,35 +708,23 @@ export function updateLumiModelConfiguration(userId: string, input: ModelConfigu
     const current = getVoicePreference();
     const provider = input.provider || (input.role === 'speech_recognition' ? current.stt : current.tts);
     const requestedModel = cleanModel(input.model);
-    if (input.role === 'speech_recognition') {
-      if (!STT_PROVIDERS.has(provider)) throw new Error(`Unsupported speech recognition provider: ${provider}`);
-      if (requestedModel && provider !== LUMI_OFFICIAL_PROVIDER_ID) {
-        throw new Error('Speech model selection is only supported by Lumi Official API.');
-      }
-      if (requestedModel && !normalizeVoiceModelId(requestedModel)) {
-        throw new Error('Speech model must use a provider/model identifier.');
-      }
-      setVoicePreference({
-        stt: provider as any,
-        ...(provider === LUMI_OFFICIAL_PROVIDER_ID
-          ? { sttModel: normalizeVoiceModelId(requestedModel) || current.sttModel || LUMI_OFFICIAL_DEFAULT_MODELS.speech_recognition }
-          : {}),
-      });
-    } else {
-      if (!TTS_PROVIDERS.has(provider)) throw new Error(`Unsupported speech synthesis provider: ${provider}`);
-      if (requestedModel && provider !== LUMI_OFFICIAL_PROVIDER_ID) {
-        throw new Error('Speech model selection is only supported by Lumi Official API.');
-      }
-      if (requestedModel && !normalizeVoiceModelId(requestedModel)) {
-        throw new Error('Speech model must use a provider/model identifier.');
-      }
-      setVoicePreference({
-        tts: provider as any,
-        ...(provider === LUMI_OFFICIAL_PROVIDER_ID
-          ? { ttsModel: normalizeVoiceModelId(requestedModel) || current.ttsModel || LUMI_OFFICIAL_DEFAULT_MODELS.speech_synthesis }
-          : {}),
-      });
+    const lane = input.role === 'speech_recognition' ? 'stt' : 'tts';
+    const modelKey = lane === 'stt' ? 'sttModel' : 'ttsModel';
+    const providers = lane === 'stt' ? STT_PROVIDERS : TTS_PROVIDERS;
+    const label = lane === 'stt' ? 'speech recognition' : 'speech synthesis';
+    if (!providers.has(provider)) throw new Error(`Unsupported ${label} provider: ${provider}`);
+    if (requestedModel && provider !== LUMI_OFFICIAL_PROVIDER_ID) {
+      throw new Error('Speech model selection is only supported by Lumi Official API.');
     }
+    const normalizedModel = normalizeVoiceModelId(requestedModel);
+    if (requestedModel && !normalizedModel) throw new Error('Speech model must use a provider/model identifier.');
+    setVoicePreference({
+      [lane]: provider,
+      ...(provider === LUMI_OFFICIAL_PROVIDER_ID
+        ? { [modelKey]: normalizedModel || current[modelKey] || LUMI_OFFICIAL_DEFAULT_MODELS[input.role] }
+        : {}),
+    });
+
   }
 
   return getLumiModelConfiguration(uid, input.role);
@@ -898,7 +768,7 @@ export async function testLLMProviderConnection(
     // Exercise the exact production adapter and request formatter. A raw SDK
     // probe can look healthy while the real Lumi route fails because it omits
     // provider-specific request fields, privacy gates, or local supervision.
-    await withConnectionTestTimeout(makeLLMCallDirect(
+    const response = await withConnectionTestTimeout(makeLLMCallDirect(
       [{ role: 'user', content: 'Reply with only OK.' }],
       [],
       {
@@ -906,24 +776,15 @@ export async function testLLMProviderConnection(
         model,
         userId,
         selectionMode: 'pinned',
-        maxTokens: 8,
+        maxTokens: 64,
+        thinkingMode: 'disabled',
         noImplicitFailover: true,
         authorizedRoutingCandidate: true,
         signal: controller.signal,
       },
-      llm.getDeepSeek || (() => null),
-      llm.getGemini || (() => null),
-      llm.getOpenAI,
-      llm.getAnthropic,
-      llm.getQwen,
-      llm.getOllama,
-      llm.getLmStudio,
-      llm.getArk,
-      llm.getXiaomi,
-      llm.getKimi,
-      llm.getGlm,
-      llm.getRelay,
+      ...providerGetterArguments(llm, "primary"),
     ), provider === 'ollama' || provider === 'lmstudio' ? 45_000 : 20_000);
+    if (!response.text?.trim()) throw new Error('The model returned an empty response to the connection test.');
   } finally {
     controller.abort();
   }
@@ -943,18 +804,7 @@ export async function testVisionProviderConnection(
     VISION_TEST_IMAGE_BASE64,
     'Confirm that you received the image. Reply with only OK.',
     { provider: provider as any, model, maxTokens: 24 },
-    llm.getDeepSeek,
-    llm.getGemini,
-    llm.getOpenAI,
-    llm.getAnthropic,
-    llm.getQwen,
-    llm.getOllama,
-    llm.getLmStudio,
-    llm.getArk,
-    llm.getXiaomi,
-    llm.getKimi,
-    llm.getGlm,
-    llm.getRelay,
+    ...providerGetterArguments(llm),
   ), provider === 'ollama' || provider === 'lmstudio' ? 60_000 : 30_000);
   return { ok: true, provider, model, latencyMs: Date.now() - startedAt };
 }
@@ -981,20 +831,9 @@ export async function testLumiModelConfiguration(
           selectionMode: preference.selectionMode,
           fallbackCandidates: preference.fallbackCandidates,
           allowCloudFallback: preference.allowCloudFallback,
-          maxTokens: 8,
+          maxTokens: 64, thinkingMode: 'disabled',
         },
-        llm.getDeepSeek || (() => null),
-        llm.getGemini || (() => null),
-        llm.getOpenAI,
-        llm.getAnthropic,
-        llm.getQwen,
-        llm.getOllama,
-        llm.getLmStudio,
-        llm.getArk,
-        llm.getXiaomi,
-        llm.getKimi,
-        llm.getGlm,
-        llm.getRelay,
+        ...providerGetterArguments(llm, "primary"),
       );
       return {
         ok: true,
@@ -1131,7 +970,8 @@ export async function testLumiModelFailoverConfiguration(
       selectionMode: 'ordered_fallback',
       fallbackCandidates,
       allowCloudFallback: preference.allowCloudFallback,
-      maxTokens: 8,
+      maxTokens: 64,
+      thinkingMode: 'disabled',
     },
     {
       getDeepSeek: llm.getDeepSeek || (() => null),

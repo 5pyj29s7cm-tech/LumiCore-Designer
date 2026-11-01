@@ -1,6 +1,9 @@
+import { reconcileInterruptedIndustryWorkflowTasks } from '../industry/workflow_service';
+import { providerGetterArguments } from "../llm/provider_getters";
+import { runtimeFaults } from './fault_state';
 import { repairTestMemoryProvenance, repairRuntimeLearningEvidence } from '../memory/provenance';
 import {
-  readDB,
+  readDatabaseTables,
   flushDB,
   closeDatabase,
   ensureDatabaseInitialized,
@@ -8,10 +11,8 @@ import {
   pruneOldData,
   requireDatabaseStartupQuickCheck,
 } from "../../db_layer";
-import fs from "fs";
-import path from "path";
 import { toolRegistry } from "../tools/registry";
-import { registerProductVariantTools } from "../tools/definitions/index";
+import { registerAllTools } from "../tools/definitions/index";
 import { mcpManager, registerMCPTools } from "../mcp";
 import { scheduler, registerScheduledTasks } from "../scheduler";
 import {
@@ -41,7 +42,6 @@ import {
 } from "../workflows/runtime";
 import { recoverInterruptedExternalAiHistorySyncs } from "../agents/external_ai_history_sync";
 import { hydrateActiveExtensions } from "../extensions/registry";
-import { PRODUCT_VARIANT } from "../../shared/product_variant";
 import { hydrateExternalCapabilities } from "../external_capabilities/registry";
 import { runScheduledReadOnlyPrewarm, readOnlyContextCache } from "../context/read_only_cache";
 import { getGptSovitsRuntimeStatus } from "../tts/gptsovits_runtime";
@@ -50,8 +50,6 @@ import {
   setUnifiedRuntimeSupervisor,
   UnifiedRuntimeSupervisor,
 } from "./unified_supervisor";
-import { enforceProductVariantSkillBaseline } from "./product_variant_skills";
-import { reconcileInterruptedIndustryWorkflowTasks } from "../industry/workflow_service";
 import {
   initializeChatExecutionRegistryPersistence,
   waitForChatExecutionPersistence,
@@ -61,6 +59,8 @@ import { installRuntimeFileLogger } from './file_logger';
 import { ensurePendingConfirmationPersistenceInitialized } from '../tools/pending_confirmation_repository';
 import { RuntimeShutdownCoordinator, registerShutdownSignals, type ShutdownIngress } from './shutdown';
 import { runtimeBackgroundWork, runtimeShutdownCancellation, waitUntilRuntimeIdle } from './shutdown_work';
+import { stopLayaShadow } from './laya_shadow';
+import { xiaozhiDeviceService } from '../devices/xiaozhi_service';
 
 interface BootstrapContext {
   server: any;
@@ -81,22 +81,6 @@ interface BootstrapContext {
 let unifiedRuntimeSupervisor: UnifiedRuntimeSupervisor | null = null;
 const startupTimers = new Set<ReturnType<typeof setTimeout>>();
 
-function ensureProductVariantSkills(): string[] {
-  const configured = mcpManager.getConfig();
-  const installedNow: string[] = [];
-  for (const skillName of PRODUCT_VARIANT.runtime.defaultSkills) {
-    if (configured[skillName]) continue;
-    const bundledPath = path.join(process.cwd(), 'server', 'skills', 'bundled', skillName);
-    if (!fs.existsSync(path.join(bundledPath, 'package.json'))) continue;
-    try {
-      mcpManager.installSkill(skillName, bundledPath, true);
-      installedNow.push(skillName);
-    } catch (error: any) {
-      console.warn(`[Variant] Could not install default skill "${skillName}": ${error?.message || String(error)}`);
-    }
-  }
-  return installedNow;
-}
 function scheduleFirstBootExploration(runtimeDir: string, delayMs = 30000) {
   const timer = setTimeout(() => {
     startupTimers.delete(timer);
@@ -153,7 +137,7 @@ export async function bootstrap(ctx: BootstrapContext) {
     await ensureDatabaseInitialized();
     repairTestMemoryProvenance();
     repairRuntimeLearningEvidence();
-    const initializedDb = readDB();
+    const initializedDb = readDatabaseTables(["conversations","interactions","users"]);
     const migrationCounts = {
       quickCheck: requireDatabaseStartupQuickCheck(),
       // A migrated database must expose all three durable collections. Using
@@ -184,7 +168,7 @@ export async function bootstrap(ctx: BootstrapContext) {
     const recoveredExternalAiHistorySyncs = recoverInterruptedExternalAiHistorySyncs();
     if (recoveredAutonomousTasks > 0) {
       console.warn(
-        `[Bootstrap] Recovered durable autonomous work leases: autonomy=${recoveredAutonomousTasks}`,
+        `[Bootstrap] Recovered ${recoveredAutonomousTasks} autonomous LumiCore task lease(s).`,
       );
     }
     if (reconciledWorkflowRuns > 0) {
@@ -198,9 +182,7 @@ export async function bootstrap(ctx: BootstrapContext) {
       console.warn(`[Bootstrap] Recovered ${recoveredTasks} orphaned conversation task lease(s)`);
     }
     const reconciledIndustryTasks = reconcileInterruptedIndustryWorkflowTasks();
-    if (reconciledIndustryTasks > 0) {
-      console.warn(`[Bootstrap] Reconciled ${reconciledIndustryTasks} interrupted industry workflow task(s) without replaying tools`);
-    }
+    if (reconciledIndustryTasks) console.warn(`[Bootstrap] Reconciled ${reconciledIndustryTasks} interrupted industry tasks without replay.`);
     if (llm.refreshLocalModels) {
       const localModels = await llm.refreshLocalModels();
       console.log(`[LLM] Local runtime ready — Ollama=${localModels.ollama}, LM Studio=${localModels.lmstudio}`);
@@ -216,24 +198,16 @@ export async function bootstrap(ctx: BootstrapContext) {
     process.exit(1);
   }
 
-  // Register the shared Lumi core plus this edition's domain-heavy tools.
-  registerProductVariantTools(toolRegistry, llm);
-  console.log(`[Tools] Registered ${toolRegistry.list().length} ${PRODUCT_VARIANT.productLine} runtime tools`);
+  // Register LumiCore capabilities.
+  registerAllTools(toolRegistry, llm);
+  console.log(`[Tools] Registered ${toolRegistry.list().length} built-in tools`);
+  try { await xiaozhiDeviceService.startSaved(); }
+  catch { console.warn('[Devices] The local device gateway could not restore; inspect its status in Device Center.'); }
   const extensionHydration = await hydrateActiveExtensions(toolRegistry);
   if (extensionHydration.activated > 0 || extensionHydration.failed > 0) {
     console.log(`[Extensions] Active=${extensionHydration.activated}, boot-failed=${extensionHydration.failed}`);
   }
   for (const error of extensionHydration.errors) console.warn(`[Extensions] ${error}`);
-  // Product skills and MCP/CAD discovery are kept, but execution remains owned
-  // by the single LumiCore foreground/autonomy runtime.
-  const defaultSkillsInstalled = ensureProductVariantSkills();
-  const inheritedSkillsDisabled = enforceProductVariantSkillBaseline();
-  if (defaultSkillsInstalled.length > 0) {
-    console.log(`[Variant] Installed default ${PRODUCT_VARIANT.productLine} skills: ${defaultSkillsInstalled.join(', ')}`);
-  }
-  if (inheritedSkillsDisabled.length > 0) {
-    console.log(`[Variant] Disabled inherited non-${PRODUCT_VARIANT.productLine} skills: ${inheritedSkillsDisabled.join(', ')}`);
-  }
   const initialExternalCapabilities = await hydrateExternalCapabilities(toolRegistry);
   if (initialExternalCapabilities.active > 0) {
     console.log(
@@ -268,7 +242,7 @@ export async function bootstrap(ctx: BootstrapContext) {
       timeoutMs: 1_000,
       run: () => ({
         registeredTools: toolRegistry.list().length,
-        databaseReadable: Boolean(readDB()),
+        databaseReadable: Boolean(readDatabaseTables(["conversations","interactions","users"])),
         readOnlyCache: readOnlyContextCache.metrics(),
         gptSovits: getGptSovitsRuntimeStatus(),
         voiceprint: getVoiceprintRuntimeStatus(),
@@ -298,7 +272,7 @@ export async function bootstrap(ctx: BootstrapContext) {
       console.warn('[Messaging] Long-connection startup failed:', err?.message || err);
     });
     scheduler.setIO(io);
-    registerScheduledTasks(llm.getDeepSeek, llm.getGemini, llm.getOpenAI, llm.getAnthropic, llm.getQwen, llm.getOllama, llm.getLmStudio, llm.getArk, llm.getXiaomi, llm.getKimi, llm.getGlm, llm.getRelay);
+    registerScheduledTasks(...providerGetterArguments(llm));
 
     scheduleFirstBootExploration(__dirname);
     schedulePostStartupFlush(5_000);
@@ -312,6 +286,7 @@ export async function bootstrap(ctx: BootstrapContext) {
       for (const timer of startupTimers) clearTimeout(timer);
       startupTimers.clear();
       stopSystemExplorationWorker();
+      stopLayaShadow();
       scheduler.stop({ drainSettledHandlers: true });
       unifiedRuntimeSupervisor?.stop();
     },
@@ -320,6 +295,7 @@ export async function bootstrap(ctx: BootstrapContext) {
         stopMessagingIngressAndDrain(),
         stopMessagingConnections(),
         ctx.shutdownMcp(),
+        xiaozhiDeviceService.close(),
         stopWorkflowRuntimeMaintenance(),
         ctx.shutdownIngress.waitForIdle(),
         waitUntilRuntimeIdle(() => scheduler.listTasks().every(task => !task.running && !task.settlementPending)),
@@ -341,7 +317,7 @@ export async function bootstrap(ctx: BootstrapContext) {
       setUnifiedRuntimeSupervisor(null);
       console.log('[Shutdown] Database saved and closed');
     },
-    exit: () => process.exit(0),
+    exit: () => process.exit(runtimeFaults.snapshot().degraded ? 1 : 0),
   });
   ctx.shutdownIngress.configure(shutdown);
   registerShutdownSignals(shutdown);

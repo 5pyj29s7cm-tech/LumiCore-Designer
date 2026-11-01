@@ -1,6 +1,6 @@
 import type sqlite3 from 'sqlite3';
 
-// Startup and persistence rebuilds share the same schema/index definitions.
+// Schema migrations own these indexes; ordinary persistence preserves them.
 export const PERFORMANCE_INDEX_SQL = [
   `CREATE INDEX IF NOT EXISTS idx_interior_projects_org_status ON interior_projects(orgId, status, updatedAt)`,
   `CREATE INDEX IF NOT EXISTS idx_interior_project_assets_project ON interior_project_assets(orgId, projectId, status, updatedAt)`,
@@ -96,6 +96,24 @@ export function migrateSchema(database: sqlite3.Database): Promise<void> {
       }
     };
     database.serialize(() => {
+    // Archive rows use direct SQL, outside the mutable whole-database snapshot.
+    database.run(`CREATE TABLE IF NOT EXISTS generated_archive_scopes (scope TEXT PRIMARY KEY)`, onAlter);
+    database.run(`CREATE TABLE IF NOT EXISTS generated_archive (
+      scope TEXT NOT NULL, id TEXT NOT NULL, filename TEXT NOT NULL, sourcePath TEXT NOT NULL,
+      sourceSize REAL NOT NULL, sourceMtimeMs REAL NOT NULL, createdAt TEXT NOT NULL, deletedAt TEXT,
+      payload TEXT NOT NULL,
+      PRIMARY KEY(scope, id)
+    )`, onAlter);
+    database.run('CREATE INDEX IF NOT EXISTS idx_generated_archive_filename ON generated_archive(scope, filename)', onAlter);
+    database.run('CREATE INDEX IF NOT EXISTS idx_generated_archive_source ON generated_archive(scope, sourcePath, sourceSize, sourceMtimeMs)', onAlter);
+    database.run('CREATE INDEX IF NOT EXISTS idx_generated_archive_scope ON generated_archive(scope)', onAlter);
+    database.run('DROP INDEX IF EXISTS idx_generated_archive_created', onAlter);
+    database.run("ALTER TABLE generated_archive_scopes ADD COLUMN revision TEXT NOT NULL DEFAULT ''", onAlter);
+    for (const action of ['INSERT', 'UPDATE', 'DELETE']) {
+      const scopes = action === 'UPDATE' ? 'OLD.scope, NEW.scope' : action === 'DELETE' ? 'OLD.scope' : 'NEW.scope';
+      database.run(`CREATE TRIGGER IF NOT EXISTS generated_archive_revision_${action} AFTER ${action} ON generated_archive
+        BEGIN UPDATE generated_archive_scopes SET revision=lower(hex(randomblob(16))) WHERE scope IN (${scopes}); END`, onAlter);
+    }
     // The table must exist before its legacy column upgrades are replayed.
     database.run(`CREATE TABLE IF NOT EXISTS memories (
       id TEXT PRIMARY KEY,
@@ -160,12 +178,26 @@ export function migrateSchema(database: sqlite3.Database): Promise<void> {
     // Add domain + orgId to conversations for personal/work isolation
     database.run("ALTER TABLE conversations ADD COLUMN domain TEXT DEFAULT 'personal'", onAlter);
     database.run("ALTER TABLE conversations ADD COLUMN orgId TEXT DEFAULT ''", onAlter);
+    database.run("ALTER TABLE conversations ADD COLUMN surface TEXT NOT NULL DEFAULT 'chat'", onAlter);
+    // Only exact, unmixed creation provenance can recover a legacy surface.
+    database.run(`UPDATE conversations SET surface='creation'
+      WHERE COALESCE(surface,'chat')='chat'
+        AND EXISTS (SELECT 1 FROM interactions i WHERE i.conversationId=conversations.id AND i.source='ai-creation'
+          AND i.userId=conversations.userId AND COALESCE(i.domain,'personal')=COALESCE(conversations.domain,'personal')
+          AND COALESCE(i.orgId,'')=COALESCE(conversations.orgId,''))
+        AND NOT EXISTS (SELECT 1 FROM interactions i WHERE i.conversationId=conversations.id
+          AND (COALESCE(i.source,'')<>'ai-creation' OR i.userId<>conversations.userId
+            OR COALESCE(i.domain,'personal')<>COALESCE(conversations.domain,'personal')
+            OR COALESCE(i.orgId,'')<>COALESCE(conversations.orgId,'')))`, onAlter);
     // Durable auto-summary cadence and bounded summary history. -1 marks rows
     // created before this migration so the manager can infer a safe baseline.
     database.run("ALTER TABLE conversations ADD COLUMN summaryChain TEXT DEFAULT '[]'", onAlter);
     database.run("ALTER TABLE conversations ADD COLUMN lastSummaryMessageCount INTEGER DEFAULT -1", onAlter);
     database.run("ALTER TABLE conversations ADD COLUMN actionContinuationState TEXT DEFAULT '{}'", onAlter);
     database.run("ALTER TABLE conversation_action_tasks ADD COLUMN context TEXT NOT NULL DEFAULT '{}'", onAlter);
+    // Add explicit identities without guessing ambiguous legacy turnId values.
+    database.run("ALTER TABLE conversation_action_receipts ADD COLUMN turnRowId TEXT NOT NULL DEFAULT ''", onAlter);
+    database.run("ALTER TABLE conversation_action_receipts ADD COLUMN externalMessageId TEXT NOT NULL DEFAULT ''", onAlter);
     // Preserve the immutable tool-selection provenance across backend restarts.
     // Never reconstruct this binding from requestId: one request may own both
     // a preflight route and the actual tool-planning route.
