@@ -1,6 +1,6 @@
 # Lumi Designer Commercial Release
 
-This repository contains the independent source and release track for Lumi Designer 3.x. Lumi Designer shares the LumiCore kernel, but its installer, application identity, updater channel, user-data root, and release artifacts are isolated from the main product and every other industry variant. Source availability and signed binary distribution are separate release decisions.
+This repository contains the independent source and release track for Lumi Designer 3.x. Lumi Designer shares the LumiCore kernel and default backend data root. Its installer, application identity, updater channel, client WebView profile, design UI and release artifacts remain distinct. Source availability and signed binary distribution are separate release decisions.
 
 ## Positioning
 
@@ -90,8 +90,8 @@ The Windows installer smoke test must prove:
 
 - Keep the Lumi Designer bundle identifier `com.lumiai.designer` stable so an upgrade retains this variant's WebView profile and macOS privacy grants without sharing them with LumiCore.
 - The Windows artifact is the independently named `Lumi Designer_<version>_x64-setup.exe`, built with product name `Lumi Designer` and updater channel `lumi-designer`.
-- User data is never deleted by the installer. The backend moves the legacy `~/LumiOS-Designer/` root to `~/LumiCore-Designer/` under an exclusive data lease on first start; it must never import from or write to `~/LumiOS/` or `~/LumiCore/`.
-- On macOS, install and launch `Lumi Designer.app`, verify its bundle identifier is `com.lumiai.designer`, and confirm it uses `~/LumiCore-Designer/`. A DMG cannot safely delete or replace an unrelated LumiCore or industry-variant app bundle during drag-install.
+- The default backend root is `~/LumiCore/`, shared with the main program. Preserve its database and attached files when changing clients. An absolute `LUMI_DATA_DIR` still overrides the default; do not place shared data inside an application-install or disposable client-cache directory. Existing `~/LumiCore-Designer/` and `~/LumiOS-Designer/` roots remain untouched and are not automatically merged. The shared root follows the main program's reviewed `~/LumiOS/` to `~/LumiCore/` migration boundary, including refusal to merge two populated roots.
+- On macOS, install and launch `Lumi Designer.app`, verify its bundle identifier is `com.lumiai.designer`, and confirm its backend uses `~/LumiCore/` unless an absolute override is explicitly configured. A DMG cannot safely delete or replace an unrelated LumiCore or industry-variant app bundle during drag-install.
 
 Manual clean Windows user gate:
 

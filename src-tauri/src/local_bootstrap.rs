@@ -12,7 +12,7 @@ use crate::native_identity::{native_client_identity, NativeClientIdentity};
 
 const MAX_PROOF_FILE_BYTES: u64 = 4096;
 const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
-const PRODUCT_DATA_DIRECTORY: &str = "LumiCore-Designer";
+const PRODUCT_DATA_DIRECTORY: &str = "LumiCore";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

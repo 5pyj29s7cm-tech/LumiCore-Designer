@@ -578,7 +578,8 @@ export function finalizeLumiResponse(input: LumiResultFinalizerInput): LumiResul
     const copy = DESIGNER_RESULT_MESSAGES[isChineseText(actionText) ? 'zh' : 'en'];
     if (design.additionalObligations?.length) return { text: copy.partial, blocked: true,
       reason: 'The selected design stage does not verify additional explicit obligations.' };
-    const payload = verifiedDesignerReceipt(input.toolRecords || [], design, input);
+    // Preserve latest current-turn failure/uncertainty instead of coalescing it into an older success.
+    const payload = verifiedDesignerReceipt(designerCadRecords, design, input);
     if (payload) {
       if (design.kind === 'status') {
         const text = formatVerifiedDesignProjectStatus({ name: 'interior_design_project_status', arguments: {}, result: JSON.stringify(payload),

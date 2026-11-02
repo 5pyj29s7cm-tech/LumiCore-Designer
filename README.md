@@ -15,7 +15,7 @@
 
 当前源码版本：`3.1.1`（不代表已安装或运行中的客户端已更新）
 
-本仓库是 Lumi Designer 的独立源码与交付仓库。它共享 LumiCore 底层，但使用独立的安装器、更新通道、应用标识和用户数据目录。Windows 和 macOS 安装包只有通过签名、冒烟、生命周期与发布门禁后，才会作为 Lumi Designer 发行物提供。
+本仓库是 Lumi Designer 的独立源码与交付仓库。它共享 LumiCore 底层及默认后台数据目录，保留独立的安装器、更新通道、应用标识和设计专属界面。Windows 和 macOS 安装包只有通过签名、冒烟、生命周期与发布门禁后，才会作为 Lumi Designer 发行物提供。
 
 LumiCore 仍在快速迭代。统一意图、风险决策、任务账本、工具回执和多模型配置已经形成底层主干；桌面控制、连续语音、外部平台协作和行业软件自动化仍会受到操作系统、模型能力、第三方界面、账号权限与网络环境影响。
 
@@ -248,14 +248,16 @@ DOUBAO_SPEECH_KEY=
 
 ## 数据与隐私
 
-默认用户数据目录为 `~/LumiCore-Designer/`，与源码仓库分离。升级时会在独占数据租约下将旧版 `~/LumiOS-Designer/` 原地迁移到 `~/LumiCore-Designer/`，不复制会话或凭据。
+默认后台数据目录为 `~/LumiCore/`，与主程序共用并与源码仓库分离。连接同一后台、使用同一账号和工作区时，可读取对应范围内已保存的聊天、记忆及归档创作。数据库和附件文件必须一并保留；未发送草稿、客户端缓存和未上传文件不属于这项共享保证。
+
+`LUMI_DATA_DIR` 仍可用绝对路径显式指定数据根。原 `~/LumiCore-Designer/` 和 `~/LumiOS-Designer/` 保持原样，本次默认值调整不会自动搬移、合并或删除其中的数据。共享后台沿用主程序的 `~/LumiOS/` → `~/LumiCore/` 历史目录迁移边界；不同的非空目录不会自动合并。
 
 | 路径 | 内容 |
 | --- | --- |
-| `~/LumiCore-Designer/data/lumi.db` | 会话、记忆、任务、回执与智能体数据 |
-| `~/LumiCore-Designer/data/keys.json` | 本地凭证存储 |
-| `~/LumiCore-Designer/data/knowledge/` | 知识库文件与索引 |
-| `~/LumiCore-Designer/data/voice_samples/` | 用户授权保存的语音样本 |
+| `~/LumiCore/data/lumi.db` | 会话、记忆、任务、回执与智能体数据 |
+| `~/LumiCore/data/keys.json` | 本地凭证存储 |
+| `~/LumiCore/data/knowledge/` | 知识库文件与索引 |
+| `~/LumiCore/data/voice_samples/` | 用户授权保存的语音样本 |
 | `~/lumi_skills/` | 用户安装的 MCP 技能包 |
 
 提交 Issue 或 Pull Request 时，不要上传 API Key、访问令牌、客户资料、个人数据库、语音样本或可识别真实账号的配置。发现安全问题请先阅读 [安全策略](./SECURITY.md)。

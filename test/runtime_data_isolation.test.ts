@@ -10,7 +10,8 @@ const originalNodeEnv = process.env.NODE_ENV;
 const tempRoots: string[] = [];
 const currentProductDataDirectory = PRODUCT_VARIANT.runtime.dataDirectoryName;
 const legacyProductDataDirectory = PRODUCT_VARIANT.runtime.legacyDataDirectoryName;
-const migrationProductName = PRODUCT_VARIANT.runtime.productName;
+// Shared default migration receipts identify the storage protocol, not the UI brand.
+const migrationProductName = 'LumiCore';
 
 afterEach(() => {
   if (originalDataDir === undefined) delete process.env.LUMI_DATA_DIR;
@@ -233,7 +234,8 @@ describe('runtime data isolation', () => {
       'utf8',
     );
     expect(source).toContain('if (!hasExplicitDataRoot()) migrateDataFromOldLocation();');
-    expect(preflight).toContain("if (!hasExplicitDataRoot() && process.env.NODE_ENV !== 'test')");
+    expect(preflight).toContain('const explicitRoot = hasExplicitDataRoot();');
+    expect(preflight).toMatch(/if \(!explicitRoot && process\.env\.NODE_ENV !== 'test'\)\s*\{\s*migrateLegacyProductDataRoot\(claimDataRootForMigration\);\s*\}/);
   });
 
   it('keeps every default generated-output consumer on the centralized data path', () => {

@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { PRODUCT_VARIANT } from '../shared/product_variant';
 
 describe('designer product identity', () => {
-  it('keeps installer, runtime, and data identities isolated from the main product', () => {
+  it('keeps the Designer installer identity while sharing the canonical backend data root', () => {
     const tauri = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8')) as {
       productName: string;
       identifier: string;
@@ -14,8 +14,8 @@ describe('designer product identity', () => {
     const nativeBootstrap = fs.readFileSync('src-tauri/src/local_bootstrap.rs', 'utf8');
     const serverEntry = fs.readFileSync('server.ts', 'utf8');
     expect(PRODUCT_VARIANT.runtime.productName).toBe('Lumi Designer');
-    expect(PRODUCT_VARIANT.runtime.dataDirectoryName).toBe('LumiCore-Designer');
-    expect(PRODUCT_VARIANT.runtime.legacyDataDirectoryName).toBe('LumiOS-Designer');
+    expect(PRODUCT_VARIANT.runtime.dataDirectoryName).toBe('LumiCore');
+    expect(PRODUCT_VARIANT.runtime.legacyDataDirectoryName).toBe('LumiOS');
     expect(tauri).toMatchObject({
       productName: PRODUCT_VARIANT.runtime.productName,
       identifier: PRODUCT_VARIANT.runtime.appIdentifier,

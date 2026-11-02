@@ -1,6 +1,6 @@
 # Current work focus
 
-On 2026-11-01 the user requested Designer feature/UI synchronization with the current main program and scoped fixes across all three editions. This is the Designer checkout; its source identity, project data root and CAD/design workflows remain distinct. The main development client is in D:/lumiOS. Native coordinate-driven acceptance remains paused. Historical lawyer acceptance is sealed under `archive/legal-development-20261027`; this maintenance does not resume its business operations or paid generations.
+On 2026-11-01 the user requested Designer feature/UI synchronization with the current main program and scoped fixes across all three editions. On 2026-11-02 the user explicitly requested the Designer default backend data root to be shared with the main program at ~/LumiCore/. This is the Designer checkout; its source and installer identity, frontend interface and CAD/design workflows remain distinct. Existing Designer data roots are preserved; this default alignment does not authorize automatic data merging. The main development client is in D:/lumiOS. Native coordinate-driven acceptance remains paused. Historical lawyer acceptance is sealed under `archive/legal-development-20261027`; this maintenance does not resume its business operations or paid generations.
 
 # Acceptance checkpoint workflow
 

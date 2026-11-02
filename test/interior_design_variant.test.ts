@@ -55,13 +55,13 @@ describe('spatial and interior design variant', () => {
     }
   });
 
-  it('ships focused skill tools instead of generic brand and UI tools', () => {
+  it('ships all interior tools and preserves shared general-design compatibility', () => {
     const skill = source('server/skills/bundled/design-studio-pack/index.ts');
     const manifest = JSON.parse(source('server/skills/bundled/design-studio-pack/package.json'));
 
-    expect(manifest.version).toBe('3.0.0');
-    expect(manifest.lumi.toolCount).toBe(8);
-    expect(manifest.lumi.displayName).toBe('Spatial & Interior Studio');
+    expect(manifest.version).toBe('3.1.0');
+    expect(manifest.lumi.toolCount).toBe(11);
+    expect(manifest.lumi.displayName).toBe('Design Studio Pack');
     expect(skill).toContain("registerTool('interior_project_brief'");
     expect(skill).toContain("registerTool('space_planning_checklist'");
     expect(skill).toContain("registerTool('interior_visual_direction'");
@@ -70,7 +70,7 @@ describe('spatial and interior design variant', () => {
     expect(skill).toContain("registerTool('revit_readonly_review_plan'");
     expect(skill).toContain("registerTool('ffe_schedule_normalize'");
     expect(skill).toContain("registerTool('site_survey_report'");
-    expect(skill).not.toContain("registerTool('visual_direction_board'");
-    expect(skill).not.toContain("registerTool('design_review_checklist'");
+    expect(skill).toContain("registerTool('visual_direction_board'");
+    expect(skill).toContain("registerTool('design_review_checklist'");
   });
 });

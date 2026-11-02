@@ -45,6 +45,28 @@ function restore(before: Snapshot, after: Snapshot, scope: string, userId: strin
   commitDatabaseTables(db);
 }
 
+/** Tools and HTTP use the same scope lock and rollback boundary. */
+export function runDurableInteriorProjectMutation<T>(
+  scope: string, userId: string, assertCurrent: () => void, mutate: () => T | Promise<T>,
+): Promise<T> {
+  return runSerializedMutation(`interior-project:${scope}`, async () => {
+    assertCurrent();
+    const before = capture(scope, userId);
+    let saved = false;
+    try {
+      const result = await mutate();
+      assertCurrent();
+      await flushDBOrThrow();
+      saved = true;
+      assertCurrent();
+      return result;
+    } catch (error) {
+      if (!saved) restore(before, capture(scope, userId), scope, userId);
+      throw error;
+    }
+  });
+}
+
 /** Project writes share main's save-before-response contract in either personal or organization context. */
 export function durableInteriorProjectRouter(base: Router): Pick<Router, 'get' | 'post' | 'put' | 'delete'> {
   const register = (method: 'post' | 'put' | 'delete') => ((route: string, ...handlers: RequestHandler[]) => {

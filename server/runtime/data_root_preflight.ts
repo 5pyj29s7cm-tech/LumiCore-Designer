@@ -1,8 +1,12 @@
 import {
+  assertLegacyDesignerDataMerged,
+  getDataRoot,
   hasExplicitDataRoot,
   migrateLegacyProductDataRoot,
   preflightProductDataMigrationReceipts,
+  resolveDefaultDataRoot,
 } from '../config/data_path';
+import { normalizePathIdentity } from '../../shared/file_identity';
 import {
   acquireDataRootLease,
   claimDataRootForMigration,
@@ -26,7 +30,12 @@ export function prepareRuntimeDataRoot(): void {
     return;
   }
 
-  if (!hasExplicitDataRoot() && process.env.NODE_ENV !== 'test') {
+  const explicitRoot = hasExplicitDataRoot();
+  if (process.env.NODE_ENV !== 'test' && (!explicitRoot
+    || normalizePathIdentity(getDataRoot()) === normalizePathIdentity(resolveDefaultDataRoot()))) {
+    assertLegacyDesignerDataMerged();
+  }
+  if (!explicitRoot && process.env.NODE_ENV !== 'test') {
     migrateLegacyProductDataRoot(claimDataRootForMigration);
   }
 

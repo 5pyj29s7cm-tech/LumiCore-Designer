@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
-import { captureOrganizationMembershipAuthorization } from '../../org/membership_authorization';
+import { captureOrganizationMembershipAuthorization, isOrganizationMembershipAuthorizationCurrent } from '../../org/membership_authorization';
+import { runDurableInteriorProjectMutation } from '../../design/durable_routes';
 import fs from 'node:fs';
 import path from 'node:path';
 import JSZip from 'jszip';
@@ -55,6 +56,23 @@ function findDesignProject(args: Record<string, any>, context?: ToolContext) {
   if (selected) return { ...active, project: selected };
   const owned = projects.filter(project => project.ownerUserId === active.userId);
   return { ...active, project: owned.length === 1 ? owned[0] : null };
+}
+
+function designMutationAuthority(context?: ToolContext) {
+  const active = designScope(context);
+  const accepted = scope(context);
+  const membership = accepted.domain === 'work'
+    ? captureOrganizationMembershipAuthorization(accepted.orgId, accepted.userId) : undefined;
+  const assertCurrent = () => {
+    context?.executionSignal?.throwIfAborted();
+    if (context?.isCancelled?.()) throw new Error('Design project mutation was cancelled.');
+    const current = designScope(context);
+    if (current.scopeId !== active.scopeId || current.userId !== active.userId
+      || membership && !isOrganizationMembershipAuthorizationCurrent(membership, accepted.orgId, accepted.userId)) {
+      throw new Error('The accepted design project authority is no longer current.');
+    }
+  };
+  return { active, assertCurrent };
 }
 
 function projectStatusProjection(workflow: NonNullable<ReturnType<typeof getInteriorProjectWorkflow>>) {
@@ -190,7 +208,8 @@ export function registerDesignProjectTools(registry: ToolRegistry): void {
       required: ['name'],
     },
     handler: async (args, context) => {
-      const active = designScope(context);
+      const { active, assertCurrent } = designMutationAuthority(context);
+      return runDurableInteriorProjectMutation(active.scopeId, active.userId, assertCurrent, () => {
       const project = createInteriorProject(active.scopeId, active.userId, {
         name: args.name,
         projectType: args.projectType || 'other',
@@ -213,6 +232,7 @@ export function registerDesignProjectTools(registry: ToolRegistry): void {
         project,
         workflow: getInteriorProjectWorkflow(active.scopeId, project.id),
       }, null, 2);
+      });
     },
     permission: 'user',
     securityLevel: 'safe',
@@ -241,6 +261,8 @@ export function registerDesignProjectTools(registry: ToolRegistry): void {
       required: [],
     },
     handler: async (args, context) => {
+      const { active, assertCurrent } = designMutationAuthority(context);
+      return runDurableInteriorProjectMutation(active.scopeId, active.userId, assertCurrent, () => {
       const resolved = findDesignProject(args, context);
       if (!resolved.project) throw new Error('Design project not found. Provide an exact project id or name.');
       const project = setActiveInteriorProject(resolved.scopeId, resolved.userId, resolved.project.id);
@@ -248,6 +270,7 @@ export function registerDesignProjectTools(registry: ToolRegistry): void {
         ok: true, status: 'selected', persisted: true, active: true, project,
         workflow: getInteriorProjectWorkflow(resolved.scopeId, resolved.project.id),
       }, null, 2);
+      });
     },
     permission: 'user',
     securityLevel: 'safe',
