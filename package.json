@@ -118,7 +118,7 @@
     "multer": "^2.4.0",
     "node-fetch-native": "^1.6.7",
     "nodemailer": "^10.0.15",
-    "openai": "^6.34.0",
+    "openai": "^7.45.1",
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^2.4.5",
     "playwright-core": "^1.61.1",
